@@ -111,21 +111,16 @@ impl SparseVector {
 }
 
 /// Distance/similarity metric for dense vector fields.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Metric {
     /// Cosine similarity (vectors are normalized at insert time; score is dot).
+    #[default]
     Cosine,
     /// Raw inner product (higher is better).
     Dot,
     /// Euclidean distance (lower is better; scores are negated distances).
     L2,
-}
-
-impl Default for Metric {
-    fn default() -> Self {
-        Metric::Cosine
-    }
 }
 
 pub fn now_millis() -> Timestamp {

@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use numpy::{PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -59,9 +59,11 @@ fn to_py_err(err: Error) -> PyErr {
 
 fn json_loads(py: Python<'_>, value: &serde_json::Value) -> PyResult<PyObject> {
     let json_mod = PyModule::import(py, "json")?;
-    let obj = json_mod.call_method1("loads", (serde_json::to_string(value).map_err(|e| {
-        PyRuntimeError::new_err(format!("serialize internal value: {e}"))
-    })?,))?;
+    let obj = json_mod.call_method1(
+        "loads",
+        (serde_json::to_string(value)
+            .map_err(|e| PyRuntimeError::new_err(format!("serialize internal value: {e}")))?,),
+    )?;
     Ok(obj.unbind())
 }
 
@@ -260,6 +262,7 @@ fn validate_filter(filter_json: String) -> PyResult<()> {
 }
 
 #[pymodule]
+#[pyo3(name = "_native")]
 fn ragvault_native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyVault>()?;
     m.add_function(wrap_pyfunction!(validate_filter, m)?)?;

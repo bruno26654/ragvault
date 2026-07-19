@@ -280,7 +280,11 @@ impl VaultEngine {
         for record in records {
             let seq = record.seq;
             match record.op {
-                WalOp::UpsertDocument { document, chunks, dim } => {
+                WalOp::UpsertDocument {
+                    document,
+                    chunks,
+                    dim,
+                } => {
                     Self::apply_upsert(&mut state, document, chunks, &record.payload, dim)?;
                 }
                 WalOp::DeleteDocument { document_id } => {
@@ -313,7 +317,12 @@ impl VaultEngine {
         if vectors.len() != chunks.len() * dim {
             return Err(Error::invalid(
                 "vectors",
-                format!("{} f32 values ({} chunks x dim {})", chunks.len() * dim, chunks.len(), dim),
+                format!(
+                    "{} f32 values ({} chunks x dim {})",
+                    chunks.len() * dim,
+                    chunks.len(),
+                    dim
+                ),
                 format!("{}", vectors.len()),
             ));
         }
@@ -519,7 +528,11 @@ impl VaultEngine {
         let mut dense: Vec<(u32, f32)> = Vec::new();
         if matches!(mode, "dense" | "hybrid") {
             let vector = request.vector.as_ref().ok_or_else(|| {
-                Error::invalid("vector", "a dense query vector for dense/hybrid mode", "none")
+                Error::invalid(
+                    "vector",
+                    "a dense query vector for dense/hybrid mode",
+                    "none",
+                )
             })?;
             let prepared = state.arena.prepare_query(vector)?;
             let live = state.arena.live();
@@ -551,15 +564,13 @@ impl VaultEngine {
                         "filtered traversal starved ({} hits) — retry ef {wide_ef}",
                         dense.len()
                     ));
-                    dense =
-                        state
-                            .hnsw
-                            .search(&state.arena, &prepared, pool, wide_ef, accept_dyn);
+                    dense = state
+                        .hnsw
+                        .search(&state.arena, &prepared, pool, wide_ef, accept_dyn);
                     if dense.len() < k {
                         dense_backend = "flat_filtered_fallback";
-                        plan_reasons.push(
-                            "still starved — exact filtered flat fallback".to_string(),
-                        );
+                        plan_reasons
+                            .push("still starved — exact filtered flat fallback".to_string());
                         dense = FlatIndex::search(&state.arena, &prepared, pool, &accept);
                     }
                 }
@@ -580,9 +591,9 @@ impl VaultEngine {
         // -- sparse signal -------------------------------------------------
         let mut sparse_hits: Vec<(u32, f32)> = Vec::new();
         if let Some(sq) = &request.sparse {
-            sparse_hits = state.sparse.search(sq, pool, &|row| {
-                !state.arena.is_deleted(row) && accept(row)
-            })?;
+            sparse_hits = state
+                .sparse
+                .search(sq, pool, &|row| !state.arena.is_deleted(row) && accept(row))?;
         }
 
         // -- fusion --------------------------------------------------------
@@ -1167,7 +1178,12 @@ mod tests {
         {
             let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
             engine
-                .upsert_document(doc("a", json!({})), vec![chunk("a", 0, "x")], &unit_vec(4, 0), None)
+                .upsert_document(
+                    doc("a", json!({})),
+                    vec![chunk("a", 0, "x")],
+                    &unit_vec(4, 0),
+                    None,
+                )
                 .unwrap();
             engine.flush().unwrap();
         }

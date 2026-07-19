@@ -126,17 +126,24 @@ impl Filter {
 }
 
 fn as_array<'a>(val: &'a Value, key: &str) -> Result<&'a Vec<Value>> {
-    val.as_array().ok_or_else(|| {
-        Error::InvalidFilter(format!("operator {key} expects an array, got: {val}"))
-    })
+    val.as_array()
+        .ok_or_else(|| Error::InvalidFilter(format!("operator {key} expects an array, got: {val}")))
 }
 
 fn parse_field(field: &str, val: &Value, _depth: usize) -> Result<Filter> {
     let op = match val {
-        Value::Object(ops) if !ops.is_empty() && ops.keys().all(|k| is_op_key(k)) => {
-            // {"field": {"gte": 5, "lt": 10}} — multiple ops on one field.
+        // A non-empty object value is always an operator map. Unknown keys
+        // are hard errors (a typo must not silently become a literal
+        // equality that matches nothing); nested equality uses dotted paths.
+        Value::Object(ops) if !ops.is_empty() => {
             let mut sub = Vec::with_capacity(ops.len());
             for (op_key, op_val) in ops {
+                if !is_op_key(op_key) {
+                    return Err(Error::InvalidFilter(format!(
+                        "unknown operator {op_key:?} for field {field:?}; \
+                         use a dotted path like \"{field}.{op_key}\" for nested equality"
+                    )));
+                }
                 sub.push(Filter::Cmp {
                     field: field.to_string(),
                     op: parse_op(op_key, op_val)?,
@@ -242,7 +249,10 @@ fn eval_cmp(op: &CmpOp, value: Option<&Value>) -> bool {
                 CmpOp::Contains(t) => contains(v, t),
                 CmpOp::ContainsAny(ts) => ts.iter().any(|t| contains(v, t)),
                 CmpOp::ContainsAll(ts) => ts.iter().all(|t| contains(v, t)),
-                CmpOp::Prefix(p) => v.as_str().map(|s| s.starts_with(p.as_str())).unwrap_or(false),
+                CmpOp::Prefix(p) => v
+                    .as_str()
+                    .map(|s| s.starts_with(p.as_str()))
+                    .unwrap_or(false),
                 CmpOp::Exists(_) | CmpOp::Ne(_) | CmpOp::NotIn(_) => unreachable!(),
             }
         }
@@ -287,16 +297,31 @@ mod tests {
 
     #[test]
     fn implicit_eq() {
-        assert!(matches(json!({"source": "manual"}), json!({"source": "manual"})));
-        assert!(!matches(json!({"source": "manual"}), json!({"source": "web"})));
+        assert!(matches(
+            json!({"source": "manual"}),
+            json!({"source": "manual"})
+        ));
+        assert!(!matches(
+            json!({"source": "manual"}),
+            json!({"source": "web"})
+        ));
         assert!(!matches(json!({"source": "manual"}), json!({})));
     }
 
     #[test]
     fn range_ops() {
-        assert!(matches(json!({"year": {"gte": 2024}}), json!({"year": 2024})));
-        assert!(matches(json!({"year": {"gte": 2024}}), json!({"year": 2025.5})));
-        assert!(!matches(json!({"year": {"gte": 2024}}), json!({"year": 2023})));
+        assert!(matches(
+            json!({"year": {"gte": 2024}}),
+            json!({"year": 2024})
+        ));
+        assert!(matches(
+            json!({"year": {"gte": 2024}}),
+            json!({"year": 2025.5})
+        ));
+        assert!(!matches(
+            json!({"year": {"gte": 2024}}),
+            json!({"year": 2023})
+        ));
         // combined range on one field
         assert!(matches(
             json!({"year": {"gte": 2020, "lt": 2024}}),
@@ -307,7 +332,10 @@ mod tests {
             json!({"year": 2024})
         ));
         // incompatible types never match
-        assert!(!matches(json!({"year": {"gte": 2024}}), json!({"year": "old"})));
+        assert!(!matches(
+            json!({"year": {"gte": 2024}}),
+            json!({"year": "old"})
+        ));
     }
 
     #[test]
@@ -330,9 +358,18 @@ mod tests {
                 {"status": {"ne": "draft"}},
             ]
         });
-        assert!(matches(f.clone(), json!({"tenant_id": "acme", "status": "final"})));
-        assert!(!matches(f.clone(), json!({"tenant_id": "acme", "status": "draft"})));
-        assert!(!matches(f, json!({"tenant_id": "other", "status": "final"})));
+        assert!(matches(
+            f.clone(),
+            json!({"tenant_id": "acme", "status": "final"})
+        ));
+        assert!(!matches(
+            f.clone(),
+            json!({"tenant_id": "acme", "status": "draft"})
+        ));
+        assert!(!matches(
+            f,
+            json!({"tenant_id": "other", "status": "final"})
+        ));
 
         let f = json!({"$or": [{"a": 1}, {"b": 2}]});
         assert!(matches(f.clone(), json!({"a": 1})));
@@ -396,6 +433,8 @@ mod tests {
         assert!(Filter::parse(&json!("just a string")).is_err());
         assert!(Filter::parse(&json!({"$and": "not-an-array"})).is_err());
         assert!(Filter::parse(&json!({"a": {"exists": "yes"}})).is_err());
+        assert!(Filter::parse(&json!({"a": {"unknown_op": 1}})).is_err());
+        assert!(Filter::parse(&json!({"year": {"gte": 2024, "typo": 1}})).is_err());
     }
 
     #[test]

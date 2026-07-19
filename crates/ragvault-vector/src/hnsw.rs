@@ -158,8 +158,7 @@ impl Hnsw {
         x ^= x >> 7;
         x ^= x << 17;
         self.rng_state = x;
-        let unit = (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64
-            / (1u64 << 53) as f64;
+        let unit = (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64;
         let level = (-unit.max(f64::MIN_POSITIVE).ln() * self.level_mult).floor() as usize;
         level.min(31)
     }
@@ -364,9 +363,15 @@ impl Hnsw {
                 let d = Self::distance(arena, neighbor, query);
                 let worst = results.peek().map(|f| f.dist).unwrap_or(f32::INFINITY);
                 if d < worst || results.len() < ef {
-                    to_visit.push(Candidate { dist: d, id: neighbor });
+                    to_visit.push(Candidate {
+                        dist: d,
+                        id: neighbor,
+                    });
                     if admit(neighbor) {
-                        results.push(FarCandidate { dist: d, id: neighbor });
+                        results.push(FarCandidate {
+                            dist: d,
+                            id: neighbor,
+                        });
                         if results.len() > ef {
                             results.pop();
                         }
@@ -440,9 +445,7 @@ impl Hnsw {
             if ep as usize >= self.nodes.len() {
                 return Err(format!("entry point {ep} out of range"));
             }
-            if self.nodes[ep as usize].layers.len() <= self.max_level
-                && !self.nodes.is_empty()
-            {
+            if self.nodes[ep as usize].layers.len() <= self.max_level && !self.nodes.is_empty() {
                 return Err("entry point does not reach max level".into());
             }
         } else if !self.nodes.is_empty() {
@@ -468,9 +471,7 @@ impl Hnsw {
                         return Err(format!("duplicate neighbor {n} at node {id}"));
                     }
                     if self.nodes[n as usize].layers.len() <= layer {
-                        return Err(format!(
-                            "neighbor {n} does not exist on layer {layer}"
-                        ));
+                        return Err(format!("neighbor {n} does not exist on layer {layer}"));
                     }
                 }
             }
@@ -571,7 +572,7 @@ mod tests {
     fn filtered_search_returns_only_accepted() {
         let (arena, hnsw) = build(1000, 16, 11);
         let q = arena.prepare_query(arena.get(0)).unwrap();
-        let accept = |id: u32| id % 5 == 0;
+        let accept = |id: u32| id.is_multiple_of(5);
         let results = hnsw.search(&arena, &q, 10, 256, Some(&accept));
         assert!(!results.is_empty());
         assert!(results.iter().all(|(id, _)| id % 5 == 0));
@@ -603,7 +604,8 @@ mod tests {
             let id = arena.push(&v).unwrap();
             hnsw.insert(&arena, id);
             if i % 97 == 0 {
-                hnsw.validate().expect("invariants during incremental build");
+                hnsw.validate()
+                    .expect("invariants during incremental build");
             }
         }
         hnsw.validate().expect("final invariants");

@@ -1,0 +1,42 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ragvault"
+version = "0.1.0"
+description = "Python-first, local-first library that turns documents into a high-quality RAG knowledge base: ingestion, hybrid retrieval, context assembly, citations and evaluation in one API."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+authors = [{ name = "RagVault contributors" }]
+keywords = ["rag", "retrieval", "vector-search", "knowledge-base", "bm25", "hnsw"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["numpy>=1.22"]
+
+[project.optional-dependencies]
+pdf = ["pypdf>=4"]
+office = ["python-docx>=1"]
+html = ["beautifulsoup4>=4.12"]
+local-models = ["sentence-transformers>=2.6"]
+all = ["pypdf>=4", "python-docx>=1", "beautifulsoup4>=4.12", "sentence-transformers>=2.6"]
+
+[project.scripts]
+ragvault = "ragvault.cli:main"
+
+[project.urls]
+Repository = "https://github.com/bruno26654/ragvault"
+
+[tool.maturin]
+python-source = "python"
+module-name = "ragvault._native"
+manifest-path = "crates/ragvault-python/Cargo.toml"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]

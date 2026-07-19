@@ -80,8 +80,8 @@ fn crc_of(bytes: &[u8]) -> u32 {
 }
 
 fn write_file_sync(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut f = fs::File::create(path)
-        .map_err(|e| Error::io(format!("create {}", path.display()), e))?;
+    let mut f =
+        fs::File::create(path).map_err(|e| Error::io(format!("create {}", path.display()), e))?;
     f.write_all(bytes)
         .map_err(|e| Error::io(format!("write {}", path.display()), e))?;
     f.sync_all()
@@ -180,8 +180,7 @@ pub fn publish(
     let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
     let tmp_manifest = dir.join("manifest.json.tmp");
     write_file_sync(&tmp_manifest, &manifest_bytes)?;
-    fs::rename(&tmp_manifest, manifest_path(dir))
-        .map_err(|e| Error::io("publish manifest", e))?;
+    fs::rename(&tmp_manifest, manifest_path(dir)).map_err(|e| Error::io("publish manifest", e))?;
     fsync_dir(dir)?;
 
     // Garbage-collect older generations only after the manifest is durable.
@@ -199,14 +198,17 @@ pub fn publish(
 }
 
 /// Load the snapshot referenced by a manifest, verifying checksums.
-pub fn load_state(dir: &Path, manifest: &PersistedManifestV1) -> Result<(PersistedStateV1, Vec<f32>)> {
+pub fn load_state(
+    dir: &Path,
+    manifest: &PersistedManifestV1,
+) -> Result<(PersistedStateV1, Vec<f32>)> {
     let gen_name = format!("gen-{}", manifest.generation);
     let mut state: Option<PersistedStateV1> = None;
     let mut vectors: Option<Vec<f32>> = None;
     for (rel, meta) in &manifest.files {
         let path = dir.join(rel);
-        let bytes = fs::read(&path)
-            .map_err(|e| Error::io(format!("read {}", path.display()), e))?;
+        let bytes =
+            fs::read(&path).map_err(|e| Error::io(format!("read {}", path.display()), e))?;
         if bytes.len() as u64 != meta.len || crc_of(&bytes) != meta.crc32 {
             return Err(Error::corrupt(
                 path.display().to_string(),
@@ -233,8 +235,7 @@ pub fn load_state(dir: &Path, manifest: &PersistedManifestV1) -> Result<(Persist
     let state = state.ok_or_else(|| {
         Error::corrupt(gen_name.clone(), "manifest missing state.json".to_string())
     })?;
-    let vectors = vectors.ok_or_else(|| {
-        Error::corrupt(gen_name, "manifest missing vectors.bin".to_string())
-    })?;
+    let vectors = vectors
+        .ok_or_else(|| Error::corrupt(gen_name, "manifest missing vectors.bin".to_string()))?;
     Ok((state, vectors))
 }

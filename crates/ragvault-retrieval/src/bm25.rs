@@ -109,12 +109,7 @@ impl Bm25Index {
 
     /// BM25 top-k. `accept` integrates tombstones/filters; rejected docs are
     /// never scored. Returns (doc, score) best-first.
-    pub fn search(
-        &self,
-        query: &str,
-        k: usize,
-        accept: &dyn Fn(u32) -> bool,
-    ) -> Vec<(u32, f32)> {
+    pub fn search(&self, query: &str, k: usize, accept: &dyn Fn(u32) -> bool) -> Vec<(u32, f32)> {
         if k == 0 || self.active_docs == 0 {
             return Vec::new();
         }
@@ -150,7 +145,8 @@ impl Bm25Index {
                 let tf = p.tf as f32;
                 let dl = self.doc_lengths[p.doc as usize] as f32;
                 let denom = tf
-                    + self.params.k1 * (1.0 - self.params.b + self.params.b * dl / avg_len.max(1e-6));
+                    + self.params.k1
+                        * (1.0 - self.params.b + self.params.b * dl / avg_len.max(1e-6));
                 let score = idf * tf * (self.params.k1 + 1.0) / denom;
                 *scores.entry(p.doc).or_insert(0.0) += score;
             }

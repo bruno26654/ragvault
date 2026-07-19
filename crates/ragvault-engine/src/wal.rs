@@ -21,20 +21,15 @@ use serde::{Deserialize, Serialize};
 use ragvault_core::{Chunk, Document, Error, Result};
 
 /// Durability policy for WAL writes.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SyncPolicy {
     /// fsync after every commit — maximum durability.
     Sync,
     /// flush to the OS after every commit, fsync on flush()/close() —
     /// survives process crashes, may lose the tail on power loss.
+    #[default]
     Batch,
-}
-
-impl Default for SyncPolicy {
-    fn default() -> Self {
-        SyncPolicy::Batch
-    }
 }
 
 /// Logical operations recorded in the WAL header.
@@ -107,9 +102,7 @@ impl Wal {
             .and_then(|_| w.write_all(&payload_bytes))
             .and_then(|_| w.write_all(&crc.to_le_bytes()))
             .map_err(|e| Error::io("append wal record", e))?;
-        self.writer
-            .flush()
-            .map_err(|e| Error::io("flush wal", e))?;
+        self.writer.flush().map_err(|e| Error::io("flush wal", e))?;
         if self.policy == SyncPolicy::Sync {
             self.sync()?;
         }
@@ -133,10 +126,7 @@ impl Wal {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(Error::io(format!("open wal {}", path.display()), e)),
         };
-        let file_len = file
-            .metadata()
-            .map_err(|e| Error::io("stat wal", e))?
-            .len();
+        let file_len = file.metadata().map_err(|e| Error::io("stat wal", e))?.len();
         let mut reader = BufReader::new(file);
         let mut records = Vec::new();
         let mut good_offset: u64 = 0;
@@ -182,7 +172,9 @@ impl Wal {
         let payload_len = u32::from_le_bytes(lens[4..8].try_into().expect("4 bytes")) as u64;
         let seq = u64::from_le_bytes(lens[8..16].try_into().expect("8 bytes"));
         let total = offset + FIXED + header_len + payload_len;
-        if header_len > 256 * 1024 * 1024 || payload_len > 4 * 1024 * 1024 * 1024 || total > file_len
+        if header_len > 256 * 1024 * 1024
+            || payload_len > 4 * 1024 * 1024 * 1024
+            || total > file_len
         {
             return Ok(None); // implausible sizes = torn tail
         }
@@ -200,10 +192,13 @@ impl Wal {
         hasher.update(&header);
         hasher.update(&payload_bytes);
         if hasher.finalize() != u32::from_le_bytes(crc_bytes) {
-            return Err(Error::corrupt("wal", format!("crc mismatch at offset {offset}")));
+            return Err(Error::corrupt(
+                "wal",
+                format!("crc mismatch at offset {offset}"),
+            ));
         }
         let op: WalOp = serde_json::from_slice(&header)?;
-        if payload_bytes.len() % 4 != 0 {
+        if !payload_bytes.len().is_multiple_of(4) {
             return Err(Error::corrupt("wal", "payload not a multiple of 4 bytes"));
         }
         let payload: Vec<f32> = payload_bytes
@@ -257,8 +252,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut wal = Wal::open(dir.path(), SyncPolicy::Sync).unwrap();
         wal.append(1, &upsert("a", 2), &[1.0, 2.0]).unwrap();
-        wal.append(2, &WalOp::DeleteDocument { document_id: "a".into() }, &[])
-            .unwrap();
+        wal.append(
+            2,
+            &WalOp::DeleteDocument {
+                document_id: "a".into(),
+            },
+            &[],
+        )
+        .unwrap();
         drop(wal);
 
         let records = Wal::replay(dir.path(), 0).unwrap();
@@ -290,7 +291,11 @@ mod tests {
 
         let records = Wal::replay(dir.path(), 0).unwrap();
         assert_eq!(records.len(), 2, "good prefix survives");
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), full_len, "tail truncated");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            full_len,
+            "tail truncated"
+        );
 
         // replay again: same result (idempotent)
         let records2 = Wal::replay(dir.path(), 0).unwrap();
