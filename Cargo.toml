@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ragvault-core",
+    "crates/ragvault-vector",
+    "crates/ragvault-retrieval",
+    "crates/ragvault-engine",
+    "crates/ragvault-python",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/bruno26654/ragvault"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+crc32fast = "1"
+rand = "0.8"
+rayon = "1.10"
+fs2 = "0.4"
+parking_lot = "0.12"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

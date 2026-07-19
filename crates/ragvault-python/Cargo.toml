@@ -1,0 +1,16 @@
+[package]
+name = "ragvault-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "ragvault_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+ragvault-core = { path = "../ragvault-core" }
+ragvault-engine = { path = "../ragvault-engine" }
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
+numpy = "0.23"
+serde_json = { workspace = true }
