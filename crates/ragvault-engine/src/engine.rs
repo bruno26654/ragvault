@@ -1192,6 +1192,80 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_publish_leftovers_do_not_break_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+            engine
+                .upsert_document(
+                    doc("a", json!({})),
+                    vec![chunk("a", 0, "survives interrupted publish")],
+                    &unit_vec(4, 0),
+                    None,
+                )
+                .unwrap();
+            engine.flush().unwrap();
+        }
+        // Simulate a crash mid-publish: stale tmp generation + tmp manifest.
+        std::fs::create_dir_all(dir.path().join("gen-99.tmp")).unwrap();
+        std::fs::write(dir.path().join("gen-99.tmp/state.json"), b"partial").unwrap();
+        std::fs::write(dir.path().join("manifest.json.tmp"), b"{partial").unwrap();
+
+        let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+        assert_eq!(engine.list_documents().len(), 1);
+        let hits = engine
+            .search(&SearchRequest {
+                vector: None,
+                text: Some("survives".into()),
+                sparse: None,
+                k: 5,
+                mode: "keyword".into(),
+                candidates: None,
+                filter: None,
+                ef_search: None,
+                weights: None,
+            })
+            .unwrap()
+            .hits;
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn corrupt_snapshot_is_detected_not_silently_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+            engine
+                .upsert_document(
+                    doc("a", json!({})),
+                    vec![chunk("a", 0, "content")],
+                    &unit_vec(4, 0),
+                    None,
+                )
+                .unwrap();
+            engine.flush().unwrap();
+        }
+        // Flip a byte in the snapshot state file.
+        let gen_dir = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .find(|e| e.file_name().to_string_lossy().starts_with("gen-"))
+            .unwrap()
+            .path();
+        let state_path = gen_dir.join("state.json");
+        let mut bytes = std::fs::read(&state_path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&state_path, &bytes).unwrap();
+
+        let result = VaultEngine::open(dir.path(), config(4));
+        assert!(
+            matches!(result, Err(Error::Corrupt { .. })),
+            "corruption must surface as an explicit error"
+        );
+    }
+
+    #[test]
     fn sparse_signal_participates_in_search() {
         let dir = tempfile::tempdir().unwrap();
         let engine = VaultEngine::open(dir.path(), config(4)).unwrap();

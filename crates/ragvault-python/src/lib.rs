@@ -148,8 +148,9 @@ impl PyVault {
     }
 
     /// Run a search. `request_json` is a SearchRequest without the dense
-    /// vector; the vector rides separately as a numpy array for zero-copy
-    /// friendliness.
+    /// vector; the vector rides separately as a numpy float32 array. Note:
+    /// the vector IS copied once at the boundary (into a `Vec<f32>`) — this
+    /// is not zero-copy, and we do not claim it is.
     #[pyo3(signature = (request_json, vector=None))]
     fn search(
         &self,
