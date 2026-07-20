@@ -9,7 +9,7 @@
 //! ├── wal.log
 //! ├── manifest.json     (points at the current generation, atomic rename)
 //! └── gen-<N>/
-//!     ├── state.json    (docs, chunks, bm25, hnsw graph — versioned DTO)
+//!     ├── state.rvseg   (docs, chunks, bm25, hnsw graph — binary segment, v2)
 //!     └── vectors.bin   (raw f32 LE, row-major)
 //! ```
 //!
@@ -18,10 +18,13 @@
 //! directory. The previous generation is removed only after the new
 //! manifest is durable, so a crash at any point leaves a readable vault.
 //!
-//! v0.1 serializes state as JSON DTOs (`format_version = 1`). This is
-//! honest about its trade-off: robust and debuggable, but not the fastest
-//! reopen for very large vaults. A binary segment format is planned
-//! (TASKS.md) behind the same manifest, with format_version gating.
+//! `format_version = 2` writes the base state as a binary segment
+//! (`gen-N/state.rvseg`, see [`crate::segment`]) with a streaming CRC, instead
+//! of the `format_version = 1` `state.json`. A v1 vault still opens
+//! (migration is transparent: the next flush rewrites it as v2), and a
+//! manifest whose `format_version` exceeds what this build supports still
+//! fails closed. ADR 0016 tracks the remaining v2 work (multi-segment
+//! deltas, read-safe online compaction).
 
 use std::collections::HashMap;
 use std::fs;
@@ -34,7 +37,15 @@ use ragvault_core::{Chunk, Document, Error, Result};
 use ragvault_retrieval::Bm25Index;
 use ragvault_vector::Hnsw;
 
-pub const FORMAT_VERSION: u32 = 1;
+use crate::segment::{self, SegmentWriter};
+
+/// Highest manifest format this build writes and can read.
+pub const FORMAT_VERSION: u32 = 2;
+
+/// Base state file name for a v2 generation (binary segment).
+const STATE_SEGMENT: &str = "state.rvseg";
+/// Base state file name for a legacy v1 generation (JSON).
+const STATE_JSON: &str = "state.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedManifestV1 {
@@ -140,22 +151,31 @@ pub fn publish(
     fs::create_dir_all(&tmp_dir)
         .map_err(|e| Error::io(format!("mkdir {}", tmp_dir.display()), e))?;
 
-    let state_bytes = serde_json::to_vec(state)?;
+    // Base state as a binary segment (one record = the full state blob). The
+    // segment self-verifies with a streaming CRC; we also record a file-level
+    // CRC in the manifest so a corrupt base is caught before it is parsed.
+    let state_blob = serde_json::to_vec(state)?;
+    let state_seg_path = tmp_dir.join(STATE_SEGMENT);
+    let mut seg = SegmentWriter::create(&state_seg_path)?;
+    seg.append(&state_blob)?;
+    seg.finish()?;
+    let state_seg_bytes = fs::read(&state_seg_path)
+        .map_err(|e| Error::io(format!("read {}", state_seg_path.display()), e))?;
+
     let vector_bytes: Vec<u8> = vector_parts
         .iter()
         .flat_map(|part| part.iter())
         .flat_map(|f| f.to_le_bytes())
         .collect();
 
-    write_file_sync(&tmp_dir.join("state.json"), &state_bytes)?;
     write_file_sync(&tmp_dir.join("vectors.bin"), &vector_bytes)?;
 
     let mut files = HashMap::new();
     files.insert(
-        format!("{gen_name}/state.json"),
+        format!("{gen_name}/{STATE_SEGMENT}"),
         PersistedFileV1 {
-            len: state_bytes.len() as u64,
-            crc32: crc_of(&state_bytes),
+            len: state_seg_bytes.len() as u64,
+            crc32: crc_of(&state_seg_bytes),
         },
     );
     files.insert(
@@ -249,7 +269,18 @@ pub fn load_state(
                 ),
             ));
         }
-        if rel.ends_with("state.json") {
+        if rel.ends_with(STATE_SEGMENT) {
+            // v2: binary segment holding one record (the state blob).
+            let records = segment::decode(&bytes, &path.display().to_string())?;
+            let blob = records
+                .first()
+                .ok_or_else(|| Error::corrupt(path.display().to_string(), "empty state segment"))?;
+            state = Some(
+                serde_json::from_slice(blob)
+                    .map_err(|e| Error::corrupt(path.display().to_string(), e.to_string()))?,
+            );
+        } else if rel.ends_with(STATE_JSON) {
+            // v1 legacy: plain JSON state (transparently migrated on next flush).
             state = Some(
                 serde_json::from_slice(&bytes)
                     .map_err(|e| Error::corrupt(path.display().to_string(), e.to_string()))?,
@@ -264,7 +295,10 @@ pub fn load_state(
         }
     }
     let state = state.ok_or_else(|| {
-        Error::corrupt(gen_name.clone(), "manifest missing state.json".to_string())
+        Error::corrupt(
+            gen_name.clone(),
+            "manifest missing state.rvseg/state.json".to_string(),
+        )
     })?;
     let vectors = vectors
         .ok_or_else(|| Error::corrupt(gen_name, "manifest missing vectors.bin".to_string()))?;

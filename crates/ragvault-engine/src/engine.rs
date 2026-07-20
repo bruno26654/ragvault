@@ -2442,7 +2442,7 @@ mod tests {
             .find(|e| e.file_name().to_string_lossy().starts_with("gen-"))
             .unwrap()
             .path();
-        let state_path = gen_dir.join("state.json");
+        let state_path = gen_dir.join("state.rvseg");
         let mut bytes = std::fs::read(&state_path).unwrap();
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0xFF;
@@ -2453,6 +2453,112 @@ mod tests {
             matches!(result, Err(Error::Corrupt { .. })),
             "corruption must surface as an explicit error"
         );
+    }
+
+    #[test]
+    fn v2_flush_writes_binary_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+            engine
+                .upsert_document(
+                    doc("a", json!({})),
+                    vec![chunk("a", 0, "content")],
+                    &unit_vec(4, 0),
+                    None,
+                )
+                .unwrap();
+            engine.flush().unwrap();
+        }
+        let manifest = snapshot::load_manifest(dir.path()).unwrap().unwrap();
+        assert_eq!(manifest.format_version, 2, "flush must write v2");
+        let gen_dir = dir.path().join(format!("gen-{}", manifest.generation));
+        assert!(gen_dir.join("state.rvseg").exists(), "binary base segment");
+        assert!(!gen_dir.join("state.json").exists(), "no legacy json");
+    }
+
+    #[test]
+    fn v1_vault_migrates_to_v2_on_reopen_and_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        // 1. Build a real v2 vault.
+        {
+            let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+            engine
+                .upsert_document(
+                    doc("a", json!({})),
+                    vec![chunk("a", 0, "legacy content")],
+                    &unit_vec(4, 0),
+                    None,
+                )
+                .unwrap();
+            engine.flush().unwrap();
+        }
+        // 2. Downgrade it on disk to the v1 JSON layout: extract the state blob
+        //    from the binary segment, write it as state.json, drop the segment,
+        //    and rewrite the manifest as format_version = 1.
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("manifest.json")).unwrap())
+                .unwrap();
+        let generation = manifest["generation"].as_u64().unwrap();
+        let gen_dir = dir.path().join(format!("gen-{generation}"));
+        let seg_bytes = std::fs::read(gen_dir.join("state.rvseg")).unwrap();
+        let blob = crate::segment::decode(&seg_bytes, "state.rvseg")
+            .unwrap()
+            .remove(0);
+        std::fs::write(gen_dir.join("state.json"), &blob).unwrap();
+        std::fs::remove_file(gen_dir.join("state.rvseg")).unwrap();
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&blob);
+        let mut files = manifest["files"].as_object().unwrap().clone();
+        files.remove(&format!("gen-{generation}/state.rvseg"));
+        files.insert(
+            format!("gen-{generation}/state.json"),
+            serde_json::json!({ "len": blob.len(), "crc32": crc.finalize() }),
+        );
+        let mut m = manifest.clone();
+        m["format_version"] = serde_json::json!(1);
+        m["files"] = serde_json::Value::Object(files);
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_vec_pretty(&m).unwrap(),
+        )
+        .unwrap();
+
+        // 3. Reopen: the v1 vault loads, search still works.
+        {
+            let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+            let hits = engine
+                .search(&SearchRequest {
+                    vector: Some(unit_vec(4, 0)),
+                    text: Some("legacy content".into()),
+                    sparse: None,
+                    k: 5,
+                    mode: "hybrid".into(),
+                    candidates: None,
+                    filter: None,
+                    ef_search: None,
+                    nprobe: None,
+                    weights: None,
+                })
+                .unwrap()
+                .hits;
+            assert_eq!(hits.len(), 1, "v1 data must be readable after migration");
+            // 4. A write + flush migrates the base to v2.
+            engine
+                .upsert_document(
+                    doc("b", json!({})),
+                    vec![chunk("b", 0, "new content")],
+                    &unit_vec(4, 1),
+                    None,
+                )
+                .unwrap();
+            engine.flush().unwrap();
+        }
+        let migrated = snapshot::load_manifest(dir.path()).unwrap().unwrap();
+        assert_eq!(migrated.format_version, 2, "flush migrates to v2");
+        let gen_dir = dir.path().join(format!("gen-{}", migrated.generation));
+        assert!(gen_dir.join("state.rvseg").exists());
+        assert!(!gen_dir.join("state.json").exists());
     }
 
     #[test]

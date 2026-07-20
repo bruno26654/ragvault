@@ -13,6 +13,12 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
 ## [Unreleased]
 
 ### Added
+- **Storage format v2 (binary base segment).** The snapshot base is now written
+  as `gen-N/state.rvseg` — a binary segment container with per-record and
+  streaming CRC (`crate::segment`) — instead of `state.json`. Manifests are
+  `format_version = 2`; a v1 vault opens unchanged and migrates transparently
+  on the next flush. Multi-segment delta flush and read-safe online compaction
+  are the remaining v2 units (ADR 0016).
 - **Native batch retrieval.** `kb.retrieve_many()` / `kb.search_many()` run a
   list of queries through one GIL-released Rust call with per-query
   parallelism, returning results identical to sequential `retrieve()`
