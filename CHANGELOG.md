@@ -45,6 +45,11 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
   on reopen, restoring the expected recall/`nprobe` curve.
 
 ### Fixed
+- **Windows write-path portability.** The WAL is opened read+write (seeked to
+  end) instead of in append mode, so `set_len` no longer fails with "Access is
+  denied" on `close()` under Windows; and `KnowledgeBase.close()` now releases
+  the sqlite embedding-cache handle so the knowledge base directory can be
+  removed. Both were caught by the multiplatform wheel smoke test.
 - **P0 write-path atomicity.** Prepared writes are now validated in full
   *before* the WAL append; apply is infallible and publishes at the end, and a
   corrupt batch fails replay as explicit corruption instead of leaving a

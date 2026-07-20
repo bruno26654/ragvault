@@ -86,6 +86,8 @@ class _EmbeddingCache:
     def __init__(self, path: Path) -> None:
         self._path = path
         self._local = threading.local()
+        self._all_conns: list[sqlite3.Connection] = []
+        self._conns_lock = threading.Lock()
         self.hits = 0
         self.misses = 0
         conn = self._conn()
@@ -100,7 +102,23 @@ class _EmbeddingCache:
         if conn is None:
             conn = sqlite3.connect(self._path)
             self._local.conn = conn
+            with self._conns_lock:
+                self._all_conns.append(conn)
         return conn
+
+    def close(self) -> None:
+        """Close every connection opened across threads. Required on Windows,
+        where an open handle to ``embedding-cache.db`` blocks deletion of the
+        knowledge base directory."""
+        with self._conns_lock:
+            conns = self._all_conns
+            self._all_conns = []
+        for conn in conns:
+            try:
+                conn.close()
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
+        self._local = threading.local()
 
     def get_many(self, keys: list[str]) -> dict[str, np.ndarray]:
         if not keys:
@@ -264,8 +282,13 @@ class KnowledgeBase:
 
     def close(self) -> None:
         if not self._closed:
-            self._vault.close()
-            self._closed = True
+            try:
+                self._vault.close()
+            finally:
+                # Always release the sqlite handle so the directory can be
+                # removed (Windows cannot delete a file with an open handle).
+                self._cache.close()
+                self._closed = True
 
     def flush(self) -> None:
         self._vault.flush()

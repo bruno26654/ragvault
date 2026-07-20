@@ -113,3 +113,35 @@ class TestPresetHonesty:
         with ragvault.open(path) as kb:
             assert kb.config.preset == "quality"
             assert kb.retrieve("persisted decision", k=1).chunks
+
+
+class TestCloseReleasesHandles:
+    """close() must release every OS handle (WAL + sqlite cache) so the
+    directory is removable. On Windows a lingering handle makes shutil.rmtree
+    raise; the multiplatform CI wheel smoke test caught exactly this."""
+
+    def test_close_completes_and_releases_cache(self, tmp_path):
+        import shutil
+
+        path = tmp_path / "kb"
+        kb = ragvault.open(path)
+        kb.add([{"id": "a", "text": "refund and cancellation policy"}])
+        assert kb.retrieve("refund policy", k=1).chunks
+        kb.close()
+        # sqlite connections closed (list emptied by _EmbeddingCache.close)
+        assert kb._cache._all_conns == []
+        # a second close is a no-op, not an error
+        kb.close()
+        # directory is fully removable — no open handle keeps a file alive
+        shutil.rmtree(path)
+        assert not path.exists()
+
+    def test_close_after_flush_and_reopen(self, tmp_path):
+        path = tmp_path / "kb"
+        with ragvault.open(path) as kb:
+            kb.add([{"id": f"d{i}", "text": f"topic {i}"} for i in range(5)])
+            kb.flush()
+        # reopen (WAL truncated on the prior close) then append + close again
+        with ragvault.open(path) as kb:
+            kb.add([{"id": "extra", "text": "appended after reopen"}])
+            assert kb.retrieve("appended after reopen", k=1).chunks
