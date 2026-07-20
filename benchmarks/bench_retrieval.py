@@ -303,15 +303,11 @@ def bench_ivf(n: int = 50_000, dim: int = 384, n_queries: int = 100, k: int = 10
     log("")
     log("| nprobe | recall@10 | QPS (1 thread) | p50 ms | p95 ms |")
     log("|---|---|---|---|---|")
-    for nprobe in (4, 8, 16, 32):
-        # nprobe is per-open config; reopening also re-verifies + retrains.
-        vault.close()
-        config["ivf"]["nprobe"] = nprobe
-        vault = _native.Vault.open(tmp, json.dumps(config))
+    for nprobe in (4, 8, 16, 32, 64):
         latencies = []
         hits = 0
         for qi, q in enumerate(queries):
-            request = {"k": k, "mode": "dense", "candidates": k}
+            request = {"k": k, "mode": "dense", "candidates": k, "nprobe": nprobe}
             t = time.monotonic()
             response = vault.search(json.dumps(request), np.ascontiguousarray(q))
             latencies.append((time.monotonic() - t) * 1000)

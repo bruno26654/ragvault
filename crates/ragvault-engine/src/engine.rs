@@ -122,6 +122,9 @@ pub struct SearchRequest {
     pub filter: Option<serde_json::Value>,
     #[serde(default)]
     pub ef_search: Option<usize>,
+    /// IVF lists to probe for this query (defaults to the config value).
+    #[serde(default)]
+    pub nprobe: Option<usize>,
     /// Fusion weights per signal.
     #[serde(default)]
     pub weights: Option<HashMap<String, f32>>,
@@ -251,8 +254,11 @@ impl VaultEngine {
         let manifest = snapshot::load_manifest(path)?;
         let mut state = if let Some(manifest) = manifest {
             let mut stored_config: EngineConfig = serde_json::from_value(manifest.config.clone())?;
-            // storage is a runtime knob, not a data-format property.
+            // Runtime knobs, not data-format properties: honor the values
+            // requested for this open.
             stored_config.storage = config.storage.clone();
+            stored_config.ivf.nprobe = config.ivf.nprobe;
+            stored_config.flat_threshold = config.flat_threshold;
             if stored_config.dim != config.dim || stored_config.metric != config.metric {
                 return Err(Error::invalid(
                     "config",
@@ -654,7 +660,7 @@ impl VaultEngine {
             if state.config.index.starts_with("ivf") {
                 if let Some(ivf) = state.ivf.as_ref() {
                     dense_backend = if ivf.uses_pq() { "ivf_pq" } else { "ivf_flat" };
-                    let nprobe = state.config.ivf.nprobe;
+                    let nprobe = request.nprobe.unwrap_or(state.config.ivf.nprobe);
                     plan_reasons.push(format!(
                         "ivf: nlist {}, nprobe {nprobe}, delta rows {}",
                         ivf.nlist(),
@@ -1123,6 +1129,7 @@ mod tests {
                 candidates: None,
                 filter: None,
                 ef_search: None,
+                nprobe: None,
                 weights: None,
             })
             .unwrap();
@@ -1142,6 +1149,7 @@ mod tests {
                 candidates: None,
                 filter: None,
                 ef_search: None,
+                nprobe: None,
                 weights: None,
             })
             .unwrap();
@@ -1179,6 +1187,7 @@ mod tests {
                 candidates: None,
                 filter: None,
                 ef_search: None,
+                nprobe: None,
                 weights: None,
             })
             .unwrap()
@@ -1213,6 +1222,7 @@ mod tests {
             candidates: None,
             filter: Some(json!({"lang": "en"})),
             ef_search: None,
+            nprobe: None,
             weights: None,
         };
         let hits = engine.search(&request).unwrap().hits;
@@ -1246,6 +1256,7 @@ mod tests {
                 candidates: None,
                 filter: None,
                 ef_search: None,
+                nprobe: None,
                 weights: None,
             })
             .unwrap()
@@ -1289,6 +1300,7 @@ mod tests {
                     candidates: None,
                     filter: None,
                     ef_search: None,
+                    nprobe: None,
                     weights: None,
                 })
                 .unwrap()
@@ -1346,6 +1358,7 @@ mod tests {
                 candidates: None,
                 filter: None,
                 ef_search: None,
+                nprobe: None,
                 weights: None,
             })
             .unwrap()
@@ -1367,6 +1380,7 @@ mod tests {
                 candidates: None,
                 filter: None,
                 ef_search: None,
+                nprobe: None,
                 weights: None,
             })
             .unwrap()
@@ -1418,6 +1432,7 @@ mod tests {
             candidates: None,
             filter: None,
             ef_search: None,
+            nprobe: None,
             weights: None,
         };
         {
@@ -1479,6 +1494,7 @@ mod tests {
             candidates: None,
             filter: None,
             ef_search: None,
+            nprobe: None,
             weights: None,
         };
         {
@@ -1514,6 +1530,15 @@ mod tests {
             engine.flush().unwrap();
             let response = engine.search(&dense_req(5)).unwrap();
             assert_eq!(response.plan["dense_backend"], "ivf_flat");
+            // per-request nprobe override is honored and visible in the plan
+            let mut one_probe = dense_req(5);
+            one_probe.nprobe = Some(1);
+            let plan = engine.search(&one_probe).unwrap().plan;
+            let reason = plan["reason"].to_string();
+            assert!(
+                reason.contains("nprobe 1"),
+                "plan must show nprobe 1: {reason}"
+            );
             assert_eq!(response.hits[0].document_id, "d5");
             assert!(engine.stats()["ivf"]["nlist"].as_u64().unwrap() >= 16);
 
@@ -1574,6 +1599,7 @@ mod tests {
             candidates: None,
             filter: None,
             ef_search: None,
+            nprobe: None,
             weights: None,
         };
         {
@@ -1645,6 +1671,7 @@ mod tests {
                 candidates: None,
                 filter: None,
                 ef_search: None,
+                nprobe: None,
                 weights: None,
             })
             .unwrap()
@@ -1681,6 +1708,7 @@ mod tests {
                 candidates: None,
                 filter: None,
                 ef_search: None,
+                nprobe: None,
                 weights: None,
             })
             .unwrap();
@@ -1714,6 +1742,7 @@ mod tests {
             candidates: None,
             filter: None,
             ef_search: None,
+            nprobe: None,
             weights: None,
         };
         {
@@ -1782,6 +1811,7 @@ mod tests {
                 candidates: None,
                 filter: None,
                 ef_search: None,
+                nprobe: None,
                 weights: None,
             })
             .unwrap()
@@ -1858,6 +1888,7 @@ mod tests {
                 candidates: None,
                 filter: None,
                 ef_search: None,
+                nprobe: None,
                 weights: None,
             })
             .unwrap()

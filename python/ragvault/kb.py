@@ -493,6 +493,7 @@ class KnowledgeBase:
         mode: Optional[str] = None,
         candidates: Optional[int] = None,
         ef_search: Optional[int] = None,
+        nprobe: Optional[int] = None,
         rerank: Optional[Callable[[str, list[RetrievedChunk]], list[RetrievedChunk]]] = None,
         dense_searcher: Optional[object] = None,
         context_window: Optional[dict] = None,
@@ -524,6 +525,7 @@ class KnowledgeBase:
             "candidates": pool,
             "filter": merged_filter,
             "ef_search": ef_search or self.config.ef_search,
+            "nprobe": nprobe or self.config.nprobe,
             "weights": {
                 "dense": self.config.dense_weight,
                 "bm25": self.config.bm25_weight,
