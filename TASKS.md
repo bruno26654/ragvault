@@ -3,15 +3,19 @@
 Rastreabilidade de requisitos → implementação → evidência. Estados:
 `not-started | in-progress | blocked | implemented | under-review | validated | experimental | deferred`
 
-> **Auditoria (sessão de hardening, commit-base f69fc5e):** baseline real
-> re-executado — fmt/clippy limpos; testes Rust (95 unit/lib + 6 differential
-> + 5 proptest) e 79 Python verdes; 1 teste `gpu` deselected (sem hardware).
+> **Auditoria (hardening, HEAD 221ef7e):** baseline real re-executado —
+> fmt/clippy limpos; testes Rust (unit/lib + differential + proptest) e 87
+> Python verdes (6 skipped: roundtrips de framework sem a lib + teste `gpu`).
 > **P0 de atomicidade foi encontrado, reproduzido e corrigido** (5aec3b9):
 > até então o Gate A estava superestimado — escrita rejeitada podia deixar
 > mutação parcial e WAL envenenado. Com o fix + suíte diferencial (04dc12a)
-> + identidade de ingestão por bytes e presets honestos (5d996c7), os Gates
-> A–C voltam a `validated` com evidência nova. Limitações do ambiente:
-> CUDA/cuVS e wheels não-Linux não validáveis aqui.
+> + identidade de ingestão por bytes e presets honestos (5d996c7), context v2
+> (dd1ce16), eval texto real (ae8fe9f), filtros tipados (3b7fddf), batch
+> nativo (cd95482) e CI multiplataforma + integrações reais (221ef7e), os
+> Gates A–D estão `validated` com evidência nova. **Restam apenas itens de
+> performance/formato:** profiling HNSW e storage v2 segmentado (ver rodapé).
+> Limitações do ambiente: CUDA/cuVS e a *execução* de wheels não-Linux não são
+> validáveis aqui — a matriz de CI existe e roda nos runners.
 
 ## Gate A — Fundação confiável (VALIDATED)
 
@@ -44,8 +48,8 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 | Fusão híbrida RRF ponderada | fusion.rs | testes de determinismo/pesos | validated |
 | Filtro integrado à travessia HNSW + retry ef + fallback Flat exato | engine.rs::search | `filters_apply_to_all_signals` | validated |
 | Planner explicável (flat vs hnsw, razões, custos) | engine.rs | plan JSON em toda busca; testes explain | validated |
-| Índices tipados de metadados (bitmaps/ranges) | — | filtro avalia predicado por candidato (correto, não indexado) | deferred |
-| Segmentos imutáveis + mutable segment | — | arena única + tombstones + compaction síncrona | deferred |
+| Índices tipados de metadados (bitmaps/ranges) | engine.rs (3b7fddf) | ver Gate D (posting lists keyword/bool + BTreeMap numérico, plano, RESULTS-FILTERS.md) | validated |
+| Segmentos imutáveis + mutable segment | — | hoje: arena única + tombstones + compaction síncrona; storage v2 segmentado é a próxima tarefa (ver rodapé) | deferred |
 | Compactação | engine.rs::compact | `compact_drops_tombstones_and_preserves_results` | validated (síncrona; background deferred) |
 | Concorrência: leitores paralelos + GIL liberado | bindings + testes | `test_gil_released_during_search`, `test_concurrent_reads_are_safe` | validated |
 
@@ -113,6 +117,14 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 - Interop Faiss (`ragvault.compat.faiss`, nível *convertible*) — validated com faiss-cpu real (`TestFaissCompat`: export → reconstruct → import com paridade de ranking).
 - `Database`/coleções (`ragvault.Database.open`) — validated (`TestDatabase`: isolamento entre coleções, nomes validados contra path traversal, descoberta em reopen). `ragvault.connect()` — assinatura reservada com NotImplementedError explícito (remoto é pós-v0.1, ADR 0001).
 - CLI `benchmark` e `migrate` — implemented (benchmark mede nesta máquina e declara isso; migrate delega à migração blocking testada).
-- Integração LangChain — validated (`TestLangChain`). LlamaIndex/Haystack/DSPy — implemented (não testados contra as libs reais; erro acionável sem a dependência).
-- Wheels multiplataforma: CI cobre Linux x86-64; macOS/Windows/ARM64 exigem runners não disponíveis neste ambiente.
+- Integrações LangChain/LlamaIndex/Haystack/DSPy — validated (`TestIntegrations`): roundtrips reais contra versões fixadas no job `integrations` do CI; erro acionável quando a lib está ausente. Localmente os roundtrips fazem `importorskip`.
+- Wheels multiplataforma — implemented: matriz de CI (`.github/workflows/ci.yml` job `wheels`) constrói Linux x86-64/aarch64, macOS arm64 (macos-14) e Windows x86-64, cada um com smoke de clean-install (`open → add → retrieve`). Execução dos runners não-Linux ocorre no CI, não neste ambiente. Changelog/checklist de release em `CHANGELOG.md` e `docs/RELEASE.md`.
 - `kb.migrate_embeddings` — validated (estratégia blocking com swap atômico e preservação do vault antigo em falha; `TestMigrateEmbeddings`). Estratégias background/copy-on-write — planned.
+
+## Backlog v1.0 restante (apenas performance/formato — nenhum P0/P1 aberto)
+
+| Tarefa | Status | Critério de conclusão |
+|---|---|---|
+| Profiling HNSW e correção de gargalos comprovados | not-started | Perfil medido primeiro; primeiro alvo: alocação O(N) de `visited`/scratch por busca em `hnsw.rs` → pool geracional + scratch por thread. Refazer curvas recall / p50/p95/p99 / QPS / memória vs Faiss no mesmo recall. Só aplicar o que o perfil justificar. |
+| Storage v2 binário segmentado | not-started | Segmentos imutáveis + mutable segment, manifest atômico versionado, checksums em streaming, query multi-segmento, compactação segura, compat/migração de formato, testes crash/reopen/read-durante-compactação. Base atual: snapshot JSON v1 + `vectors.bin` mmap-able. |
+| Roaring bitmaps / histogramas / OPQ / binary quantization | deferred | Só substituir posting lists / quantizadores atuais quando profiling ou benchmark demonstrar necessidade. |
