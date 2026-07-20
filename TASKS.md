@@ -1,7 +1,17 @@
 # TASKS
 
 Rastreabilidade de requisitos → implementação → evidência. Estados:
-`not-started | in-progress | blocked | implemented | validated | experimental | deferred`
+`not-started | in-progress | blocked | implemented | under-review | validated | experimental | deferred`
+
+> **Auditoria (sessão de hardening, commit-base f69fc5e):** baseline real
+> re-executado — fmt/clippy limpos; testes Rust (95 unit/lib + 6 differential
+> + 5 proptest) e 79 Python verdes; 1 teste `gpu` deselected (sem hardware).
+> **P0 de atomicidade foi encontrado, reproduzido e corrigido** (5aec3b9):
+> até então o Gate A estava superestimado — escrita rejeitada podia deixar
+> mutação parcial e WAL envenenado. Com o fix + suíte diferencial (04dc12a)
+> + identidade de ingestão por bytes e presets honestos (5d996c7), os Gates
+> A–C voltam a `validated` com evidência nova. Limitações do ambiente:
+> CUDA/cuVS e wheels não-Linux não validáveis aqui.
 
 ## Gate A — Fundação confiável (VALIDATED)
 
@@ -17,6 +27,10 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 | Recovery snapshot + WAL replay | engine.rs | `reopen_after_flush_uses_snapshot_plus_wal` | validated |
 | Lock de writer único por diretório | engine.rs | `second_writer_is_rejected` | validated |
 | Upsert/replace/delete atômicos por documento | engine.rs | `replace_publishes_atomically...` | validated |
+| **Prepared-write: validação integral pré-WAL, apply infalível, replay de batch corrompido falha claro** | engine.rs (5aec3b9) | `rejected_write_leaves_no_trace_even_after_reopen`, `rejected_replace_preserves_old_version` | validated |
+| Equivalência diferencial compact == compact+reopen (todos os backends) | tests/differential_consistency.rs (04dc12a) | 6 configs, workload misto, 2 tenants | validated |
+| Identidade de fonte por sha256(raw_bytes) + fingerprints de pipeline | kb.py::sync (5d996c7) | `TestSourceIdentity` (binários distintos, invalidação por pipeline) | validated |
+| Preset `quality` sem degradação lexical silenciosa; `offline-lite` explícito | kb.py/config.py (5d996c7) | `TestPresetHonesty` | validated |
 | Bindings Python com exceções específicas, sem panics propagados | ragvault-python | suíte pytest | validated |
 
 ## Gate B — Retrieval competitivo (VALIDATED, com limitações registradas)
