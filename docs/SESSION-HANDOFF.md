@@ -5,9 +5,9 @@ Atualizado ao final de cada sessão de trabalho (disciplina de continuidade).
 ```
 branch:        claude/ragvault-python-library-xeltxs
 commit-base:   f69fc5e (merge da main pós-PR#1/#2; baseline auditado nesta sessão)
-último commit: ver `git log -1` (todos os commits desta sessão estão pushed)
+último commit: dd1ce16 (context v2) — todos pushed
 push:          em dia — working tree limpo
-PR:            #1 mergeada; novos commits fluem pela branch (abrir nova PR p/ main quando desejar)
+PR:            #1/#2 mergeadas; PR dos 5 commits de hardening (5aec3b9..dd1ce16) aberta nesta sessão
 ```
 
 ## Baseline auditado (esta sessão, neste hardware: 4 vCPUs, sem GPU)

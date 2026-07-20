@@ -125,6 +125,11 @@ tenant_kb.retrieve(...)   # filtro de tenant aplicado a toda query
 | Recurso | Status |
 |---|---|
 | KnowledgeBase (`open/add/sync/retrieve/ask/evaluate`) | implemented |
+| Atomicidade de escrita (prepared-write pré-WAL, replay de batch corrompido falha claro) | implemented + testes de regressão |
+| Equivalência compact == compact+reopen (suíte diferencial, todos os backends) | implemented |
+| Identidade de ingestão por sha256(bytes) + fingerprints de pipeline | implemented |
+| Preset `offline-lite` (baseline lexical explícito); `quality` exige decisão de embedding | implemented |
+| Contexto v2: fusão de chunks adjacentes + flag `result.truncated` | implemented |
 | Flat exato + HNSW com filtros integrados | implemented |
 | BM25 incremental + fusão RRF ponderada | implemented |
 | Sparse vectors fornecidos pelo usuário | implemented (persistidos no WAL, sobrevivem a crash e compactação) |
