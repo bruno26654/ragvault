@@ -21,6 +21,11 @@ Presets: `quality, balanced, fast, offline, multilingual, code, long_documents, 
 | `retrieve_many(queries, **kw)` / `aretrieve` / `aretrieve_many` | lote e async |
 | `ask(question, llm=..., citations=True, system_prompt=None, **retrieve_kw)` | → `Answer` (LLM é seu) |
 | `evaluate(dataset, k=10)` | → `EvaluationReport` |
+| `compare(dataset, presets=[...], k=10)` | avalia presets (parâmetros de retrieval) → `ComparisonReport` |
+| `tune(dataset, objective="ndcg@10", max_p95_ms=None, grid=None)` | grid-search com evidência → `TuningRecommendation` (nunca aplica sozinho) |
+| `apply(recommendation)` | aplica e persiste uma recomendação explicitamente |
+| `as_langchain_retriever(k=8)` | retriever LangChain (requer langchain-core) |
+| `as_llamaindex_retriever(k=8)` | retriever LlamaIndex (requer llama-index-core) |
 | `for_tenant(tenant_id)` | view com isolamento automático de tenant |
 | `stats()` / `inspect(document_id)` / `documents()` | introspecção |
 | `flush()` / `compact()` / `close()` | durabilidade e manutenção |

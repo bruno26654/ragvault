@@ -122,15 +122,17 @@ tenant_kb.retrieve(...)   # filtro de tenant aplicado a toda query
 | KnowledgeBase (`open/add/sync/retrieve/ask/evaluate`) | implemented |
 | Flat exato + HNSW com filtros integrados | implemented |
 | BM25 incremental + fusão RRF ponderada | implemented |
-| Sparse vectors fornecidos pelo usuário | implemented (não persistidos no WAL — ver docs/STORAGE.md) |
+| Sparse vectors fornecidos pelo usuário | implemented (persistidos no WAL, sobrevivem a crash e compactação) |
 | WAL + recovery + snapshots atômicos | implemented |
 | Contexto com MMR, expansão, token budget, citações | implemented |
 | Avaliação nativa (Recall@k, MRR, nDCG, latência) | implemented |
 | CLI (`init/sync/query/doctor/evaluate/compact`) | implemented |
 | Presets (`quality/balanced/fast/offline/...`) | implemented |
+| Comparação de presets e auto-tuning (`kb.compare`/`kb.tune`/`kb.apply`) | implemented |
+| Integração LangChain (`kb.as_langchain_retriever()`) | implemented |
 | Quantização (SQ8/IVF/PQ), mmap | planned |
 | Backends GPU (cuVS/CAGRA) | planned |
-| Integrações LangChain/LlamaIndex | planned |
+| Integração LlamaIndex | implemented (untested: requer llama-index-core; erro acionável sem a dependência) |
 | Wheels multiplataforma no PyPI | planned (CI configurado para Linux) |
 
 Detalhes de arquitetura interna (segmentos, HNSW, WAL): [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Limitações conhecidas: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).

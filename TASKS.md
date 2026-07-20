@@ -54,7 +54,7 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 | Multi-tenancy com isolamento adversarial | `test_tenant_isolation` | validated |
 | CLI init/sync/query/inspect/doctor/evaluate/compact | exercitada manualmente + smoke no CI | validated |
 | Reranking plugável (callback, tolerante a falha) | `test_rerank_callback_and_tolerant_failure` | validated |
-| kb.compare / kb.tune | — | not-started |
+| kb.compare / kb.tune / kb.apply | `TestCompare`, `TestTune` (grid com evidência, restrição de p95, nunca auto-aplica) | validated |
 | Studio UI | — | not-started |
 
 ## Gate D — Performance avançada
@@ -66,7 +66,7 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 | Comparação com faiss-cpu no mesmo hardware | validated | benchmarks/RESULTS.md (cenário único; sem claim universal) |
 | SQ8 / IVF / PQ / OPQ / binary | not-started | |
 | mmap / storage híbrido | not-started | |
-| Autotuning (kb.tune) | not-started | |
+| Autotuning (kb.tune) | validated | grid retrieval-time com evidência por trial |
 
 ## Gate E — GPU
 
@@ -77,10 +77,9 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 
 ## Outras pendências registradas
 
-- Sparse vectors não são persistidos no WAL (somente em snapshots via flush) — documentado em docs/STORAGE.md.
-- `compact()` não preserva sparse postings (rebuild deixa vazio) — documentado; corrigir junto com persistência sparse.
+- ~~Sparse não persistido no WAL / compact não preserva sparse~~ — resolvido: sparse vai ao WAL (campo opcional, retrocompatível) e `compact()` faz remap de postings; testes `sparse_survives_wal_replay_and_compaction` (Rust) e `TestSparsePersistence` (Python).
 - Snapshot serializa estado como JSON (formato v1) — formato binário de segmentos planejado atrás do mesmo manifest.
 - Named vectors / multivectors (MaxSim) — not-started.
-- Integrações LangChain/LlamaIndex/Haystack/DSPy — not-started.
+- Integração LangChain — validated (`TestLangChain`, adapter com proveniência completa). LlamaIndex — implemented (não testado: dependência não instalada no ambiente; erro acionável). Haystack/DSPy — not-started.
 - Wheels multiplataforma: CI cobre Linux x86-64; macOS/Windows/ARM64 exigem runners não disponíveis neste ambiente.
 - `kb.migrate_embeddings` — not-started (reopen com embedder diferente é rejeitado com erro claro).

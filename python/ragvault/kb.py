@@ -517,8 +517,8 @@ class KnowledgeBase:
 
         doc_cache: dict[str, Optional[dict]] = {}
         chunks: list[RetrievedChunk] = []
-        for hit in response["hits"]:
-            chunk = self._vault.get_chunk(hit["chunk_id"])
+        hit_chunks = self._vault.get_chunks([h["chunk_id"] for h in response["hits"]])
+        for hit, chunk in zip(response["hits"], hit_chunks):
             if chunk is None:
                 continue
             doc_id = hit["document_id"]
@@ -634,6 +634,42 @@ class KnowledgeBase:
         from .evaluate import evaluate_kb
 
         return evaluate_kb(self, dataset, k=k, **retrieve_kwargs)
+
+    def compare(self, dataset: Union[str, Path, Iterable[dict]],
+                presets: Optional[list[str]] = None, *, k: int = 10):
+        """Evaluate several presets' retrieval-time settings on this KB."""
+        from .tuning import compare_presets
+
+        return compare_presets(self, dataset, presets, k=k)
+
+    def tune(self, dataset: Union[str, Path, Iterable[dict]], *,
+             objective: str = "ndcg@10", k: int = 10,
+             max_p95_ms: Optional[float] = None,
+             grid: Optional[dict] = None):
+        """Grid-search retrieval parameters; returns a recommendation with
+        evidence. Never applies anything automatically."""
+        from .tuning import tune as _tune
+
+        return _tune(self, dataset, objective=objective, k=k,
+                     max_p95_ms=max_p95_ms, grid=grid)
+
+    def apply(self, recommendation) -> None:
+        """Explicitly apply a TuningRecommendation and persist the config."""
+        from .tuning import apply_recommendation
+
+        apply_recommendation(self, recommendation)
+
+    # -- integrations --------------------------------------------------------
+
+    def as_langchain_retriever(self, *, k: int = 8, **retrieve_kwargs: Any):
+        from .integrations import as_langchain_retriever
+
+        return as_langchain_retriever(self, k=k, **retrieve_kwargs)
+
+    def as_llamaindex_retriever(self, *, k: int = 8, **retrieve_kwargs: Any):
+        from .integrations import as_llamaindex_retriever
+
+        return as_llamaindex_retriever(self, k=k, **retrieve_kwargs)
 
     # -- multi-tenancy -----------------------------------------------------
 

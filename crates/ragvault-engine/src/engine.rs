@@ -284,8 +284,16 @@ impl VaultEngine {
                     document,
                     chunks,
                     dim,
+                    sparse,
                 } => {
-                    Self::apply_upsert(&mut state, document, chunks, &record.payload, dim)?;
+                    Self::apply_upsert_with_sparse(
+                        &mut state,
+                        document,
+                        chunks,
+                        &record.payload,
+                        dim,
+                        sparse,
+                    )?;
                 }
                 WalOp::DeleteDocument { document_id } => {
                     Self::apply_delete(&mut state, &document_id);
@@ -354,25 +362,13 @@ impl VaultEngine {
             document: document.clone(),
             chunks: chunks.clone(),
             dim,
+            sparse: sparse.clone(),
         };
         state.wal.append(seq, &op, vectors)?;
-        // Sparse vectors are not WAL-persisted in v0.1 (documented
-        // limitation; they are rebuilt into snapshots on flush). Reject the
-        // combination of sparse + batch-sync crash expectations in docs.
         Self::apply_upsert_with_sparse(&mut state, document, chunks, vectors, dim, sparse)?;
         state.seq = seq;
         state.dirty = true;
         Ok(next_version)
-    }
-
-    fn apply_upsert(
-        state: &mut State,
-        document: Document,
-        chunks: Vec<Chunk>,
-        vectors: &[f32],
-        dim: usize,
-    ) -> Result<()> {
-        Self::apply_upsert_with_sparse(state, document, chunks, vectors, dim, None)
     }
 
     fn apply_upsert_with_sparse(
@@ -765,23 +761,22 @@ impl VaultEngine {
             let mut arena = VectorArena::new(config.dim, config.metric);
             let mut hnsw = Hnsw::new(config.hnsw.clone());
             let mut bm25 = Bm25Index::new(config.bm25.clone());
-            let sparse = SparseIndex::new();
             let mut chunks: Vec<Option<StoredChunk>> = Vec::new();
             let mut chunk_ids = HashMap::new();
             let mut doc_rows: HashMap<String, Vec<u32>> = HashMap::new();
+            let mut row_map: HashMap<u32, u32> = HashMap::new();
 
             let mut live_rows: Vec<u32> = (0..state.chunks.len() as u32)
                 .filter(|&r| !state.arena.is_deleted(r) && state.chunks[r as usize].is_some())
                 .collect();
             live_rows.sort();
-            let mut new_sparse = sparse;
             for old_row in live_rows {
                 let sc = state.chunks[old_row as usize].as_ref().expect("live row");
                 let vector = state.arena.get(old_row).to_vec();
                 let new_row = arena.push(&vector)?;
                 hnsw.insert(&arena, new_row);
                 bm25.add(new_row, &sc.chunk.text);
-                new_sparse.add_empty(new_row); // sparse rebuild limitation (see docs)
+                row_map.insert(old_row, new_row);
                 chunk_ids.insert(sc.chunk.chunk_id.clone(), new_row);
                 doc_rows
                     .entry(sc.chunk.document_id.clone())
@@ -792,10 +787,10 @@ impl VaultEngine {
                     eff_metadata: sc.eff_metadata.clone(),
                 }));
             }
+            state.sparse = state.sparse.remap(&row_map, arena.len() as u32);
             state.arena = arena;
             state.hnsw = hnsw;
             state.bm25 = bm25;
-            state.sparse = new_sparse;
             state.chunks = chunks;
             state.chunk_ids = chunk_ids;
             state.doc_rows = doc_rows;
@@ -1189,6 +1184,58 @@ mod tests {
         }
         let wrong = VaultEngine::open(dir.path(), config(8));
         assert!(wrong.is_err());
+    }
+
+    #[test]
+    fn sparse_survives_wal_replay_and_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let sv = SparseVector {
+            indices: vec![3, 9],
+            values: vec![1.5, 2.0],
+        };
+        let sparse_query = SearchRequest {
+            vector: None,
+            text: None,
+            sparse: Some(sv.clone()),
+            k: 5,
+            mode: "sparse".into(),
+            candidates: None,
+            filter: None,
+            ef_search: None,
+            weights: None,
+        };
+        {
+            let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+            engine
+                .upsert_document(
+                    doc("keep", json!({})),
+                    vec![chunk("keep", 0, "kept sparse doc")],
+                    &unit_vec(4, 0),
+                    Some(vec![Some(sv.clone())]),
+                )
+                .unwrap();
+            engine
+                .upsert_document(
+                    doc("drop", json!({})),
+                    vec![chunk("drop", 0, "dropped doc")],
+                    &unit_vec(4, 1),
+                    None,
+                )
+                .unwrap();
+            // no flush: crash-simulating drop — sparse must come back via WAL
+        }
+        let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+        let hits = engine.search(&sparse_query).unwrap().hits;
+        assert_eq!(hits.len(), 1, "sparse signal must survive WAL replay");
+        assert_eq!(hits[0].document_id, "keep");
+        assert_eq!(hits[0].sparse_score, Some(1.5 * 1.5 + 2.0 * 2.0));
+
+        // Compaction must remap sparse postings, not drop them.
+        engine.delete_document("drop").unwrap();
+        engine.compact().unwrap();
+        let hits = engine.search(&sparse_query).unwrap().hits;
+        assert_eq!(hits.len(), 1, "sparse signal must survive compaction");
+        assert_eq!(hits[0].document_id, "keep");
     }
 
     #[test]

@@ -48,6 +48,27 @@ impl SparseIndex {
         self.len += 1;
     }
 
+    /// Rebuild the index keeping only docs present in `map` (old id → new
+    /// id), used by compaction. `new_len` is the row count of the compacted
+    /// arena; every mapped id must be < new_len.
+    pub fn remap(&self, map: &HashMap<u32, u32>, new_len: u32) -> SparseIndex {
+        let mut postings: HashMap<u32, Vec<(u32, f32)>> = HashMap::new();
+        for (&dim, entries) in &self.postings {
+            let mut remapped: Vec<(u32, f32)> = entries
+                .iter()
+                .filter_map(|&(doc, val)| map.get(&doc).map(|&new_doc| (new_doc, val)))
+                .collect();
+            if !remapped.is_empty() {
+                remapped.sort_by_key(|&(doc, _)| doc);
+                postings.insert(dim, remapped);
+            }
+        }
+        SparseIndex {
+            postings,
+            len: new_len,
+        }
+    }
+
     /// Sparse dot-product top-k with integrated accept predicate.
     pub fn search(
         &self,
@@ -108,6 +129,22 @@ mod tests {
         idx.add(1, &sv(&[(1, 5.0)])).unwrap();
         let results = idx.search(&sv(&[(1, 1.0)]), 10, &|d| d == 0).unwrap();
         assert_eq!(results, vec![(0, 1.0)]);
+    }
+
+    #[test]
+    fn remap_preserves_scores_for_kept_docs() {
+        let mut idx = SparseIndex::new();
+        idx.add(0, &sv(&[(1, 1.0)])).unwrap();
+        idx.add(1, &sv(&[(1, 5.0), (2, 3.0)])).unwrap();
+        idx.add(2, &sv(&[(2, 7.0)])).unwrap();
+        // Drop doc 0; doc 1 -> 0, doc 2 -> 1 (as compaction would).
+        let map = HashMap::from([(1u32, 0u32), (2u32, 1u32)]);
+        let remapped = idx.remap(&map, 2);
+        assert_eq!(remapped.len(), 2);
+        let results = remapped.search(&sv(&[(2, 1.0)]), 10, &|_| true).unwrap();
+        assert_eq!(results, vec![(1, 7.0), (0, 3.0)]);
+        let results = remapped.search(&sv(&[(1, 1.0)]), 10, &|_| true).unwrap();
+        assert_eq!(results, vec![(0, 5.0)], "dropped doc must vanish");
     }
 
     #[test]

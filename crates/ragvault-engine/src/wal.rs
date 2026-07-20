@@ -42,6 +42,11 @@ pub enum WalOp {
         /// dims of the dense vectors in the payload (payload holds
         /// `chunks.len() * dim` f32 LE values; 0 = no vectors).
         dim: usize,
+        /// Optional sparse vectors, one entry per chunk. Absent in records
+        /// written before this field existed (serde default keeps old WALs
+        /// readable).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sparse: Option<Vec<Option<ragvault_core::SparseVector>>>,
     },
     DeleteDocument {
         document_id: String,
@@ -244,6 +249,24 @@ mod tests {
             document: doc(id),
             chunks: vec![],
             dim,
+            sparse: None,
+        }
+    }
+
+    #[test]
+    fn records_without_sparse_field_still_parse() {
+        // Backward compatibility: headers written before the `sparse` field
+        // existed must keep replaying.
+        let old_header = serde_json::json!({
+            "op": "upsert_document",
+            "document": doc("legacy"),
+            "chunks": [],
+            "dim": 0,
+        });
+        let parsed: WalOp = serde_json::from_value(old_header).unwrap();
+        match parsed {
+            WalOp::UpsertDocument { sparse, .. } => assert!(sparse.is_none()),
+            _ => panic!("wrong op"),
         }
     }
 

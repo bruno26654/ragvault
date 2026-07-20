@@ -25,6 +25,5 @@
 
 ## Limitações conhecidas e documentadas
 
-- Sparse vectors não vão ao WAL (persistem apenas via snapshot no `flush()`); um crash antes do flush perde só o sinal sparse, nunca o documento. `compact()` atualmente não reconstrói postings sparse.
 - Snapshot v1 serializa estado como JSON — reabertura de vaults muito grandes é mais lenta que um formato binário de segmentos (planejado como format_version 2, com migração explícita).
 - Compactação é síncrona (determinística em testes); background compaction planejada.

@@ -183,6 +183,17 @@ impl PyVault {
         }
     }
 
+    /// Fetch many chunks in one call. Returns a list aligned with the input
+    /// ids; missing chunks come back as None.
+    fn get_chunks(&self, py: Python<'_>, chunk_ids: Vec<String>) -> PyResult<PyObject> {
+        let engine = self.engine()?;
+        let chunks: Vec<Option<ragvault_core::Chunk>> =
+            py.allow_threads(|| chunk_ids.iter().map(|id| engine.get_chunk(id)).collect());
+        let value =
+            serde_json::to_value(&chunks).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        json_loads(py, &value)
+    }
+
     fn get_document(&self, py: Python<'_>, document_id: String) -> PyResult<Option<PyObject>> {
         match self.engine()?.get_document(&document_id) {
             Some(doc) => {
