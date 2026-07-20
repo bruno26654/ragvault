@@ -71,6 +71,14 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 | kb.compare / kb.tune / kb.apply | `TestCompare`, `TestTune` (grid com evidência, restrição de p95, nunca auto-aplica) | validated |
 | Studio UI (`ragvault studio`, stdlib http.server, local-only) | `TestStudio` | validated |
 
+## Avaliação RAG com texto real (P1)
+
+| Tarefa | Status | Evidência |
+|---|---|---|
+| Dataset real reproduzível commitado (30 passagens / 24 queries, 12 paráfrase + 12 keyword) | validated | benchmarks/data/*.jsonl |
+| Harness bm25 / lexical / hybrid / +MMR / +expansion com Recall@k, MRR, nDCG, precision, dup, tokens, p50/p95 e MRR por estilo | validated | benchmarks/bench_rag_quality.py → RESULTS-RAG.md (números executados) |
+| Linhas semânticas (dense/hybrid/rerank com sentence-transformers) | blocked | política de rede nega huggingface.co (CONNECT 403, registrado no proxy); comando exato documentado no harness e em RESULTS-RAG.md |
+
 ## Gate D — Performance avançada
 
 | Tarefa | Status | Nota |
