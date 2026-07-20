@@ -243,9 +243,10 @@ def bench_sq8(n: int = 50_000, dim: int = 384, n_queries: int = 100, k: int = 10
     sq8_mb = stats["sq8_bytes"] / 1e6
     log(f"- quantized scan memory: {sq8_mb:.0f} MB vs {f32_mb:.0f} MB f32 "
         f"({f32_mb / sq8_mb:.1f}x smaller); f32 kept for rescoring")
-    log("- trade-off vs HNSW at this scale: exact-ish recall and much faster, "
-      "durable ingestion, at the cost of O(n) scan per query — the right choice "
-      "for write-heavy or filter-heavy medium collections")
+    log("- trade-off vs HNSW at this scale: near-exact recall and ~300x faster "
+        "durable ingestion (no graph build), at the cost of an O(n) scan per "
+        "query (slower QPS than HNSW here) — the right choice for write-heavy "
+        "or filter-heavy medium collections")
     vault.close()
     shutil.rmtree(tmp, ignore_errors=True)
 
