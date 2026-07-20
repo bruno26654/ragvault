@@ -105,6 +105,7 @@ ragvault query ./data "minha pergunta" --explain
 ragvault doctor ./data
 ragvault evaluate ./data evaluation.jsonl
 ragvault compact ./data
+ragvault studio ./data        # UI local de inspeção (sem dependências extras)
 ```
 
 ## Multi-tenancy
@@ -130,9 +131,12 @@ tenant_kb.retrieve(...)   # filtro de tenant aplicado a toda query
 | Presets (`quality/balanced/fast/offline/...`) | implemented |
 | Comparação de presets e auto-tuning (`kb.compare`/`kb.tune`/`kb.apply`) | implemented |
 | Integração LangChain (`kb.as_langchain_retriever()`) | implemented |
-| Quantização (SQ8/IVF/PQ), mmap | planned |
+| Quantização SQ8 (int8 scan + rescore f32, preset `low_memory`) | implemented |
+| `kb.migrate_embeddings` (estratégia blocking, swap atômico) | implemented |
+| RagVault Studio (`ragvault studio` — UI local sem dependências) | implemented |
+| Quantização IVF/PQ, mmap | planned |
 | Backends GPU (cuVS/CAGRA) | planned |
-| Integração LlamaIndex | implemented (untested: requer llama-index-core; erro acionável sem a dependência) |
+| Integrações LlamaIndex/Haystack/DSPy | implemented (untested: requerem as libs; erro acionável sem elas) |
 | Wheels multiplataforma no PyPI | planned (CI configurado para Linux) |
 
 Detalhes de arquitetura interna (segmentos, HNSW, WAL): [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Limitações conhecidas: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).

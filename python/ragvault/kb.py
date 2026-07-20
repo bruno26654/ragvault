@@ -659,6 +659,92 @@ class KnowledgeBase:
 
         apply_recommendation(self, recommendation)
 
+    # -- embedding migration -------------------------------------------------
+
+    def migrate_embeddings(self, new_embedding: object, *,
+                           strategy: str = "blocking") -> None:
+        """Re-embed every current document version with a new embedder and
+        atomically swap the vault.
+
+        Only ``strategy="blocking"`` is implemented (background/copy-on-write
+        are planned). The old vault stays intact until the new one is fully
+        built, flushed and validated; the swap is two directory renames.
+        Caveats (documented): version history and user-supplied sparse
+        vectors are not carried over — only current document versions.
+        """
+        if self._tenant_filter is not None:
+            raise ConfigurationError(
+                "migrate_embeddings must run on the base KnowledgeBase, "
+                "not a tenant view"
+            )
+        if strategy != "blocking":
+            raise ConfigurationError(
+                f"strategy {strategy!r} not implemented; available: 'blocking'"
+            )
+        new_embedder = resolve_embedding(new_embedding)
+        if (new_embedder.model_id == self.embedder.model_id
+                and new_embedder.dimension == self.embedder.dimension):
+            return  # nothing to do
+
+        import shutil
+
+        new_config = Config.from_dict(self.config.to_dict())
+        new_config.embedding = (
+            new_embedding if isinstance(new_embedding, str) else new_embedder.model_id
+        )
+        new_config.dim = new_embedder.dimension
+        new_fingerprint = embedding_fingerprint(new_embedder)
+
+        tmp_vault = self.path / "vault-migrate.tmp"
+        if tmp_vault.exists():
+            shutil.rmtree(tmp_vault)
+        new_vault = _native.Vault.open(
+            str(tmp_vault), json.dumps(new_config.engine_config())
+        )
+        try:
+            for doc in self._vault.list_documents():
+                chunks = self._vault.get_document_chunks(doc["document_id"])
+                if not chunks:
+                    continue
+                texts = [c["text"] for c in chunks]
+                keys = [f"{content_hash(t)}:{new_fingerprint}" for t in texts]
+                cached = self._cache.get_many(keys)
+                missing = [i for i, key in enumerate(keys) if key not in cached]
+                if missing:
+                    fresh = new_embedder.embed_documents([texts[i] for i in missing])
+                    new_items = {keys[i]: fresh[j] for j, i in enumerate(missing)}
+                    self._cache.put_many(new_items)
+                    cached.update(new_items)
+                vectors = np.stack([cached[key] for key in keys]).astype(np.float32)
+                new_vault.upsert_document(
+                    json.dumps(doc), json.dumps(chunks), np.ascontiguousarray(vectors)
+                )
+            new_vault.flush()
+        except Exception:
+            new_vault.close()
+            shutil.rmtree(tmp_vault, ignore_errors=True)
+            raise  # old vault untouched
+        new_vault.close()
+
+        # Swap: old vault preserved until the new one is in place.
+        self._vault.close()
+        old_vault = self.path / "vault-old.tmp"
+        if old_vault.exists():
+            shutil.rmtree(old_vault)
+        (self.path / "vault").rename(old_vault)
+        tmp_vault.rename(self.path / "vault")
+        shutil.rmtree(old_vault, ignore_errors=True)
+
+        self.config = new_config
+        (self.path / CONFIG_FILE).write_text(
+            json.dumps(self.config.to_dict(), indent=2, sort_keys=True) + "\n"
+        )
+        self.embedder = new_embedder
+        self._fingerprint = new_fingerprint
+        self._vault = _native.Vault.open(
+            str(self.path / "vault"), json.dumps(self.config.engine_config())
+        )
+
     # -- integrations --------------------------------------------------------
 
     def as_langchain_retriever(self, *, k: int = 8, **retrieve_kwargs: Any):
@@ -670,6 +756,16 @@ class KnowledgeBase:
         from .integrations import as_llamaindex_retriever
 
         return as_llamaindex_retriever(self, k=k, **retrieve_kwargs)
+
+    def as_haystack_retriever(self, *, k: int = 8, **retrieve_kwargs: Any):
+        from .integrations import as_haystack_retriever
+
+        return as_haystack_retriever(self, k=k, **retrieve_kwargs)
+
+    def as_dspy_retriever(self, *, k: int = 8, **retrieve_kwargs: Any):
+        from .integrations import as_dspy_retriever
+
+        return as_dspy_retriever(self, k=k, **retrieve_kwargs)
 
     # -- multi-tenancy -----------------------------------------------------
 

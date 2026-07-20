@@ -129,6 +129,23 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_studio(args: argparse.Namespace) -> int:
+    from .studio import serve
+
+    with _open(args.path) as kb:
+        server = serve(kb, host=args.host, port=args.port,
+                       open_browser=not args.no_browser)
+        host, port = server.server_address[:2]
+        print(f"RagVault Studio at http://{host}:{port}/ (Ctrl+C to stop)")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nstopping")
+        finally:
+            server.server_close()
+    return 0
+
+
 def cmd_compact(args: argparse.Namespace) -> int:
     with _open(args.path) as kb:
         before = kb.stats()
@@ -188,6 +205,13 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("compact", help="reclaim space from deletions")
     p.add_argument("path")
     p.set_defaults(fn=cmd_compact)
+
+    p = sub.add_parser("studio", help="open the local inspection UI")
+    p.add_argument("path")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=7644)
+    p.add_argument("--no-browser", action="store_true")
+    p.set_defaults(fn=cmd_studio)
 
     args = parser.parse_args(argv)
     return args.fn(args)

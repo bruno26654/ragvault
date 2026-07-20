@@ -62,6 +62,7 @@ PRESETS: dict[str, dict] = {
         "candidates": 30,
         "ef_search": 32,
         "hnsw_m": 8,
+        "quantization": "sq8",
     },
 }
 
@@ -84,6 +85,7 @@ class Config:
     hnsw_ef_construction: int = 200
     ef_search: int = 64
     flat_threshold: int = 1000
+    quantization: str = "none"  # "none" | "sq8" (int8 scan + f32 rescore)
     # retrieval
     retrieval_mode: str = "hybrid"
     candidates: int = 80
@@ -135,9 +137,9 @@ class Config:
                 self.overlap_tokens,
             ),
             "index: hnsw(M={0}, ef_construction={1}, ef_search={2}), "
-            "flat below {3} vectors".format(
+            "flat below {3} vectors, quantization={4}".format(
                 self.hnsw_m, self.hnsw_ef_construction, self.ef_search,
-                self.flat_threshold,
+                self.flat_threshold, self.quantization,
             ),
             "retrieval: mode={0} candidate_pool={1} weights(dense={2}, bm25={3}, "
             "sparse={4})".format(
@@ -168,4 +170,5 @@ class Config:
             "bm25": {"k1": 1.2, "b": 0.75, "lowercase": True},
             "wal_sync": self.wal_sync,
             "flat_threshold": self.flat_threshold,
+            "quantization": self.quantization,
         }

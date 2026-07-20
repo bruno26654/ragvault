@@ -14,5 +14,5 @@
 2. Filtros avaliam predicado por candidato (correto, mas sem índices bitmap/range dedicados — custo cresce com o pool filtrado).
 3. Snapshot v1 em JSON: reopen de bases com centenas de milhares de chunks é mais lento do que o formato binário planejado.
 4. `wal_sync="batch"` (default) pode perder os últimos commits em queda de energia (não em crash de processo). Use `wal_sync="sync"` para fsync por commit.
-5. GPU, quantização (SQ8/IVF/PQ), adaptador LlamaIndex testado e Studio ainda não existem (TASKS.md). `kb.compare`/`kb.tune`/`kb.apply` e o adaptador LangChain estão implementados e testados.
+5. GPU e quantização IVF/PQ ainda não existem (TASKS.md). SQ8 (`quantization="sq8"`), `kb.compare`/`kb.tune`/`kb.apply`, `kb.migrate_embeddings` (blocking), Studio (`ragvault studio`) e o adaptador LangChain estão implementados e testados; adaptadores LlamaIndex/Haystack/DSPy estão implementados com erro acionável quando a dependência falta (não testados contra as libs reais).
 6. Wheels PyPI ainda não publicadas; instalação via maturin.

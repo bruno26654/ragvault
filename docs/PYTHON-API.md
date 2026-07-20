@@ -26,6 +26,8 @@ Presets: `quality, balanced, fast, offline, multilingual, code, long_documents, 
 | `apply(recommendation)` | aplica e persiste uma recomendação explicitamente |
 | `as_langchain_retriever(k=8)` | retriever LangChain (requer langchain-core) |
 | `as_llamaindex_retriever(k=8)` | retriever LlamaIndex (requer llama-index-core) |
+| `as_haystack_retriever(k=8)` / `as_dspy_retriever(k=8)` | adaptadores Haystack 2.x / DSPy (deps opcionais) |
+| `migrate_embeddings(new_embedding, strategy="blocking")` | re-embeda tudo e troca o vault atomicamente |
 | `for_tenant(tenant_id)` | view com isolamento automático de tenant |
 | `stats()` / `inspect(document_id)` / `documents()` | introspecção |
 | `flush()` / `compact()` / `close()` | durabilidade e manutenção |

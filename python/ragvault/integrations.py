@@ -71,6 +71,63 @@ def as_langchain_retriever(kb: "KnowledgeBase", *, k: int = 8, **retrieve_kwargs
     return retriever
 
 
+def as_haystack_retriever(kb: "KnowledgeBase", *, k: int = 8, **retrieve_kwargs: Any):
+    """A Haystack 2.x component that retrieves RagVault chunks as Documents.
+
+    Requires ``pip install haystack-ai``.
+    """
+    try:
+        from haystack import Document as HSDocument, component
+    except ImportError as exc:
+        raise ConfigurationError(
+            "as_haystack_retriever() requires haystack-ai: pip install haystack-ai"
+        ) from exc
+
+    @component
+    class RagVaultHaystackRetriever:
+        @component.output_types(documents=list)
+        def run(self, query: str):
+            result = kb.retrieve(query, k=k, **retrieve_kwargs)
+            documents = [
+                HSDocument(
+                    id=chunk.chunk_id,
+                    content=chunk.text,
+                    score=chunk.score,
+                    meta={
+                        "document_id": chunk.document_id,
+                        "document_version": chunk.document_version,
+                        "title": chunk.title,
+                        "uri": chunk.uri,
+                        "section_path": chunk.section_path,
+                    },
+                )
+                for chunk in result.chunks
+            ]
+            return {"documents": documents}
+
+    return RagVaultHaystackRetriever()
+
+
+def as_dspy_retriever(kb: "KnowledgeBase", *, k: int = 8, **retrieve_kwargs: Any):
+    """A DSPy retrieval module backed by this knowledge base.
+
+    Requires ``pip install dspy``.
+    """
+    try:
+        import dspy
+    except ImportError as exc:
+        raise ConfigurationError(
+            "as_dspy_retriever() requires dspy: pip install dspy"
+        ) from exc
+
+    class RagVaultDspyRetriever(dspy.Retrieve):
+        def forward(self, query: str, k_override: int | None = None):
+            result = kb.retrieve(query, k=k_override or k, **retrieve_kwargs)
+            return dspy.Prediction(passages=[chunk.text for chunk in result.chunks])
+
+    return RagVaultDspyRetriever(k=k)
+
+
 def as_llamaindex_retriever(kb: "KnowledgeBase", *, k: int = 8, **retrieve_kwargs: Any):
     """A LlamaIndex ``BaseRetriever`` backed by this knowledge base.
 

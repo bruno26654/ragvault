@@ -9,9 +9,13 @@ Números reais medidos neste repositório: **benchmarks/RESULTS.md** (gerado por
 - Arena contígua row-major; cosine normalizado no insert (busca = dot).
 - GIL liberado em busca/ingestão/flush/compact (testado).
 
+## Quantização SQ8 (`quantization="sq8"` / preset `low_memory`)
+
+Backend `sq8_flat`: cada vetor é quantizado para int8 com escala própria; a busca varre os códigos int8 (4x menos banda de memória), sobreamostra 4x e refina os sobreviventes contra os vetores f32 originais — recall quase exato sem construir grafo (ingestão muito mais rápida, escolha certa para coleções médias com muita escrita ou filtro). Números reais em benchmarks/RESULTS.md. Limitações: métricas cosine/dot (L2 é rejeitada com erro claro); os f32 são mantidos para rescoring, então a economia é no custo de varredura e no grafo, não no total residente.
+
 ## O que ainda não está (honesto)
 
-- SQ8/IVF/PQ/OPQ, mmap, prefetch explícito, intrinsics por arquitetura, autotuning: planejados (Gate D em TASKS.md). Não há números para eles porque não existem.
+- IVF/PQ/OPQ/binary, mmap, prefetch explícito, intrinsics por arquitetura: planejados (Gate D em TASKS.md). Não há números para eles porque não existem.
 - Snapshot JSON v1 torna reopen de vaults muito grandes mais lento que o necessário — medido em RESULTS.md, correção planejada.
 
 ## Comparações

@@ -55,7 +55,7 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 | CLI init/sync/query/inspect/doctor/evaluate/compact | exercitada manualmente + smoke no CI | validated |
 | Reranking plugável (callback, tolerante a falha) | `test_rerank_callback_and_tolerant_failure` | validated |
 | kb.compare / kb.tune / kb.apply | `TestCompare`, `TestTune` (grid com evidência, restrição de p95, nunca auto-aplica) | validated |
-| Studio UI | — | not-started |
+| Studio UI (`ragvault studio`, stdlib http.server, local-only) | `TestStudio` | validated |
 
 ## Gate D — Performance avançada
 
@@ -64,7 +64,7 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 | Kernels auto-vetorizados portáteis + testes diferenciais | validated | unrolled 4-acc; sem intrinsics por arch (deferred) |
 | Top-k limitado com merge por shard | validated | |
 | Comparação com faiss-cpu no mesmo hardware | validated | benchmarks/RESULTS.md (cenário único; sem claim universal) |
-| SQ8 / IVF / PQ / OPQ / binary | not-started | |
+| SQ8 (int8 + rescore f32, backend sq8_flat) | validated | testes Rust+Python, benchmark real em RESULTS.md; IVF/PQ/OPQ/binary not-started |
 | mmap / storage híbrido | not-started | |
 | Autotuning (kb.tune) | validated | grid retrieval-time com evidência por trial |
 
@@ -80,6 +80,6 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 - ~~Sparse não persistido no WAL / compact não preserva sparse~~ — resolvido: sparse vai ao WAL (campo opcional, retrocompatível) e `compact()` faz remap de postings; testes `sparse_survives_wal_replay_and_compaction` (Rust) e `TestSparsePersistence` (Python).
 - Snapshot serializa estado como JSON (formato v1) — formato binário de segmentos planejado atrás do mesmo manifest.
 - Named vectors / multivectors (MaxSim) — not-started.
-- Integração LangChain — validated (`TestLangChain`, adapter com proveniência completa). LlamaIndex — implemented (não testado: dependência não instalada no ambiente; erro acionável). Haystack/DSPy — not-started.
+- Integração LangChain — validated (`TestLangChain`). LlamaIndex/Haystack/DSPy — implemented (não testados contra as libs reais; erro acionável sem a dependência).
 - Wheels multiplataforma: CI cobre Linux x86-64; macOS/Windows/ARM64 exigem runners não disponíveis neste ambiente.
-- `kb.migrate_embeddings` — not-started (reopen com embedder diferente é rejeitado com erro claro).
+- `kb.migrate_embeddings` — validated (estratégia blocking com swap atômico e preservação do vault antigo em falha; `TestMigrateEmbeddings`). Estratégias background/copy-on-write — planned.

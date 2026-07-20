@@ -24,7 +24,7 @@ use serde_json::json;
 
 use ragvault_core::{now_millis, Chunk, Document, Error, Filter, Metric, Result, SparseVector};
 use ragvault_retrieval::{rrf_fuse, Bm25Index, Bm25Params, FusionInput, SparseIndex};
-use ragvault_vector::{FlatIndex, Hnsw, HnswConfig, VectorArena};
+use ragvault_vector::{FlatIndex, Hnsw, HnswConfig, Sq8Arena, TopK, VectorArena};
 
 use crate::snapshot::{self, PersistedStateV1, PersistedVersionV1};
 use crate::wal::{SyncPolicy, Wal, WalOp};
@@ -43,6 +43,15 @@ pub struct EngineConfig {
     /// Below this many live vectors the planner always uses Flat.
     #[serde(default = "default_flat_threshold")]
     pub flat_threshold: usize,
+    /// "none" (default) or "sq8". With sq8, dense search runs an int8
+    /// quantized scan with f32 rescoring instead of building an HNSW graph
+    /// (4x smaller scan, near-exact recall; see docs/PERFORMANCE.md).
+    #[serde(default = "default_quantization")]
+    pub quantization: String,
+}
+
+fn default_quantization() -> String {
+    "none".to_string()
 }
 
 fn default_flat_threshold() -> usize {
@@ -58,6 +67,7 @@ impl EngineConfig {
             bm25: Bm25Params::default(),
             wal_sync: SyncPolicy::default(),
             flat_threshold: default_flat_threshold(),
+            quantization: default_quantization(),
         }
     }
 }
@@ -127,6 +137,7 @@ struct State {
     chunk_ids: HashMap<String, u32>,
     doc_rows: HashMap<String, Vec<u32>>,
     arena: VectorArena,
+    sq8: Option<Sq8Arena>,
     hnsw: Hnsw,
     bm25: Bm25Index,
     sparse: SparseIndex,
@@ -235,6 +246,15 @@ impl VaultEngine {
                 }
             }
             let wal = Wal::open(path, stored_config.wal_sync)?;
+            let sq8 = if stored_config.quantization == "sq8" {
+                let mut q = Sq8Arena::new(stored_config.dim, stored_config.metric)?;
+                for row in 0..arena.len() as u32 {
+                    q.push(arena.get(row))?;
+                }
+                Some(q)
+            } else {
+                None
+            };
             State {
                 config: stored_config,
                 documents: persisted
@@ -247,6 +267,7 @@ impl VaultEngine {
                 chunk_ids,
                 doc_rows,
                 arena,
+                sq8,
                 hnsw: persisted.hnsw,
                 bm25: persisted.bm25,
                 sparse: persisted.sparse,
@@ -259,6 +280,11 @@ impl VaultEngine {
             let wal = Wal::open(path, config.wal_sync)?;
             State {
                 arena: VectorArena::new(config.dim, config.metric),
+                sq8: if config.quantization == "sq8" {
+                    Some(Sq8Arena::new(config.dim, config.metric)?)
+                } else {
+                    None
+                },
                 hnsw: Hnsw::new(config.hnsw.clone()),
                 bm25: Bm25Index::new(config.bm25.clone()),
                 sparse: SparseIndex::new(),
@@ -395,7 +421,12 @@ impl VaultEngine {
         for (i, chunk) in chunks.into_iter().enumerate() {
             let vector = &vectors[i * dim..(i + 1) * dim];
             let row = state.arena.push(vector)?;
-            state.hnsw.insert(&state.arena, row);
+            if let Some(sq8) = state.sq8.as_mut() {
+                // sq8 mode replaces the graph: quantized scan + f32 rescore.
+                sq8.push(state.arena.get(row))?;
+            } else {
+                state.hnsw.insert(&state.arena, row);
+            }
             state.bm25.add(row, &chunk.text);
             match sparse.as_ref().and_then(|s| s.get(i).cloned().flatten()) {
                 Some(sv) => state.sparse.add(row, &sv)?,
@@ -532,8 +563,22 @@ impl VaultEngine {
             })?;
             let prepared = state.arena.prepare_query(vector)?;
             let live = state.arena.live();
-            let use_flat = live <= state.config.flat_threshold || state.hnsw.is_empty();
-            if use_flat {
+            if let Some(sq8) = state.sq8.as_ref() {
+                dense_backend = "sq8_flat";
+                let oversample = (pool * 4).max(pool + 16);
+                plan_reasons.push(format!(
+                    "sq8 quantized scan: oversample {oversample}, f32 rescore to pool {pool}"
+                ));
+                let quantized = sq8.prepare_query(&prepared)?;
+                let candidates = sq8.scan(&quantized, oversample, &|id| {
+                    !state.arena.is_deleted(id) && accept(id)
+                });
+                let mut rescored = TopK::new(pool);
+                for (id, _) in candidates {
+                    rescored.push(id, state.arena.score(id, &prepared));
+                }
+                dense = rescored.into_sorted();
+            } else if live <= state.config.flat_threshold || state.hnsw.is_empty() {
                 dense_backend = "flat";
                 plan_reasons.push(format!(
                     "flat scan: {live} live vectors <= flat_threshold {}",
@@ -761,6 +806,11 @@ impl VaultEngine {
             let mut arena = VectorArena::new(config.dim, config.metric);
             let mut hnsw = Hnsw::new(config.hnsw.clone());
             let mut bm25 = Bm25Index::new(config.bm25.clone());
+            let mut sq8 = if state.sq8.is_some() {
+                Some(Sq8Arena::new(config.dim, config.metric)?)
+            } else {
+                None
+            };
             let mut chunks: Vec<Option<StoredChunk>> = Vec::new();
             let mut chunk_ids = HashMap::new();
             let mut doc_rows: HashMap<String, Vec<u32>> = HashMap::new();
@@ -774,7 +824,11 @@ impl VaultEngine {
                 let sc = state.chunks[old_row as usize].as_ref().expect("live row");
                 let vector = state.arena.get(old_row).to_vec();
                 let new_row = arena.push(&vector)?;
-                hnsw.insert(&arena, new_row);
+                if let Some(q) = sq8.as_mut() {
+                    q.push(arena.get(new_row))?;
+                } else {
+                    hnsw.insert(&arena, new_row);
+                }
                 bm25.add(new_row, &sc.chunk.text);
                 row_map.insert(old_row, new_row);
                 chunk_ids.insert(sc.chunk.chunk_id.clone(), new_row);
@@ -789,6 +843,7 @@ impl VaultEngine {
             }
             state.sparse = state.sparse.remap(&row_map, arena.len() as u32);
             state.arena = arena;
+            state.sq8 = sq8;
             state.hnsw = hnsw;
             state.bm25 = bm25;
             state.chunks = chunks;
@@ -813,6 +868,8 @@ impl VaultEngine {
             "seq": state.seq,
             "dirty": state.dirty,
             "hnsw_nodes": state.hnsw.len(),
+            "quantization": state.config.quantization,
+            "sq8_bytes": state.sq8.as_ref().map(|q| q.memory_bytes()),
         })
     }
 
@@ -1184,6 +1241,75 @@ mod tests {
         }
         let wrong = VaultEngine::open(dir.path(), config(8));
         assert!(wrong.is_err());
+    }
+
+    #[test]
+    fn sq8_backend_full_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(8);
+        cfg.quantization = "sq8".to_string();
+        let dense_req = |hot: usize| SearchRequest {
+            vector: Some(unit_vec(8, hot)),
+            text: None,
+            sparse: None,
+            k: 3,
+            mode: "dense".into(),
+            candidates: None,
+            filter: None,
+            ef_search: None,
+            weights: None,
+        };
+        {
+            let engine = VaultEngine::open(dir.path(), cfg.clone()).unwrap();
+            for i in 0..30 {
+                let id = format!("d{i}");
+                engine
+                    .upsert_document(
+                        doc(&id, json!({"parity": i % 2})),
+                        vec![chunk(&id, 0, &format!("doc {i}"))],
+                        &unit_vec(8, i),
+                        None,
+                    )
+                    .unwrap();
+            }
+            let response = engine.search(&dense_req(3)).unwrap();
+            assert_eq!(response.plan["dense_backend"], "sq8_flat");
+            assert_eq!(response.hits[0].document_id, "d3");
+            assert_eq!(engine.stats()["hnsw_nodes"], 0, "sq8 mode skips the graph");
+            assert!(engine.stats()["sq8_bytes"].as_u64().unwrap() > 0);
+
+            // filters are a true prefilter on the quantized scan
+            let mut filtered = dense_req(3);
+            filtered.filter = Some(json!({"parity": 0}));
+            let hits = engine.search(&filtered).unwrap().hits;
+            assert!(!hits.is_empty());
+            assert!(hits
+                .iter()
+                .all(|h| h.document_id[1..].parse::<usize>().unwrap() % 2 == 0));
+            engine.flush().unwrap();
+        }
+        // reopen rebuilds the quantized arena from the snapshot
+        let engine = VaultEngine::open(dir.path(), cfg.clone()).unwrap();
+        let response = engine.search(&dense_req(5)).unwrap();
+        assert_eq!(response.plan["dense_backend"], "sq8_flat");
+        assert_eq!(response.hits[0].document_id, "d5");
+        // compaction preserves the quantized backend
+        for i in 0..10 {
+            engine.delete_document(&format!("d{i}")).unwrap();
+        }
+        engine.compact().unwrap();
+        let response = engine.search(&dense_req(15)).unwrap();
+        assert_eq!(response.plan["dense_backend"], "sq8_flat");
+        assert_eq!(response.hits[0].document_id, "d15");
+    }
+
+    #[test]
+    fn sq8_rejects_l2_metric() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(4);
+        cfg.quantization = "sq8".to_string();
+        cfg.metric = Metric::L2;
+        assert!(VaultEngine::open(dir.path(), cfg).is_err());
     }
 
     #[test]
