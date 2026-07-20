@@ -72,14 +72,25 @@ impl Wal {
     }
 
     /// Open (or create) the WAL for appending.
+    ///
+    /// Opened read+write (not `append`) and seeked to the end: appends are
+    /// serialized by the single-writer directory lock, so OS-level atomic
+    /// append is unnecessary — and on Windows a handle opened in append mode
+    /// lacks `FILE_WRITE_DATA`, which makes [`Self::truncate`]'s `set_len`
+    /// fail with "Access is denied" (os error 5). Read+write keeps `set_len`
+    /// portable across platforms.
     pub fn open(dir: &Path, policy: SyncPolicy) -> Result<Wal> {
         let path = Self::wal_path(dir);
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
-            .append(true)
             .read(true)
+            .write(true)
+            .truncate(false) // keep existing records; we seek to the end below
             .open(&path)
             .map_err(|e| Error::io(format!("open wal {}", path.display()), e))?;
+        // Position at end so records append after any existing log.
+        file.seek(SeekFrom::End(0))
+            .map_err(|e| Error::io("seek wal to end", e))?;
         Ok(Wal {
             path,
             writer: BufWriter::new(file),
@@ -357,6 +368,49 @@ mod tests {
         let records = Wal::replay(dir.path(), 0).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].seq, 2);
+    }
+
+    #[test]
+    fn reopen_appends_after_existing_records() {
+        // Regression: the WAL is opened read+write (not O_APPEND) and seeked
+        // to the end, so a reopened log must append after existing records
+        // rather than overwrite from offset 0. (O_APPEND was dropped because
+        // it makes set_len fail on Windows.)
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), SyncPolicy::Sync).unwrap();
+        wal.append(1, &upsert("a", 0), &[1.0]).unwrap();
+        drop(wal);
+
+        let mut wal = Wal::open(dir.path(), SyncPolicy::Sync).unwrap();
+        wal.append(2, &upsert("b", 0), &[2.0]).unwrap();
+        drop(wal);
+
+        let records = Wal::replay(dir.path(), 0).unwrap();
+        assert_eq!(records.len(), 2, "reopen must not clobber the first record");
+        assert_eq!(records[0].seq, 1);
+        assert_eq!(records[0].payload, vec![1.0]);
+        assert_eq!(records[1].seq, 2);
+        assert_eq!(records[1].payload, vec![2.0]);
+    }
+
+    #[test]
+    fn truncate_then_reopen_then_append_is_clean() {
+        // Exercises the full close-path shape that failed on Windows:
+        // truncate (set_len 0) on the writer handle, reopen, append.
+        let dir = tempfile::tempdir().unwrap();
+        let mut wal = Wal::open(dir.path(), SyncPolicy::Sync).unwrap();
+        wal.append(1, &upsert("a", 0), &[]).unwrap();
+        wal.append(2, &upsert("b", 0), &[]).unwrap();
+        wal.truncate().unwrap();
+        drop(wal);
+
+        let mut wal = Wal::open(dir.path(), SyncPolicy::Sync).unwrap();
+        wal.append(3, &upsert("c", 0), &[]).unwrap();
+        drop(wal);
+
+        let records = Wal::replay(dir.path(), 0).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].seq, 3);
     }
 
     #[test]

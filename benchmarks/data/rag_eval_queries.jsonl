@@ -1,0 +1,24 @@
+{"query": "how long do I have to send something back for my money", "relevant_ids": ["refund-policy"], "style": "paraphrase"}
+{"query": "who pays the postage when I return a broken item", "relevant_ids": ["refund-shipping-costs"], "style": "paraphrase"}
+{"query": "when will the money show up on my card after approval", "relevant_ids": ["refund-processing-time"], "style": "paraphrase"}
+{"query": "fastest way to get a package delivered inside the country", "relevant_ids": ["shipping-domestic"], "style": "paraphrase"}
+{"query": "why is my overseas parcel stuck at the border", "relevant_ids": ["shipping-international"], "style": "paraphrase"}
+{"query": "shut down my profile permanently", "relevant_ids": ["account-closure"], "style": "paraphrase"}
+{"query": "download everything you have stored about me", "relevant_ids": ["account-data-export"], "style": "paraphrase"}
+{"query": "does the company give my details to other businesses", "relevant_ids": ["privacy-sharing"], "style": "paraphrase"}
+{"query": "my laptop stopped working is it covered", "relevant_ids": ["warranty-coverage"], "style": "paraphrase"}
+{"query": "extra charge for paying my bill late", "relevant_ids": ["billing-late-fees"], "style": "paraphrase"}
+{"query": "talk to a human on the weekend", "relevant_ids": ["support-hours"], "style": "paraphrase"}
+{"query": "minimum computer specs to run the program", "relevant_ids": ["installation-requirements"], "style": "paraphrase"}
+{"query": "tracking code parcel email dispatch", "relevant_ids": ["shipping-tracking"], "style": "keyword"}
+{"query": "two-factor authentication hardware key lock", "relevant_ids": ["account-security"], "style": "keyword"}
+{"query": "cookies consent analytics banner", "relevant_ids": ["privacy-cookies"], "style": "keyword"}
+{"query": "warranty claim serial number proof of purchase", "relevant_ids": ["warranty-claims"], "style": "keyword"}
+{"query": "extended protection plan battery degradation", "relevant_ids": ["warranty-extensions"], "style": "keyword"}
+{"query": "invoice tax identification number monthly", "relevant_ids": ["billing-invoices"], "style": "keyword"}
+{"query": "API rate limit 429 Retry-After", "relevant_ids": ["api-rate-limits"], "style": "keyword"}
+{"query": "webhook HMAC signature retries backoff", "relevant_ids": ["api-webhooks"], "style": "keyword"}
+{"query": "cancel subscription end of paid period refund", "relevant_ids": ["cancellation-subscription"], "style": "keyword"}
+{"query": "cancel order carrier pending status", "relevant_ids": ["cancellation-orders"], "style": "keyword"}
+{"query": "early termination exit fee annual contract", "relevant_ids": ["cancellation-fees"], "style": "keyword"}
+{"query": "escalate ticket senior engineer", "relevant_ids": ["support-escalation"], "style": "keyword"}

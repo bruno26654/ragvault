@@ -7,7 +7,11 @@ De documentos a um RAG confiável em minutos, sem montar manualmente uma stack d
 ```python
 import ragvault
 
-kb = ragvault.open("./knowledge", preset="quality")
+kb = ragvault.open(
+    "./knowledge",
+    preset="quality",
+    embedding="sentence-transformers:all-MiniLM-L6-v2",  # decisão explícita
+)
 kb.sync("./documents")
 
 result = kb.retrieve("Quais são as regras de cancelamento?", token_budget=6000)
@@ -53,10 +57,10 @@ pip install "ragvault[local-models]"  # sentence-transformers
 
 ## Três níveis de uso
 
-**Simples** — funciona offline com o embedder lexical embutido (determinístico, sem dependências; documentado como lexical, não semântico — combine com um modelo real para máxima qualidade):
+**Simples** — funciona offline com o embedder lexical embutido (determinístico, sem dependências; documentado como lexical, não semântico). O preset `quality` **exige** uma decisão explícita de embedding — nunca degrada silenciosamente para lexical nem baixa modelos sozinho:
 
 ```python
-kb = ragvault.open("./data")
+kb = ragvault.open("./data")  # preset balanced: lexical explícito por default
 kb.add(["primeiro texto", "segundo texto"])
 result = kb.retrieve("minha pergunta")
 ```
@@ -121,6 +125,11 @@ tenant_kb.retrieve(...)   # filtro de tenant aplicado a toda query
 | Recurso | Status |
 |---|---|
 | KnowledgeBase (`open/add/sync/retrieve/ask/evaluate`) | implemented |
+| Atomicidade de escrita (prepared-write pré-WAL, replay de batch corrompido falha claro) | implemented + testes de regressão |
+| Equivalência compact == compact+reopen (suíte diferencial, todos os backends) | implemented |
+| Identidade de ingestão por sha256(bytes) + fingerprints de pipeline | implemented |
+| Preset `offline-lite` (baseline lexical explícito); `quality` exige decisão de embedding | implemented |
+| Contexto v2: fusão de chunks adjacentes + flag `result.truncated` | implemented |
 | Flat exato + HNSW com filtros integrados | implemented |
 | BM25 incremental + fusão RRF ponderada | implemented |
 | Sparse vectors fornecidos pelo usuário | implemented (persistidos no WAL, sobrevivem a crash e compactação) |

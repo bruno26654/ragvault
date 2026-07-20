@@ -473,6 +473,7 @@ dependencies = [
  "ragvault-core",
  "ragvault-retrieval",
  "ragvault-vector",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",

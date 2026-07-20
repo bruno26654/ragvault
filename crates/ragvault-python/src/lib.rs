@@ -253,6 +253,41 @@ impl PyVault {
             .map_err(to_py_err)
     }
 
+    /// Batch search: requests as a JSON array; optional float32 matrix
+    /// supplies request i's dense vector from row i. Runs the whole batch in
+    /// parallel with the GIL released; results are identical to sequential
+    /// `search` calls (native equivalence test).
+    #[pyo3(signature = (requests_json, vectors=None))]
+    fn search_many(
+        &self,
+        py: Python<'_>,
+        requests_json: String,
+        vectors: Option<PyReadonlyArray2<'_, f32>>,
+    ) -> PyResult<PyObject> {
+        let mut requests: Vec<SearchRequest> = serde_json::from_str(&requests_json)
+            .map_err(|e| PyValueError::new_err(format!("invalid search requests: {e}")))?;
+        if let Some(matrix) = vectors {
+            let array = matrix.as_array();
+            if array.nrows() != requests.len() {
+                return Err(PyValueError::new_err(format!(
+                    "vectors has {} rows but {} requests were provided",
+                    array.nrows(),
+                    requests.len()
+                )));
+            }
+            for (i, request) in requests.iter_mut().enumerate() {
+                request.vector = Some(array.row(i).iter().copied().collect());
+            }
+        }
+        let engine = self.engine()?;
+        let responses = py
+            .allow_threads(|| engine.search_many(&requests))
+            .map_err(to_py_err)?;
+        let value = serde_json::to_value(&responses)
+            .map_err(|e| PyRuntimeError::new_err(format!("serialize responses: {e}")))?;
+        json_loads(py, &value)
+    }
+
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
         let engine = self.engine()?;
         py.allow_threads(|| engine.flush()).map_err(to_py_err)

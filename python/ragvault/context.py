@@ -69,6 +69,8 @@ class RetrievalResult:
     token_count: int
     plan: dict = field(default_factory=dict)
     trace: Optional[dict] = None
+    #: True when any selected content was cut to fit the token budget.
+    truncated: bool = False
 
     @property
     def text(self) -> str:
@@ -203,37 +205,59 @@ def assemble_context(
                                           chunk.score)
     final.sort(key=lambda c: (-doc_best[c.document_id], c.document_id, c.chunk_index))
 
-    # 6. citations + formatting
+    # 6. merge adjacent runs: chunks from the same document AND version with
+    #    consecutive chunk_index (typical after neighbor expansion) become a
+    #    single reading-order block. Merging never crosses documents or
+    #    versions and never mutates the stored chunk texts (join only).
+    runs: list[list[RetrievedChunk]] = []
+    for chunk in final:
+        last = runs[-1] if runs else None
+        if (last
+                and last[-1].document_id == chunk.document_id
+                and last[-1].document_version == chunk.document_version
+                and chunk.chunk_index == last[-1].chunk_index + 1):
+            last.append(chunk)
+        else:
+            runs.append([chunk])
+
+    # 7. citations + formatting (one citation per document, chunk_ids keep
+    #    the per-excerpt provenance; merged runs render as one block).
     citations: list[Citation] = []
     doc_to_citation: dict[str, Citation] = {}
     blocks: list[str] = []
-    for chunk in final:
-        citation = doc_to_citation.get(chunk.document_id)
+    truncated = any("truncated" in c.selection_reason for c in final)
+    for run in runs:
+        first = run[0]
+        citation = doc_to_citation.get(first.document_id)
         if citation is None:
             citation = Citation(
                 index=len(citations) + 1,
-                document_id=chunk.document_id,
-                document_version=chunk.document_version,
+                document_id=first.document_id,
+                document_version=first.document_version,
                 chunk_ids=[],
-                title=chunk.title,
-                uri=chunk.uri,
-                section=" > ".join(chunk.section_path) or None,
-                page_number=chunk.page_number,
-                score=chunk.score,
+                title=first.title,
+                uri=first.uri,
+                section=" > ".join(first.section_path) or None,
+                page_number=first.page_number,
+                score=first.score,
             )
             citations.append(citation)
-            doc_to_citation[chunk.document_id] = citation
-        citation.chunk_ids.append(chunk.chunk_id)
-        citation.score = max(citation.score, chunk.score)
+            doc_to_citation[first.document_id] = citation
+        for chunk in run:
+            citation.chunk_ids.append(chunk.chunk_id)
+            citation.score = max(citation.score, chunk.score)
 
         header = f"[{citation.index}]"
-        if chunk.title:
-            header += f" {chunk.title}"
-        if chunk.section_path:
-            header += f" — {' > '.join(chunk.section_path)}"
-        if chunk.page_number is not None:
-            header += f" (page {chunk.page_number})"
-        blocks.append(f"{header}\n{chunk.text.strip()}")
+        if first.title:
+            header += f" {first.title}"
+        if first.section_path:
+            header += f" — {' > '.join(first.section_path)}"
+        if first.page_number is not None:
+            header += f" (page {first.page_number})"
+        body = "\n".join(chunk.text.strip() for chunk in run)
+        if truncated and any("truncated" in c.selection_reason for c in run):
+            header += " [truncated to fit token budget]"
+        blocks.append(f"{header}\n{body}")
 
     context = "\n\n".join(blocks)
     total_tokens = sum(c.token_count for c in final)
@@ -247,10 +271,14 @@ def assemble_context(
             "token_budget": token_budget,
             "tokens_used": total_tokens,
         }
+    if trace is not None:
+        trace["context"]["merged_blocks"] = len(runs)
+        trace["context"]["truncated"] = truncated
     return RetrievalResult(
         context=context,
         chunks=final,
         citations=citations,
         token_count=total_tokens,
         trace=trace,
+        truncated=truncated,
     )

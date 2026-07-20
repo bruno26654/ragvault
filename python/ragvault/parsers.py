@@ -19,6 +19,10 @@ from typing import Callable, Optional
 
 from .errors import IngestionError
 
+# Bumping this invalidates synced documents (processing fingerprint):
+# raise it whenever parser output for the same bytes can change.
+PARSER_VERSION = "2"
+
 CODE_EXTENSIONS = {
     ".py", ".rs", ".js", ".ts", ".tsx", ".jsx", ".go", ".java", ".c", ".h",
     ".cpp", ".hpp", ".rb", ".php", ".swift", ".kt", ".scala", ".sh", ".sql",

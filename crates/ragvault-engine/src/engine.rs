@@ -152,6 +152,161 @@ pub struct SearchResponse {
     pub plan: serde_json::Value,
 }
 
+/// Typed metadata index over top-level scalar fields of the effective
+/// metadata: keyword/bool posting lists for `eq`, a sorted numeric index
+/// for ranges. Rows are appended in ascending order, so posting lists stay
+/// sorted; tombstones are filtered at query time and compaction rebuilds.
+#[derive(Default)]
+struct MetaIndex {
+    keyword: HashMap<(String, String), Vec<u32>>,
+    boolean: HashMap<(String, bool), Vec<u32>>,
+    /// field -> BTreeMap<order-preserving f64 bits, rows>
+    numeric: HashMap<String, std::collections::BTreeMap<u64, Vec<u32>>>,
+}
+
+/// Monotonic mapping f64 -> u64 (IEEE total-order trick; NaN never stored).
+fn f64_sortable(x: f64) -> u64 {
+    let bits = x.to_bits();
+    if bits >> 63 == 0 {
+        bits ^ 0x8000_0000_0000_0000
+    } else {
+        !bits
+    }
+}
+
+impl MetaIndex {
+    fn add_row(&mut self, row: u32, eff_metadata: &serde_json::Value) {
+        let Some(map) = eff_metadata.as_object() else {
+            return;
+        };
+        for (key, value) in map {
+            match value {
+                serde_json::Value::String(v) => self
+                    .keyword
+                    .entry((key.clone(), v.clone()))
+                    .or_default()
+                    .push(row),
+                serde_json::Value::Bool(b) => {
+                    self.boolean.entry((key.clone(), *b)).or_default().push(row)
+                }
+                serde_json::Value::Number(n) => {
+                    if let Some(f) = n.as_f64() {
+                        if f.is_finite() {
+                            self.numeric
+                                .entry(key.clone())
+                                .or_default()
+                                .entry(f64_sortable(f))
+                                .or_default()
+                                .push(row);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn lookup_cmp(&self, field: &str, op: &ragvault_core::filter::CmpOp) -> Option<Vec<u32>> {
+        use ragvault_core::filter::CmpOp;
+        match op {
+            CmpOp::Eq(serde_json::Value::String(v)) => Some(
+                self.keyword
+                    .get(&(field.to_string(), v.clone()))
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            CmpOp::Eq(serde_json::Value::Bool(b)) => Some(
+                self.boolean
+                    .get(&(field.to_string(), *b))
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            CmpOp::Eq(serde_json::Value::Number(n)) => {
+                let f = n.as_f64()?;
+                let tree = self.numeric.get(field)?;
+                Some(tree.get(&f64_sortable(f)).cloned().unwrap_or_default())
+            }
+            CmpOp::Gt(v) | CmpOp::Gte(v) | CmpOp::Lt(v) | CmpOp::Lte(v) => {
+                let f = v.as_f64()?;
+                if !f.is_finite() {
+                    return None;
+                }
+                let tree = self.numeric.get(field)?;
+                let key = f64_sortable(f);
+                use std::ops::Bound::{Excluded, Included, Unbounded};
+                let range: Box<dyn Iterator<Item = &Vec<u32>>> = match op {
+                    CmpOp::Gt(_) => {
+                        Box::new(tree.range((Excluded(key), Unbounded)).map(|(_, r)| r))
+                    }
+                    CmpOp::Gte(_) => {
+                        Box::new(tree.range((Included(key), Unbounded)).map(|(_, r)| r))
+                    }
+                    CmpOp::Lt(_) => {
+                        Box::new(tree.range((Unbounded, Excluded(key))).map(|(_, r)| r))
+                    }
+                    _ => Box::new(tree.range((Unbounded, Included(key))).map(|(_, r)| r)),
+                };
+                let mut rows: Vec<u32> = range.flatten().copied().collect();
+                rows.sort_unstable();
+                Some(rows)
+            }
+            _ => None,
+        }
+    }
+
+    /// Try to answer (part of) the filter from the typed indexes. Returns
+    /// (sorted candidate rows, fully_covered): when not fully covered, the
+    /// residual predicate must still be applied on top of the row set.
+    fn prefilter(&self, filter: &Filter) -> Option<(Vec<u32>, bool)> {
+        match filter {
+            Filter::Cmp { field, op } if !field.contains('.') => {
+                self.lookup_cmp(field, op).map(|rows| (rows, true))
+            }
+            Filter::And(parts) => {
+                let mut acc: Option<Vec<u32>> = None;
+                let mut covered = true;
+                let mut any = false;
+                for part in parts {
+                    match self.prefilter(part) {
+                        Some((rows, part_covered)) => {
+                            any = true;
+                            covered &= part_covered;
+                            acc = Some(match acc {
+                                None => rows,
+                                Some(prev) => intersect_sorted(&prev, &rows),
+                            });
+                        }
+                        None => covered = false,
+                    }
+                }
+                if any {
+                    Some((acc.unwrap_or_default(), covered))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(a.len().min(b.len()));
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
 struct StoredChunk {
     chunk: Chunk,
     /// Effective metadata for filtering: document metadata overlaid with
@@ -168,6 +323,7 @@ struct State {
     chunk_ids: HashMap<String, u32>,
     doc_rows: HashMap<String, Vec<u32>>,
     arena: VectorArena,
+    meta_index: MetaIndex,
     sq8: Option<Sq8Arena>,
     ivf: Option<IvfIndex>,
     hnsw: Hnsw,
@@ -355,6 +511,7 @@ impl VaultEngine {
                 chunk_ids,
                 doc_rows,
                 arena,
+                meta_index: MetaIndex::default(),
                 sq8,
                 ivf: None,
                 hnsw: persisted.hnsw,
@@ -369,6 +526,7 @@ impl VaultEngine {
             let wal = Wal::open(path, config.wal_sync)?;
             State {
                 arena: VectorArena::new(config.dim, config.metric),
+                meta_index: MetaIndex::default(),
                 sq8: if config.quantization == "sq8" {
                     Some(Sq8Arena::new(config.dim, config.metric)?)
                 } else {
@@ -391,6 +549,14 @@ impl VaultEngine {
             }
         };
 
+        // Rebuild the typed metadata index from loaded chunks (rebuildable
+        // acceleration structure, like sq8/ivf — not persisted).
+        for (row, slot) in state.chunks.iter().enumerate() {
+            if let Some(sc) = slot {
+                state.meta_index.add_row(row as u32, &sc.eff_metadata);
+            }
+        }
+
         // Recovery: replay WAL operations newer than the snapshot.
         let records = Wal::replay(path, state.seq)?;
         for record in records {
@@ -402,6 +568,10 @@ impl VaultEngine {
                     dim,
                     sparse,
                 } => {
+                    // Records in the WAL passed prepared-write validation
+                    // before being appended; a failure here means the
+                    // committed batch is corrupt — fail clearly instead of
+                    // opening with partial state.
                     Self::apply_upsert_with_sparse(
                         &mut state,
                         document,
@@ -409,7 +579,13 @@ impl VaultEngine {
                         &record.payload,
                         dim,
                         sparse,
-                    )?;
+                    )
+                    .map_err(|e| {
+                        Error::corrupt(
+                            "wal",
+                            format!("committed batch seq {seq} failed to apply: {e}"),
+                        )
+                    })?;
                 }
                 WalOp::DeleteDocument { document_id } => {
                     Self::apply_delete(&mut state, &document_id);
@@ -460,6 +636,33 @@ impl VaultEngine {
                 ));
             }
         }
+        // Prepared-write stage: EVERY fallible validation happens here,
+        // before the WAL append. Once a record is durable, apply must not
+        // fail — a failure after this point would leave a poisoned WAL and
+        // partial in-memory state (covered by the
+        // rejected_write_leaves_no_trace_even_after_reopen regression test).
+        for (i, chunk_vec) in vectors.chunks_exact(dim.max(1)).enumerate() {
+            if chunk_vec.iter().any(|x| !x.is_finite()) {
+                return Err(Error::invalid(
+                    format!("vector for chunk {i}"),
+                    "finite f32 values",
+                    "NaN or infinity",
+                ));
+            }
+        }
+        if let Some(entries) = &sparse {
+            for (i, entry) in entries.iter().enumerate() {
+                if let Some(sv) = entry {
+                    sv.validate().map_err(|e| {
+                        Error::invalid(
+                            format!("sparse vector for chunk {i}"),
+                            "a valid sparse vector",
+                            e.to_string(),
+                        )
+                    })?;
+                }
+            }
+        }
         // Version bookkeeping: bump over any previous version.
         let next_version = state
             .documents
@@ -502,13 +705,13 @@ impl VaultEngine {
                 got: dim,
             });
         }
-        // Stage new rows first; only after everything is inserted do we
-        // retire the old version — a query in between still sees the old
-        // version because we hold the write lock for the whole apply.
+        // Stage new rows first; the old version is retired only in the
+        // publish phase at the very end. Readers never observe the interim
+        // because the write lock is held for the whole apply.
         let doc_id = document.document_id.clone();
-        let old_rows = state.doc_rows.remove(&doc_id).unwrap_or_default();
 
         let mut new_rows = Vec::with_capacity(chunks.len());
+        let mut new_chunk_ids: Vec<(String, u32)> = Vec::with_capacity(chunks.len());
         for (i, chunk) in chunks.into_iter().enumerate() {
             let vector = &vectors[i * dim..(i + 1) * dim];
             let row = state.arena.push(vector)?;
@@ -527,7 +730,12 @@ impl VaultEngine {
                 None => state.sparse.add_empty(row),
             }
             let eff = effective_metadata(&document, &chunk);
-            state.chunk_ids.insert(chunk.chunk_id.clone(), row);
+            state.meta_index.add_row(row, &eff);
+            // chunk_ids mapping is deferred to the publish phase so the OLD
+            // chunk-id mappings stay intact until the new version is fully
+            // staged (state.chunks stays row-aligned with the arena, which
+            // is why the slot itself is pushed here).
+            new_chunk_ids.push((chunk.chunk_id.clone(), row));
             state.chunks.push(Some(StoredChunk {
                 chunk,
                 eff_metadata: eff,
@@ -535,7 +743,12 @@ impl VaultEngine {
             new_rows.push(row);
         }
 
-        // Publish: register document + rows, then tombstone the old rows.
+        // Publish phase: everything below is infallible. Swap the mappings,
+        // record the version, then tombstone the previous version's rows.
+        let old_rows = state.doc_rows.remove(&doc_id).unwrap_or_default();
+        for (cid, row) in new_chunk_ids {
+            state.chunk_ids.insert(cid, row);
+        }
         state
             .versions
             .entry(doc_id.clone())
@@ -610,9 +823,25 @@ impl VaultEngine {
             None => Filter::True,
         };
         let has_filter = !filter.is_true();
+        // Typed-index prefilter: eq on keyword/bool/number and numeric
+        // ranges (including AND combinations) are answered from posting
+        // lists instead of per-candidate JSON evaluation.
+        let prefilter: Option<(Vec<u32>, bool)> = if has_filter {
+            state.meta_index.prefilter(&filter)
+        } else {
+            None
+        };
         let accept = |row: u32| -> bool {
             if !has_filter {
                 return true;
+            }
+            if let Some((rows, covered)) = &prefilter {
+                if rows.binary_search(&row).is_err() {
+                    return false;
+                }
+                if *covered {
+                    return true;
+                }
             }
             match state.chunks.get(row as usize) {
                 Some(Some(sc)) => filter.matches(&sc.eff_metadata),
@@ -657,7 +886,27 @@ impl VaultEngine {
             })?;
             let prepared = state.arena.prepare_query(vector)?;
             let live = state.arena.live();
-            if state.config.index.starts_with("ivf") {
+            let prefiltered_small = prefilter
+                .as_ref()
+                .map(|(rows, _)| rows.len() <= (pool * 32).max(2048))
+                .unwrap_or(false);
+            if prefiltered_small {
+                let (rows, covered) = prefilter.as_ref().expect("checked above");
+                dense_backend = "bitmap_prefiltered_flat";
+                plan_reasons.push(format!(
+                    "typed-index prefilter: {} candidate rows ({:.2}% of {live} live), \
+                     covered={covered} — exact scan over the row set",
+                    rows.len(),
+                    100.0 * rows.len() as f64 / live.max(1) as f64,
+                ));
+                let mut topk = TopK::new(pool);
+                for &row in rows {
+                    if !state.arena.is_deleted(row) && accept(row) {
+                        topk.push(row, state.arena.score(row, &prepared));
+                    }
+                }
+                dense = topk.into_sorted();
+            } else if state.config.index.starts_with("ivf") {
                 if let Some(ivf) = state.ivf.as_ref() {
                     dense_backend = if ivf.uses_pq() { "ivf_pq" } else { "ivf_flat" };
                     let nprobe = request.nprobe.unwrap_or(state.config.ivf.nprobe);
@@ -814,9 +1063,22 @@ impl VaultEngine {
                 "reason": plan_reasons,
                 "candidate_pool": pool,
                 "filtered": has_filter,
+                "typed_prefilter": prefilter.as_ref().map(|(rows, covered)| json!({
+                    "rows": rows.len(),
+                    "covered": covered,
+                    "selectivity": rows.len() as f64 / state.arena.live().max(1) as f64,
+                })),
                 "live_vectors": state.arena.live(),
             }),
         })
+    }
+
+    /// Batch search: evaluates requests in parallel under the shared read
+    /// lock (one coherent snapshot per request; results are identical to
+    /// calling `search` sequentially — proven by test).
+    pub fn search_many(&self, requests: &[SearchRequest]) -> Result<Vec<SearchResponse>> {
+        use rayon::prelude::*;
+        requests.par_iter().map(|r| self.search(r)).collect()
     }
 
     pub fn get_chunk(&self, chunk_id: &str) -> Option<Chunk> {
@@ -973,6 +1235,7 @@ impl VaultEngine {
             let mut chunk_ids = HashMap::new();
             let mut doc_rows: HashMap<String, Vec<u32>> = HashMap::new();
             let mut row_map: HashMap<u32, u32> = HashMap::new();
+            let mut meta_index = MetaIndex::default();
 
             let mut live_rows: Vec<u32> = (0..state.chunks.len() as u32)
                 .filter(|&r| !state.arena.is_deleted(r) && state.chunks[r as usize].is_some())
@@ -989,6 +1252,7 @@ impl VaultEngine {
                 }
                 bm25.add(new_row, &sc.chunk.text);
                 row_map.insert(old_row, new_row);
+                meta_index.add_row(new_row, &sc.eff_metadata);
                 chunk_ids.insert(sc.chunk.chunk_id.clone(), new_row);
                 doc_rows
                     .entry(sc.chunk.document_id.clone())
@@ -1000,6 +1264,7 @@ impl VaultEngine {
                 }));
             }
             state.sparse = state.sparse.remap(&row_map, arena.len() as u32);
+            state.meta_index = meta_index;
             state.arena = arena;
             state.sq8 = sq8;
             state.hnsw = hnsw;
@@ -1416,6 +1681,342 @@ mod tests {
         }
         let wrong = VaultEngine::open(dir.path(), config(8));
         assert!(wrong.is_err());
+    }
+
+    /// P0 regression: a write that fails validation mid-apply must leave
+    /// NO trace — not in memory, not in the WAL, not after reopen.
+    /// Typed prefilter must be RESULT-EQUIVALENT to predicate evaluation
+    /// for every supported shape, across all signals, deletes and compact.
+    #[test]
+    fn typed_prefilter_matches_predicate_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(4);
+        cfg.flat_threshold = 1_000_000;
+        let engine = VaultEngine::open(dir.path(), cfg).unwrap();
+        for i in 0..200 {
+            let id = format!("d{i}");
+            engine
+                .upsert_document(
+                    doc(
+                        &id,
+                        json!({
+                            "team": format!("team{}", i % 5),
+                            "year": 2015 + (i % 10),
+                            "active": i % 2 == 0,
+                            "score": (i as f64) / 7.0,
+                        }),
+                    ),
+                    vec![chunk(&id, 0, &format!("payload {i} shared"))],
+                    &unit_vec(4, i),
+                    None,
+                )
+                .unwrap();
+        }
+        for i in (0..200).step_by(9) {
+            engine.delete_document(&format!("d{i}")).unwrap();
+        }
+        let filters = vec![
+            json!({"team": "team2"}),
+            json!({"active": true}),
+            json!({"year": 2018}),
+            json!({"year": {"gte": 2019}}),
+            json!({"score": {"gt": 10.0, "lte": 20.0}}),
+            json!({"$and": [{"team": "team1"}, {"year": {"lt": 2020}}]}),
+            // partially covered: prefix is NOT indexable -> residual predicate
+            json!({"$and": [{"team": "team3"}, {"title": {"prefix": "Title"}}]}),
+            // not indexable at all -> pure predicate path
+            json!({"$or": [{"team": "team0"}, {"team": "team4"}]}),
+        ];
+        let run = |filter: Option<serde_json::Value>, mode: &str| -> Vec<(String, String)> {
+            engine
+                .search(&SearchRequest {
+                    vector: Some(unit_vec(4, 3)),
+                    text: Some("payload shared".into()),
+                    sparse: None,
+                    k: 50,
+                    mode: mode.into(),
+                    candidates: Some(300),
+                    filter,
+                    ef_search: None,
+                    nprobe: None,
+                    weights: None,
+                })
+                .unwrap()
+                .hits
+                .into_iter()
+                .map(|h| (h.chunk_id, format!("{:.6}", h.score)))
+                .collect()
+        };
+        // Reference: brute-force predicate over list_documents (no index).
+        for filter in &filters {
+            let parsed = Filter::parse(filter).unwrap();
+            for mode in ["dense", "keyword", "hybrid"] {
+                let got = run(Some(filter.clone()), mode);
+                // every returned doc satisfies the predicate
+                for (cid, _) in &got {
+                    let c = engine.get_chunk(cid).unwrap();
+                    let d = engine.get_document(&c.document_id).unwrap();
+                    let eff = effective_metadata(&d, &c);
+                    assert!(parsed.matches(&eff), "{mode} {filter} returned {cid}");
+                }
+                // and no satisfying doc is missing (k=50 > matches for team
+                // filters; verify counts against a manual scan)
+                let expected: usize = engine
+                    .list_documents()
+                    .iter()
+                    .filter(|d| {
+                        let c = &engine.get_document_chunks(&d.document_id)[0];
+                        parsed.matches(&effective_metadata(d, c))
+                    })
+                    .count();
+                if mode == "keyword" {
+                    assert_eq!(got.len(), expected.min(50), "{mode} {filter}");
+                }
+            }
+        }
+        // compact + reopen keep prefilter results identical
+        let before = run(Some(filters[3].clone()), "hybrid");
+        engine.compact().unwrap();
+        assert_eq!(before, run(Some(filters[3].clone()), "hybrid"));
+    }
+
+    #[test]
+    fn search_many_equals_sequential_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = VaultEngine::open(dir.path(), config(8)).unwrap();
+        for i in 0..80 {
+            let id = format!("d{i}");
+            engine
+                .upsert_document(
+                    doc(&id, json!({"g": i % 4})),
+                    vec![chunk(&id, 0, &format!("text {i} common"))],
+                    &unit_vec(8, i),
+                    None,
+                )
+                .unwrap();
+        }
+        let requests: Vec<SearchRequest> = (0..16)
+            .map(|i| SearchRequest {
+                vector: Some(unit_vec(8, i)),
+                text: Some("text common".into()),
+                sparse: None,
+                k: 5,
+                mode: "hybrid".into(),
+                candidates: None,
+                filter: if i % 2 == 0 {
+                    Some(json!({"g": 1}))
+                } else {
+                    None
+                },
+                ef_search: None,
+                nprobe: None,
+                weights: None,
+            })
+            .collect();
+        let batch = engine.search_many(&requests).unwrap();
+        for (request, batched) in requests.iter().zip(&batch) {
+            let single = engine.search(request).unwrap();
+            let a: Vec<_> = single.hits.iter().map(|h| (&h.chunk_id, h.score)).collect();
+            let b: Vec<_> = batched
+                .hits
+                .iter()
+                .map(|h| (&h.chunk_id, h.score))
+                .collect();
+            assert_eq!(a, b, "batch result must equal sequential result");
+        }
+    }
+
+    #[test]
+    fn typed_prefilter_is_visible_in_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+        for i in 0..50 {
+            let id = format!("d{i}");
+            engine
+                .upsert_document(
+                    doc(&id, json!({"team": format!("team{}", i % 5)})),
+                    vec![chunk(&id, 0, "x")],
+                    &unit_vec(4, i),
+                    None,
+                )
+                .unwrap();
+        }
+        let response = engine
+            .search(&SearchRequest {
+                vector: Some(unit_vec(4, 0)),
+                text: None,
+                sparse: None,
+                k: 5,
+                mode: "dense".into(),
+                candidates: None,
+                filter: Some(json!({"team": "team2"})),
+                ef_search: None,
+                nprobe: None,
+                weights: None,
+            })
+            .unwrap();
+        assert_eq!(response.plan["dense_backend"], "bitmap_prefiltered_flat");
+        let pf = &response.plan["typed_prefilter"];
+        assert_eq!(pf["rows"], 10);
+        assert_eq!(pf["covered"], true);
+        assert!(pf["selectivity"].as_f64().unwrap() < 0.25);
+    }
+
+    #[test]
+    fn rejected_write_leaves_no_trace_even_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let assert_clean = |engine: &VaultEngine| {
+            assert_eq!(engine.list_documents().len(), 1, "only the good doc");
+            assert!(engine.get_document("bad").is_none());
+            assert!(engine.get_chunk("bad#0").is_none());
+            let stats = engine.stats();
+            assert_eq!(stats["live_chunks"], 1, "no orphan arena rows");
+            assert_eq!(stats["total_rows"], 1, "no partial rows at all");
+            let hits = engine
+                .search(&SearchRequest {
+                    vector: None,
+                    text: Some("poisoned".into()),
+                    sparse: None,
+                    k: 5,
+                    mode: "keyword".into(),
+                    candidates: None,
+                    filter: None,
+                    ef_search: None,
+                    nprobe: None,
+                    weights: None,
+                })
+                .unwrap()
+                .hits;
+            assert!(hits.is_empty(), "rejected text must not be in bm25");
+            let hits = engine
+                .search(&SearchRequest {
+                    vector: Some(unit_vec(4, 0)),
+                    text: Some("good".into()),
+                    sparse: None,
+                    k: 5,
+                    mode: "hybrid".into(),
+                    candidates: None,
+                    filter: None,
+                    ef_search: None,
+                    nprobe: None,
+                    weights: None,
+                })
+                .unwrap()
+                .hits;
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].document_id, "good");
+        };
+        {
+            let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+            engine
+                .upsert_document(
+                    doc("good", json!({})),
+                    vec![chunk("good", 0, "good doc")],
+                    &unit_vec(4, 0),
+                    None,
+                )
+                .unwrap();
+
+            // Case 1: NaN vector in the SECOND chunk (first would apply).
+            let mut vectors = unit_vec(4, 1);
+            vectors.extend_from_slice(&[f32::NAN, 0.0, 0.0, 0.0]);
+            let result = engine.upsert_document(
+                doc("bad", json!({})),
+                vec![
+                    chunk("bad", 0, "poisoned one"),
+                    chunk("bad", 1, "poisoned two"),
+                ],
+                &vectors,
+                None,
+            );
+            assert!(result.is_err(), "NaN vector must be rejected");
+            assert_clean(&engine);
+
+            // Case 2: invalid sparse (decreasing indices) in the second chunk.
+            let bad_sparse = SparseVector {
+                indices: vec![9, 3],
+                values: vec![1.0, 1.0],
+            };
+            let mut vectors = unit_vec(4, 1);
+            vectors.extend_from_slice(&unit_vec(4, 2));
+            let result = engine.upsert_document(
+                doc("bad", json!({})),
+                vec![
+                    chunk("bad", 0, "poisoned one"),
+                    chunk("bad", 1, "poisoned two"),
+                ],
+                &vectors,
+                Some(vec![None, Some(bad_sparse)]),
+            );
+            assert!(result.is_err(), "invalid sparse must be rejected");
+            assert_clean(&engine);
+        }
+        // The vault must reopen (no poisoned WAL) and stay clean; replay is
+        // idempotent across a second reopen.
+        for _ in 0..2 {
+            let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+            assert_clean(&engine);
+        }
+    }
+
+    /// P0 regression: a rejected REPLACEMENT must preserve the old version
+    /// fully (chunks, indexes, citations), in memory and after reopen.
+    #[test]
+    fn rejected_replace_preserves_old_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let assert_v1_intact = |engine: &VaultEngine| {
+            let d = engine.get_document("a").unwrap();
+            assert_eq!(d.current_version, 1, "old version must stay current");
+            let chunks = engine.get_document_chunks("a");
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].text, "original content zebra");
+            assert!(engine.get_chunk("a#0").is_some(), "citations stay valid");
+            let hits = engine
+                .search(&SearchRequest {
+                    vector: Some(unit_vec(4, 0)),
+                    text: Some("zebra".into()),
+                    sparse: None,
+                    k: 5,
+                    mode: "hybrid".into(),
+                    candidates: None,
+                    filter: None,
+                    ef_search: None,
+                    nprobe: None,
+                    weights: None,
+                })
+                .unwrap()
+                .hits;
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].document_id, "a");
+            assert!(hits[0].dense_score.is_some());
+            assert!(hits[0].bm25_score.is_some());
+        };
+        {
+            let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+            engine
+                .upsert_document(
+                    doc("a", json!({})),
+                    vec![chunk("a", 0, "original content zebra")],
+                    &unit_vec(4, 0),
+                    None,
+                )
+                .unwrap();
+            let result = engine.upsert_document(
+                doc("a", json!({})),
+                vec![chunk("a", 0, "replacement lions")],
+                &[f32::INFINITY, 0.0, 0.0, 0.0],
+                None,
+            );
+            assert!(result.is_err(), "non-finite vector must be rejected");
+            assert_v1_intact(&engine);
+            assert_eq!(
+                engine.list_document_versions("a").len(),
+                1,
+                "rejected replace must not record a version"
+            );
+        }
+        let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+        assert_v1_intact(&engine);
     }
 
     #[test]

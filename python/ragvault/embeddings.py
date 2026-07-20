@@ -190,6 +190,12 @@ def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def bytes_hash(raw: bytes) -> str:
+    """Identity hash of ORIGINAL file bytes. Never derive file identity from
+    decoded text (`errors="replace"` collapses distinct binary files)."""
+    return hashlib.sha256(raw).hexdigest()
+
+
 def iter_batches(items: Sequence[str], size: int) -> Iterable[list[str]]:
     for i in range(0, len(items), size):
         yield list(items[i:i + size])

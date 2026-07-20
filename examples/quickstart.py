@@ -11,7 +11,11 @@ docs.mkdir()
 )
 (docs / "shipping.md").write_text("# Shipping\n\nOrders ship within 5 business days.\n")
 
-with ragvault.open(Path(tempfile.mkdtemp()) / "kb", preset="quality") as kb:
+# preset="quality" demands an explicit embedding decision (no silent
+# lexical degradation, no silent downloads). For real semantic quality use
+# embedding="sentence-transformers:all-MiniLM-L6-v2" with ragvault[local-models].
+with ragvault.open(Path(tempfile.mkdtemp()) / "kb", preset="quality",
+                   embedding="builtin:hashed-ngram") as kb:
     print(kb.sync(docs))
     result = kb.retrieve("how do refunds work?", token_budget=2000)
     print(result.context)

@@ -1,7 +1,21 @@
 # TASKS
 
 Rastreabilidade de requisitos → implementação → evidência. Estados:
-`not-started | in-progress | blocked | implemented | validated | experimental | deferred`
+`not-started | in-progress | blocked | implemented | under-review | validated | experimental | deferred`
+
+> **Auditoria (hardening, HEAD 221ef7e):** baseline real re-executado —
+> fmt/clippy limpos; testes Rust (unit/lib + differential + proptest) e 87
+> Python verdes (6 skipped: roundtrips de framework sem a lib + teste `gpu`).
+> **P0 de atomicidade foi encontrado, reproduzido e corrigido** (5aec3b9):
+> até então o Gate A estava superestimado — escrita rejeitada podia deixar
+> mutação parcial e WAL envenenado. Com o fix + suíte diferencial (04dc12a)
+> + identidade de ingestão por bytes e presets honestos (5d996c7), context v2
+> (dd1ce16), eval texto real (ae8fe9f), filtros tipados (3b7fddf), batch
+> nativo (cd95482) e CI multiplataforma + integrações reais (221ef7e), os
+> Gates A–D estão `validated` com evidência nova. **Restam apenas itens de
+> performance/formato:** profiling HNSW e storage v2 segmentado (ver rodapé).
+> Limitações do ambiente: CUDA/cuVS e a *execução* de wheels não-Linux não são
+> validáveis aqui — a matriz de CI existe e roda nos runners.
 
 ## Gate A — Fundação confiável (VALIDATED)
 
@@ -17,6 +31,10 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 | Recovery snapshot + WAL replay | engine.rs | `reopen_after_flush_uses_snapshot_plus_wal` | validated |
 | Lock de writer único por diretório | engine.rs | `second_writer_is_rejected` | validated |
 | Upsert/replace/delete atômicos por documento | engine.rs | `replace_publishes_atomically...` | validated |
+| **Prepared-write: validação integral pré-WAL, apply infalível, replay de batch corrompido falha claro** | engine.rs (5aec3b9) | `rejected_write_leaves_no_trace_even_after_reopen`, `rejected_replace_preserves_old_version` | validated |
+| Equivalência diferencial compact == compact+reopen (todos os backends) | tests/differential_consistency.rs (04dc12a) | 6 configs, workload misto, 2 tenants | validated |
+| Identidade de fonte por sha256(raw_bytes) + fingerprints de pipeline | kb.py::sync (5d996c7) | `TestSourceIdentity` (binários distintos, invalidação por pipeline) | validated |
+| Preset `quality` sem degradação lexical silenciosa; `offline-lite` explícito | kb.py/config.py (5d996c7) | `TestPresetHonesty` | validated |
 | Bindings Python com exceções específicas, sem panics propagados | ragvault-python | suíte pytest | validated |
 
 ## Gate B — Retrieval competitivo (VALIDATED, com limitações registradas)
@@ -30,8 +48,8 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 | Fusão híbrida RRF ponderada | fusion.rs | testes de determinismo/pesos | validated |
 | Filtro integrado à travessia HNSW + retry ef + fallback Flat exato | engine.rs::search | `filters_apply_to_all_signals` | validated |
 | Planner explicável (flat vs hnsw, razões, custos) | engine.rs | plan JSON em toda busca; testes explain | validated |
-| Índices tipados de metadados (bitmaps/ranges) | — | filtro avalia predicado por candidato (correto, não indexado) | deferred |
-| Segmentos imutáveis + mutable segment | — | arena única + tombstones + compaction síncrona | deferred |
+| Índices tipados de metadados (bitmaps/ranges) | engine.rs (3b7fddf) | ver Gate D (posting lists keyword/bool + BTreeMap numérico, plano, RESULTS-FILTERS.md) | validated |
+| Segmentos imutáveis + mutable segment | — | hoje: arena única + tombstones + compaction síncrona; storage v2 segmentado é a próxima tarefa (ver rodapé) | deferred |
 | Compactação | engine.rs::compact | `compact_drops_tombstones_and_preserves_results` | validated (síncrona; background deferred) |
 | Concorrência: leitores paralelos + GIL liberado | bindings + testes | `test_gil_released_during_search`, `test_concurrent_reads_are_safe` | validated |
 
@@ -57,6 +75,14 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 | kb.compare / kb.tune / kb.apply | `TestCompare`, `TestTune` (grid com evidência, restrição de p95, nunca auto-aplica) | validated |
 | Studio UI (`ragvault studio`, stdlib http.server, local-only) | `TestStudio` | validated |
 
+## Avaliação RAG com texto real (P1)
+
+| Tarefa | Status | Evidência |
+|---|---|---|
+| Dataset real reproduzível commitado (30 passagens / 24 queries, 12 paráfrase + 12 keyword) | validated | benchmarks/data/*.jsonl |
+| Harness bm25 / lexical / hybrid / +MMR / +expansion com Recall@k, MRR, nDCG, precision, dup, tokens, p50/p95 e MRR por estilo | validated | benchmarks/bench_rag_quality.py → RESULTS-RAG.md (números executados) |
+| Linhas semânticas (dense/hybrid/rerank com sentence-transformers) | blocked | política de rede nega huggingface.co (CONNECT 403, registrado no proxy); comando exato documentado no harness e em RESULTS-RAG.md |
+
 ## Gate D — Performance avançada
 
 | Tarefa | Status | Nota |
@@ -69,7 +95,8 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 | IVF-PQ (ADC 8-bit, oversample 8x, rescore f32, pq_m automático) | validated | `pq_with_rescore_reaches_high_recall`, `ivf_pq_auto_subspaces` |
 | OPQ / binary quantization | not-started | mesmo gate de benchmark de SQ8/IVF |
 | mmap (`storage="mmap"`: base mmap + cauda RAM, checksum na abertura) | validated | `mmap_storage_full_lifecycle` (Rust), `TestMmapPython` (paridade byte-a-byte com memory) |
-| Índices bitmap/range de metadados | not-started | predicado por candidato é correto; isto é otimização |
+| Índices tipados de metadados (posting lists keyword/bool + BTreeMap numérico para ranges, interseção AND, cobertura parcial com predicado residual) | validated | `typed_prefilter_matches_predicate_results` (equivalência com predicado em 8 formas × 3 modos, deletes, compact), `typed_prefilter_is_visible_in_plan`; benchmark RESULTS-FILTERS.md: 12x @10%, 172x @1%, 484x @0.1% seletividade |
+| Roaring bitmaps / histogramas / índices textuais dedicados | deferred | posting lists ordenadas cobrem eq/range; roaring é otimização de memória futura |
 | Autotuning (kb.tune) | validated | grid retrieval-time com evidência por trial |
 | Property testing (proptest) | validated | `proptest_filter.rs` (parser nunca em pânico; not = complemento; eq == in([x])), `proptest_topk.rs` (equivalência com sort; merge == stream único) |
 
@@ -90,6 +117,14 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 - Interop Faiss (`ragvault.compat.faiss`, nível *convertible*) — validated com faiss-cpu real (`TestFaissCompat`: export → reconstruct → import com paridade de ranking).
 - `Database`/coleções (`ragvault.Database.open`) — validated (`TestDatabase`: isolamento entre coleções, nomes validados contra path traversal, descoberta em reopen). `ragvault.connect()` — assinatura reservada com NotImplementedError explícito (remoto é pós-v0.1, ADR 0001).
 - CLI `benchmark` e `migrate` — implemented (benchmark mede nesta máquina e declara isso; migrate delega à migração blocking testada).
-- Integração LangChain — validated (`TestLangChain`). LlamaIndex/Haystack/DSPy — implemented (não testados contra as libs reais; erro acionável sem a dependência).
-- Wheels multiplataforma: CI cobre Linux x86-64; macOS/Windows/ARM64 exigem runners não disponíveis neste ambiente.
+- Integrações LangChain/LlamaIndex/Haystack/DSPy — validated (`TestIntegrations`): roundtrips reais contra versões fixadas no job `integrations` do CI; erro acionável quando a lib está ausente. Localmente os roundtrips fazem `importorskip`.
+- Wheels multiplataforma — implemented: matriz de CI (`.github/workflows/ci.yml` job `wheels`) constrói Linux x86-64/aarch64, macOS arm64 (macos-14) e Windows x86-64, cada um com smoke de clean-install (`open → add → retrieve`). Execução dos runners não-Linux ocorre no CI, não neste ambiente. Changelog/checklist de release em `CHANGELOG.md` e `docs/RELEASE.md`.
 - `kb.migrate_embeddings` — validated (estratégia blocking com swap atômico e preservação do vault antigo em falha; `TestMigrateEmbeddings`). Estratégias background/copy-on-write — planned.
+
+## Backlog v1.0 restante (apenas performance/formato — nenhum P0/P1 aberto)
+
+| Tarefa | Status | Critério de conclusão |
+|---|---|---|
+| Profiling HNSW e correção de gargalos comprovados | validated | Perfil medido (`examples/hnsw_bench.rs`): a alocação O(N) de `visited` por `search_layer` foi provada como gargalo em escala. Substituída por `VisitedSet` geracional thread-local (reset O(1), reuso por thread). Recall idêntico; em N=200k: mean 1.9×, p95 3.7×, p99 10.4×, QPS 1.9× (RESULTS-HNSW.md). Neutro em N=50k. Heaps de scratch (limitados por ef, não N) e SIMD não perseguidos — sem gargalo comprovado. |
+| Storage v2 binário segmentado | not-started | Design e critérios de aceitação em **ADR 0016** (segmentos imutáveis + mutable, manifest v2 multi-segmento, CRC em streaming, query multi-segmento, compactação read-safe, migração v1→v2, testes crash/reopen/read-durante-compactação). Base já pronta: manifest versionado + publish atômico por rename + CRC por arquivo + `vectors.bin` mmap-able (ADR 0004). Único item P2 arquitetural restante para v1.0. |
+| Roaring bitmaps / histogramas / OPQ / binary quantization | deferred | Só substituir posting lists / quantizadores atuais quando profiling ou benchmark demonstrar necessidade. |

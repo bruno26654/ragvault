@@ -75,7 +75,11 @@ class TestTune:
             eval_kb.tune(DATASET, k=3, grid={"hnsw_m": [8]})
 
 
-class TestLangChain:
+class TestIntegrations:
+    """Real roundtrips against the actual frameworks when installed (the CI
+    ``integrations`` job pins real versions and runs these), plus actionable
+    errors when a framework is absent."""
+
     def test_langchain_retriever_roundtrip(self, eval_kb):
         pytest.importorskip("langchain_core")
         retriever = eval_kb.as_langchain_retriever(k=2)
@@ -84,6 +88,33 @@ class TestLangChain:
         assert docs[0].metadata["document_id"] == "refunds"
         assert docs[0].metadata["chunk_id"]
         assert "Refunds" in docs[0].page_content
+
+    def test_llamaindex_retriever_roundtrip(self, eval_kb):
+        pytest.importorskip("llama_index.core")
+        from llama_index.core.schema import QueryBundle
+
+        retriever = eval_kb.as_llamaindex_retriever(k=2)
+        nodes = retriever.retrieve(QueryBundle(query_str="refund timing"))
+        assert nodes
+        assert nodes[0].node.metadata["document_id"] == "refunds"
+        assert nodes[0].score is not None
+        assert "Refunds" in nodes[0].node.get_content()
+
+    def test_haystack_retriever_roundtrip(self, eval_kb):
+        pytest.importorskip("haystack")
+        retriever = eval_kb.as_haystack_retriever(k=2)
+        out = retriever.run(query="refund timing")
+        docs = out["documents"]
+        assert docs
+        assert docs[0].meta["document_id"] == "refunds"
+        assert "Refunds" in docs[0].content
+
+    def test_dspy_retriever_roundtrip(self, eval_kb):
+        pytest.importorskip("dspy")
+        retriever = eval_kb.as_dspy_retriever(k=2)
+        prediction = retriever.forward("refund timing")
+        assert prediction.passages
+        assert any("Refunds" in p for p in prediction.passages)
 
     def test_llamaindex_without_dep_gives_actionable_error(self, eval_kb):
         try:
@@ -94,6 +125,26 @@ class TestLangChain:
         with pytest.raises(ragvault.ConfigurationError) as err:
             eval_kb.as_llamaindex_retriever()
         assert "llama-index-core" in str(err.value)
+
+    def test_haystack_without_dep_gives_actionable_error(self, eval_kb):
+        try:
+            import haystack  # noqa: F401
+            pytest.skip("haystack-ai installed")
+        except ImportError:
+            pass
+        with pytest.raises(ragvault.ConfigurationError) as err:
+            eval_kb.as_haystack_retriever()
+        assert "haystack-ai" in str(err.value)
+
+    def test_dspy_without_dep_gives_actionable_error(self, eval_kb):
+        try:
+            import dspy  # noqa: F401
+            pytest.skip("dspy installed")
+        except ImportError:
+            pass
+        with pytest.raises(ragvault.ConfigurationError) as err:
+            eval_kb.as_dspy_retriever()
+        assert "dspy" in str(err.value)
 
 
 class TestSparsePersistence:

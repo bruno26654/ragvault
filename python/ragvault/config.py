@@ -33,7 +33,13 @@ PRESETS: dict[str, dict] = {
         "context_window": {"before": 0, "after": 0},
         "target_tokens": 450,
     },
-    "offline": {
+    "offline": {  # alias of offline-lite (kept for compatibility)
+        "embedding": "builtin:hashed-ngram",
+        "retrieval_mode": "hybrid",
+    },
+    "offline-lite": {
+        # Explicitly lexical: hashed n-gram projection + BM25 hybrid.
+        # Honest naming — this is NOT a semantic embedding.
         "embedding": "builtin:hashed-ngram",
         "retrieval_mode": "hybrid",
     },

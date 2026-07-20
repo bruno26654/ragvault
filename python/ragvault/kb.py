@@ -34,6 +34,7 @@ from .context import (
 )
 from .embeddings import (
     Embedder,
+    bytes_hash,
     content_hash,
     embedding_fingerprint,
     resolve_embedding,
@@ -85,6 +86,8 @@ class _EmbeddingCache:
     def __init__(self, path: Path) -> None:
         self._path = path
         self._local = threading.local()
+        self._all_conns: list[sqlite3.Connection] = []
+        self._conns_lock = threading.Lock()
         self.hits = 0
         self.misses = 0
         conn = self._conn()
@@ -99,7 +102,23 @@ class _EmbeddingCache:
         if conn is None:
             conn = sqlite3.connect(self._path)
             self._local.conn = conn
+            with self._conns_lock:
+                self._all_conns.append(conn)
         return conn
+
+    def close(self) -> None:
+        """Close every connection opened across threads. Required on Windows,
+        where an open handle to ``embedding-cache.db`` blocks deletion of the
+        knowledge base directory."""
+        with self._conns_lock:
+            conns = self._all_conns
+            self._all_conns = []
+        for conn in conns:
+            try:
+                conn.close()
+            except Exception:  # pragma: no cover - best-effort cleanup
+                pass
+        self._local = threading.local()
 
     def get_many(self, keys: list[str]) -> dict[str, np.ndarray]:
         if not keys:
@@ -215,6 +234,20 @@ class KnowledgeBase:
         else:
             if not create:
                 raise ConfigurationError(f"no knowledge base at {self.path}")
+            if preset == "quality" and embedding is None:
+                # quality must be semantically real: never silently degrade
+                # to the lexical baseline, never silently download a model.
+                raise ConfigurationError(
+                    "preset='quality' requires an explicit embedding decision:\n"
+                    "  - semantic (recommended): ragvault.open(path, preset='quality',\n"
+                    "      embedding='sentence-transformers:all-MiniLM-L6-v2')\n"
+                    "    (pip install \"ragvault[local-models]\"; the model downloads\n"
+                    "    on first use of sentence-transformers — an explicit action)\n"
+                    "  - your own embedder: embedding=my_callable_or_Embedder\n"
+                    "  - explicit lexical fallback (NOT semantic):\n"
+                    "      embedding='builtin:hashed-ngram'\n"
+                    "  - or use preset='offline-lite' for the lexical baseline"
+                )
             embedding_spec = embedding if embedding is not None else None
             if isinstance(embedding_spec, str):
                 overrides = {**overrides, "embedding": embedding_spec}
@@ -249,8 +282,13 @@ class KnowledgeBase:
 
     def close(self) -> None:
         if not self._closed:
-            self._vault.close()
-            self._closed = True
+            try:
+                self._vault.close()
+            finally:
+                # Always release the sqlite handle so the directory can be
+                # removed (Windows cannot delete a file with an open handle).
+                self._cache.close()
+                self._closed = True
 
     def flush(self) -> None:
         self._vault.flush()
@@ -269,6 +307,21 @@ class KnowledgeBase:
         return f"KnowledgeBase(path={str(self.path)!r}, preset={self.config.preset!r}, {state})"
 
     # -- ingestion ---------------------------------------------------------
+
+    def _processing_fingerprint(self) -> str:
+        """Identifies the parse→chunk→embed pipeline. A change in any stage
+        must invalidate previously synced documents even when the source
+        bytes are unchanged."""
+        import hashlib as _hashlib
+
+        from .parsers import PARSER_VERSION
+
+        payload = json.dumps({
+            "parser": PARSER_VERSION,
+            "chunking": self._chunking_config().to_dict(),
+            "embedding": self._fingerprint,
+        }, sort_keys=True, default=str)
+        return _hashlib.sha256(payload.encode()).hexdigest()[:16]
 
     def _chunking_config(self) -> ChunkingConfig:
         return ChunkingConfig(
@@ -406,6 +459,7 @@ class KnowledgeBase:
             for d in self._vault.list_documents()
             if d.get("source_id") == source_id
         }
+        processing_fp = self._processing_fingerprint()
         seen_ids: set[str] = set()
         for path in files:
             rel = path.relative_to(directory).as_posix()
@@ -413,9 +467,16 @@ class KnowledgeBase:
             seen_ids.add(doc_id)
             try:
                 raw = path.read_bytes()
-                file_hash = content_hash(raw.decode("utf-8", errors="replace"))
+                # Identity = sha256 of ORIGINAL bytes; decoded text must not
+                # collapse distinct binary files. The processing fingerprint
+                # (parser + chunking + embedding) invalidates on pipeline
+                # changes even when the bytes are identical.
+                file_hash = bytes_hash(raw)
                 prior = existing.get(doc_id)
-                if prior and prior.get("metadata", {}).get("file_hash") == file_hash:
+                prior_meta = (prior or {}).get("metadata", {})
+                if (prior
+                        and prior_meta.get("source_content_hash") == file_hash
+                        and prior_meta.get("processing_fingerprint") == processing_fp):
                     report.unchanged += 1
                     continue
                 parsed = parse_file(path)
@@ -428,7 +489,9 @@ class KnowledgeBase:
                     "title": parsed.title,
                     "metadata": {
                         **parsed.metadata,
-                        "file_hash": file_hash,
+                        "source_content_hash": file_hash,
+                        "parsed_content_hash": content_hash(parsed.text),
+                        "processing_fingerprint": processing_fp,
                         "path": rel,
                         "format": parsed.format,
                     },
@@ -544,6 +607,39 @@ class KnowledgeBase:
         else:
             response = self._vault.search(json.dumps(request), query_vec)
         search_ms = (time.monotonic() - t0) * 1000
+        return self._finalize_retrieval(
+            query, response, k=k, token_budget=token_budget, rerank=rerank,
+            context_window=context_window,
+            max_chunks_per_document=max_chunks_per_document,
+            explain=explain, trace=trace, trace_data=trace_data,
+            mode=mode, search_ms=search_ms, gpu_note=gpu_note,
+        )
+
+    def _finalize_retrieval(
+        self,
+        query: str,
+        response: dict,
+        *,
+        k: int = 8,
+        token_budget: Optional[int] = None,
+        rerank: Optional[Callable] = None,
+        context_window: Optional[dict] = None,
+        max_chunks_per_document: Optional[int] = None,
+        explain: bool = False,
+        trace: bool = False,
+        trace_data: Optional[dict] = None,
+        mode: Optional[str] = None,
+        search_ms: Optional[float] = None,
+        gpu_note: Optional[str] = None,
+        **_ignored: Any,
+    ) -> RetrievalResult:
+        """Shared post-search pipeline: chunk materialization, rerank,
+        neighbor expansion, context assembly, plan/trace enrichment. Used by
+        both retrieve() and the batched retrieve_many() so their results are
+        equivalent by construction."""
+        token_budget = token_budget or self.config.default_token_budget
+        if trace and trace_data is None:
+            trace_data = {}
 
         doc_cache: dict[str, Optional[dict]] = {}
         chunks: list[RetrievedChunk] = []
@@ -604,11 +700,13 @@ class KnowledgeBase:
             result.plan["reason"] = list(result.plan["reason"]) + [gpu_note]
         if explain or trace:
             result.plan = dict(result.plan)
-            result.plan["search_ms"] = round(search_ms, 3)
+            if search_ms is not None:
+                result.plan["search_ms"] = round(search_ms, 3)
             result.plan["mode"] = mode
             result.plan["token_budget"] = token_budget
         if trace_data is not None:
-            trace_data["search_ms"] = round(search_ms, 3)
+            if search_ms is not None:
+                trace_data["search_ms"] = round(search_ms, 3)
             result.trace = trace_data
         return result
 
@@ -677,7 +775,45 @@ class KnowledgeBase:
         }
 
     def retrieve_many(self, queries: Sequence[str], **kwargs: Any) -> list[RetrievalResult]:
-        return [self.retrieve(q, **kwargs) for q in queries]
+        """Batch retrieval. Uses one batched query-embedding call plus the
+        native parallel `search_many` (GIL released) when possible; falls
+        back to sequential retrieve() for sidecar searchers. Results are
+        equivalent to per-query retrieve() calls (tested)."""
+        queries = list(queries)
+        if not queries or kwargs.get("dense_searcher") is not None:
+            return [self.retrieve(q, **kwargs) for q in queries]
+
+        mode = kwargs.get("mode") or self.config.retrieval_mode
+        k = kwargs.get("k", 8)
+        pool = kwargs.get("candidates") or self.config.candidates
+        merged_filter = self._merged_filter(kwargs.get("filters"))
+        if merged_filter is not None:
+            _native.validate_filter(json.dumps(merged_filter))
+
+        vectors = None
+        if mode in ("dense", "hybrid", "auto"):
+            vectors = np.ascontiguousarray(
+                self.embedder.embed_queries(queries), dtype=np.float32
+            )
+        requests = [{
+            "text": q if mode in ("keyword", "hybrid", "auto") else None,
+            "k": max(pool, k),
+            "mode": mode,
+            "candidates": pool,
+            "filter": merged_filter,
+            "ef_search": kwargs.get("ef_search") or self.config.ef_search,
+            "nprobe": kwargs.get("nprobe") or self.config.nprobe,
+            "weights": {
+                "dense": self.config.dense_weight,
+                "bm25": self.config.bm25_weight,
+                "sparse": self.config.sparse_weight,
+            },
+        } for q in queries]
+        responses = self._vault.search_many(json.dumps(requests), vectors)
+        return [
+            self._finalize_retrieval(query, response, **kwargs)
+            for query, response in zip(queries, responses)
+        ]
 
     async def aretrieve(self, query: str, **kwargs: Any) -> RetrievalResult:
         return await asyncio.to_thread(self.retrieve, query, **kwargs)
