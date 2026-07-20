@@ -152,6 +152,161 @@ pub struct SearchResponse {
     pub plan: serde_json::Value,
 }
 
+/// Typed metadata index over top-level scalar fields of the effective
+/// metadata: keyword/bool posting lists for `eq`, a sorted numeric index
+/// for ranges. Rows are appended in ascending order, so posting lists stay
+/// sorted; tombstones are filtered at query time and compaction rebuilds.
+#[derive(Default)]
+struct MetaIndex {
+    keyword: HashMap<(String, String), Vec<u32>>,
+    boolean: HashMap<(String, bool), Vec<u32>>,
+    /// field -> BTreeMap<order-preserving f64 bits, rows>
+    numeric: HashMap<String, std::collections::BTreeMap<u64, Vec<u32>>>,
+}
+
+/// Monotonic mapping f64 -> u64 (IEEE total-order trick; NaN never stored).
+fn f64_sortable(x: f64) -> u64 {
+    let bits = x.to_bits();
+    if bits >> 63 == 0 {
+        bits ^ 0x8000_0000_0000_0000
+    } else {
+        !bits
+    }
+}
+
+impl MetaIndex {
+    fn add_row(&mut self, row: u32, eff_metadata: &serde_json::Value) {
+        let Some(map) = eff_metadata.as_object() else {
+            return;
+        };
+        for (key, value) in map {
+            match value {
+                serde_json::Value::String(v) => self
+                    .keyword
+                    .entry((key.clone(), v.clone()))
+                    .or_default()
+                    .push(row),
+                serde_json::Value::Bool(b) => {
+                    self.boolean.entry((key.clone(), *b)).or_default().push(row)
+                }
+                serde_json::Value::Number(n) => {
+                    if let Some(f) = n.as_f64() {
+                        if f.is_finite() {
+                            self.numeric
+                                .entry(key.clone())
+                                .or_default()
+                                .entry(f64_sortable(f))
+                                .or_default()
+                                .push(row);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn lookup_cmp(&self, field: &str, op: &ragvault_core::filter::CmpOp) -> Option<Vec<u32>> {
+        use ragvault_core::filter::CmpOp;
+        match op {
+            CmpOp::Eq(serde_json::Value::String(v)) => Some(
+                self.keyword
+                    .get(&(field.to_string(), v.clone()))
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            CmpOp::Eq(serde_json::Value::Bool(b)) => Some(
+                self.boolean
+                    .get(&(field.to_string(), *b))
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            CmpOp::Eq(serde_json::Value::Number(n)) => {
+                let f = n.as_f64()?;
+                let tree = self.numeric.get(field)?;
+                Some(tree.get(&f64_sortable(f)).cloned().unwrap_or_default())
+            }
+            CmpOp::Gt(v) | CmpOp::Gte(v) | CmpOp::Lt(v) | CmpOp::Lte(v) => {
+                let f = v.as_f64()?;
+                if !f.is_finite() {
+                    return None;
+                }
+                let tree = self.numeric.get(field)?;
+                let key = f64_sortable(f);
+                use std::ops::Bound::{Excluded, Included, Unbounded};
+                let range: Box<dyn Iterator<Item = &Vec<u32>>> = match op {
+                    CmpOp::Gt(_) => {
+                        Box::new(tree.range((Excluded(key), Unbounded)).map(|(_, r)| r))
+                    }
+                    CmpOp::Gte(_) => {
+                        Box::new(tree.range((Included(key), Unbounded)).map(|(_, r)| r))
+                    }
+                    CmpOp::Lt(_) => {
+                        Box::new(tree.range((Unbounded, Excluded(key))).map(|(_, r)| r))
+                    }
+                    _ => Box::new(tree.range((Unbounded, Included(key))).map(|(_, r)| r)),
+                };
+                let mut rows: Vec<u32> = range.flatten().copied().collect();
+                rows.sort_unstable();
+                Some(rows)
+            }
+            _ => None,
+        }
+    }
+
+    /// Try to answer (part of) the filter from the typed indexes. Returns
+    /// (sorted candidate rows, fully_covered): when not fully covered, the
+    /// residual predicate must still be applied on top of the row set.
+    fn prefilter(&self, filter: &Filter) -> Option<(Vec<u32>, bool)> {
+        match filter {
+            Filter::Cmp { field, op } if !field.contains('.') => {
+                self.lookup_cmp(field, op).map(|rows| (rows, true))
+            }
+            Filter::And(parts) => {
+                let mut acc: Option<Vec<u32>> = None;
+                let mut covered = true;
+                let mut any = false;
+                for part in parts {
+                    match self.prefilter(part) {
+                        Some((rows, part_covered)) => {
+                            any = true;
+                            covered &= part_covered;
+                            acc = Some(match acc {
+                                None => rows,
+                                Some(prev) => intersect_sorted(&prev, &rows),
+                            });
+                        }
+                        None => covered = false,
+                    }
+                }
+                if any {
+                    Some((acc.unwrap_or_default(), covered))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(a.len().min(b.len()));
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
 struct StoredChunk {
     chunk: Chunk,
     /// Effective metadata for filtering: document metadata overlaid with
@@ -168,6 +323,7 @@ struct State {
     chunk_ids: HashMap<String, u32>,
     doc_rows: HashMap<String, Vec<u32>>,
     arena: VectorArena,
+    meta_index: MetaIndex,
     sq8: Option<Sq8Arena>,
     ivf: Option<IvfIndex>,
     hnsw: Hnsw,
@@ -355,6 +511,7 @@ impl VaultEngine {
                 chunk_ids,
                 doc_rows,
                 arena,
+                meta_index: MetaIndex::default(),
                 sq8,
                 ivf: None,
                 hnsw: persisted.hnsw,
@@ -369,6 +526,7 @@ impl VaultEngine {
             let wal = Wal::open(path, config.wal_sync)?;
             State {
                 arena: VectorArena::new(config.dim, config.metric),
+                meta_index: MetaIndex::default(),
                 sq8: if config.quantization == "sq8" {
                     Some(Sq8Arena::new(config.dim, config.metric)?)
                 } else {
@@ -390,6 +548,14 @@ impl VaultEngine {
                 generation: 0,
             }
         };
+
+        // Rebuild the typed metadata index from loaded chunks (rebuildable
+        // acceleration structure, like sq8/ivf — not persisted).
+        for (row, slot) in state.chunks.iter().enumerate() {
+            if let Some(sc) = slot {
+                state.meta_index.add_row(row as u32, &sc.eff_metadata);
+            }
+        }
 
         // Recovery: replay WAL operations newer than the snapshot.
         let records = Wal::replay(path, state.seq)?;
@@ -564,6 +730,7 @@ impl VaultEngine {
                 None => state.sparse.add_empty(row),
             }
             let eff = effective_metadata(&document, &chunk);
+            state.meta_index.add_row(row, &eff);
             // chunk_ids mapping is deferred to the publish phase so the OLD
             // chunk-id mappings stay intact until the new version is fully
             // staged (state.chunks stays row-aligned with the arena, which
@@ -656,9 +823,25 @@ impl VaultEngine {
             None => Filter::True,
         };
         let has_filter = !filter.is_true();
+        // Typed-index prefilter: eq on keyword/bool/number and numeric
+        // ranges (including AND combinations) are answered from posting
+        // lists instead of per-candidate JSON evaluation.
+        let prefilter: Option<(Vec<u32>, bool)> = if has_filter {
+            state.meta_index.prefilter(&filter)
+        } else {
+            None
+        };
         let accept = |row: u32| -> bool {
             if !has_filter {
                 return true;
+            }
+            if let Some((rows, covered)) = &prefilter {
+                if rows.binary_search(&row).is_err() {
+                    return false;
+                }
+                if *covered {
+                    return true;
+                }
             }
             match state.chunks.get(row as usize) {
                 Some(Some(sc)) => filter.matches(&sc.eff_metadata),
@@ -703,7 +886,27 @@ impl VaultEngine {
             })?;
             let prepared = state.arena.prepare_query(vector)?;
             let live = state.arena.live();
-            if state.config.index.starts_with("ivf") {
+            let prefiltered_small = prefilter
+                .as_ref()
+                .map(|(rows, _)| rows.len() <= (pool * 32).max(2048))
+                .unwrap_or(false);
+            if prefiltered_small {
+                let (rows, covered) = prefilter.as_ref().expect("checked above");
+                dense_backend = "bitmap_prefiltered_flat";
+                plan_reasons.push(format!(
+                    "typed-index prefilter: {} candidate rows ({:.2}% of {live} live), \
+                     covered={covered} — exact scan over the row set",
+                    rows.len(),
+                    100.0 * rows.len() as f64 / live.max(1) as f64,
+                ));
+                let mut topk = TopK::new(pool);
+                for &row in rows {
+                    if !state.arena.is_deleted(row) && accept(row) {
+                        topk.push(row, state.arena.score(row, &prepared));
+                    }
+                }
+                dense = topk.into_sorted();
+            } else if state.config.index.starts_with("ivf") {
                 if let Some(ivf) = state.ivf.as_ref() {
                     dense_backend = if ivf.uses_pq() { "ivf_pq" } else { "ivf_flat" };
                     let nprobe = request.nprobe.unwrap_or(state.config.ivf.nprobe);
@@ -860,6 +1063,11 @@ impl VaultEngine {
                 "reason": plan_reasons,
                 "candidate_pool": pool,
                 "filtered": has_filter,
+                "typed_prefilter": prefilter.as_ref().map(|(rows, covered)| json!({
+                    "rows": rows.len(),
+                    "covered": covered,
+                    "selectivity": rows.len() as f64 / state.arena.live().max(1) as f64,
+                })),
                 "live_vectors": state.arena.live(),
             }),
         })
@@ -1019,6 +1227,7 @@ impl VaultEngine {
             let mut chunk_ids = HashMap::new();
             let mut doc_rows: HashMap<String, Vec<u32>> = HashMap::new();
             let mut row_map: HashMap<u32, u32> = HashMap::new();
+            let mut meta_index = MetaIndex::default();
 
             let mut live_rows: Vec<u32> = (0..state.chunks.len() as u32)
                 .filter(|&r| !state.arena.is_deleted(r) && state.chunks[r as usize].is_some())
@@ -1035,6 +1244,7 @@ impl VaultEngine {
                 }
                 bm25.add(new_row, &sc.chunk.text);
                 row_map.insert(old_row, new_row);
+                meta_index.add_row(new_row, &sc.eff_metadata);
                 chunk_ids.insert(sc.chunk.chunk_id.clone(), new_row);
                 doc_rows
                     .entry(sc.chunk.document_id.clone())
@@ -1046,6 +1256,7 @@ impl VaultEngine {
                 }));
             }
             state.sparse = state.sparse.remap(&row_map, arena.len() as u32);
+            state.meta_index = meta_index;
             state.arena = arena;
             state.sq8 = sq8;
             state.hnsw = hnsw;
@@ -1466,6 +1677,137 @@ mod tests {
 
     /// P0 regression: a write that fails validation mid-apply must leave
     /// NO trace — not in memory, not in the WAL, not after reopen.
+    /// Typed prefilter must be RESULT-EQUIVALENT to predicate evaluation
+    /// for every supported shape, across all signals, deletes and compact.
+    #[test]
+    fn typed_prefilter_matches_predicate_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(4);
+        cfg.flat_threshold = 1_000_000;
+        let engine = VaultEngine::open(dir.path(), cfg).unwrap();
+        for i in 0..200 {
+            let id = format!("d{i}");
+            engine
+                .upsert_document(
+                    doc(
+                        &id,
+                        json!({
+                            "team": format!("team{}", i % 5),
+                            "year": 2015 + (i % 10),
+                            "active": i % 2 == 0,
+                            "score": (i as f64) / 7.0,
+                        }),
+                    ),
+                    vec![chunk(&id, 0, &format!("payload {i} shared"))],
+                    &unit_vec(4, i),
+                    None,
+                )
+                .unwrap();
+        }
+        for i in (0..200).step_by(9) {
+            engine.delete_document(&format!("d{i}")).unwrap();
+        }
+        let filters = vec![
+            json!({"team": "team2"}),
+            json!({"active": true}),
+            json!({"year": 2018}),
+            json!({"year": {"gte": 2019}}),
+            json!({"score": {"gt": 10.0, "lte": 20.0}}),
+            json!({"$and": [{"team": "team1"}, {"year": {"lt": 2020}}]}),
+            // partially covered: prefix is NOT indexable -> residual predicate
+            json!({"$and": [{"team": "team3"}, {"title": {"prefix": "Title"}}]}),
+            // not indexable at all -> pure predicate path
+            json!({"$or": [{"team": "team0"}, {"team": "team4"}]}),
+        ];
+        let run = |filter: Option<serde_json::Value>, mode: &str| -> Vec<(String, String)> {
+            engine
+                .search(&SearchRequest {
+                    vector: Some(unit_vec(4, 3)),
+                    text: Some("payload shared".into()),
+                    sparse: None,
+                    k: 50,
+                    mode: mode.into(),
+                    candidates: Some(300),
+                    filter,
+                    ef_search: None,
+                    nprobe: None,
+                    weights: None,
+                })
+                .unwrap()
+                .hits
+                .into_iter()
+                .map(|h| (h.chunk_id, format!("{:.6}", h.score)))
+                .collect()
+        };
+        // Reference: brute-force predicate over list_documents (no index).
+        for filter in &filters {
+            let parsed = Filter::parse(filter).unwrap();
+            for mode in ["dense", "keyword", "hybrid"] {
+                let got = run(Some(filter.clone()), mode);
+                // every returned doc satisfies the predicate
+                for (cid, _) in &got {
+                    let c = engine.get_chunk(cid).unwrap();
+                    let d = engine.get_document(&c.document_id).unwrap();
+                    let eff = effective_metadata(&d, &c);
+                    assert!(parsed.matches(&eff), "{mode} {filter} returned {cid}");
+                }
+                // and no satisfying doc is missing (k=50 > matches for team
+                // filters; verify counts against a manual scan)
+                let expected: usize = engine
+                    .list_documents()
+                    .iter()
+                    .filter(|d| {
+                        let c = &engine.get_document_chunks(&d.document_id)[0];
+                        parsed.matches(&effective_metadata(d, c))
+                    })
+                    .count();
+                if mode == "keyword" {
+                    assert_eq!(got.len(), expected.min(50), "{mode} {filter}");
+                }
+            }
+        }
+        // compact + reopen keep prefilter results identical
+        let before = run(Some(filters[3].clone()), "hybrid");
+        engine.compact().unwrap();
+        assert_eq!(before, run(Some(filters[3].clone()), "hybrid"));
+    }
+
+    #[test]
+    fn typed_prefilter_is_visible_in_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+        for i in 0..50 {
+            let id = format!("d{i}");
+            engine
+                .upsert_document(
+                    doc(&id, json!({"team": format!("team{}", i % 5)})),
+                    vec![chunk(&id, 0, "x")],
+                    &unit_vec(4, i),
+                    None,
+                )
+                .unwrap();
+        }
+        let response = engine
+            .search(&SearchRequest {
+                vector: Some(unit_vec(4, 0)),
+                text: None,
+                sparse: None,
+                k: 5,
+                mode: "dense".into(),
+                candidates: None,
+                filter: Some(json!({"team": "team2"})),
+                ef_search: None,
+                nprobe: None,
+                weights: None,
+            })
+            .unwrap();
+        assert_eq!(response.plan["dense_backend"], "bitmap_prefiltered_flat");
+        let pf = &response.plan["typed_prefilter"];
+        assert_eq!(pf["rows"], 10);
+        assert_eq!(pf["covered"], true);
+        assert!(pf["selectivity"].as_f64().unwrap() < 0.25);
+    }
+
     #[test]
     fn rejected_write_leaves_no_trace_even_after_reopen() {
         let dir = tempfile::tempdir().unwrap();

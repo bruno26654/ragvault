@@ -39,7 +39,13 @@ PR:            #1/#2 mergeadas; PR dos 5 commits de hardening (5aec3b9..dd1ce16)
 
 Nenhuma alteração local pendente. Próximas tarefas na ordem da diretiva:
 
-1. **P1 Context Builder v2** (docs/../python/ragvault/context.py):
+1. ~~Context Builder v2~~ — concluído (dd1ce16).
+1b. ~~Avaliação texto real~~ — concluído (ae8fe9f; linhas semânticas blocked por rede).
+1c. ~~Filtros tipados~~ — concluído (este commit).
+2. **P2 batch nativo**: `search_many` no binding (matriz de queries, GIL
+   liberado, rayon por query, merge determinístico); `retrieve_many` usa;
+   testar equivalência com queries individuais. ESTA É A PRÓXIMA TAREFA.
+3. (antigo 1) **P1 Context Builder v2** (docs/../python/ragvault/context.py):
    fusão de chunks sobrepostos/adjacentes por offsets (não cruzar documento/
    versão), flag de truncamento explícita no resultado, testes adversariais
    (sobreposição, budget mínimo, ACL). O budget pós-expansão já é respeitado.

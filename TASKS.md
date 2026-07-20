@@ -91,7 +91,8 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 | IVF-PQ (ADC 8-bit, oversample 8x, rescore f32, pq_m automático) | validated | `pq_with_rescore_reaches_high_recall`, `ivf_pq_auto_subspaces` |
 | OPQ / binary quantization | not-started | mesmo gate de benchmark de SQ8/IVF |
 | mmap (`storage="mmap"`: base mmap + cauda RAM, checksum na abertura) | validated | `mmap_storage_full_lifecycle` (Rust), `TestMmapPython` (paridade byte-a-byte com memory) |
-| Índices bitmap/range de metadados | not-started | predicado por candidato é correto; isto é otimização |
+| Índices tipados de metadados (posting lists keyword/bool + BTreeMap numérico para ranges, interseção AND, cobertura parcial com predicado residual) | validated | `typed_prefilter_matches_predicate_results` (equivalência com predicado em 8 formas × 3 modos, deletes, compact), `typed_prefilter_is_visible_in_plan`; benchmark RESULTS-FILTERS.md: 12x @10%, 172x @1%, 484x @0.1% seletividade |
+| Roaring bitmaps / histogramas / índices textuais dedicados | deferred | posting lists ordenadas cobrem eq/range; roaring é otimização de memória futura |
 | Autotuning (kb.tune) | validated | grid retrieval-time com evidência por trial |
 | Property testing (proptest) | validated | `proptest_filter.rs` (parser nunca em pânico; not = complemento; eq == in([x])), `proptest_topk.rs` (equivalência com sort; merge == stream único) |
 
