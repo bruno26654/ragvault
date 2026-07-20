@@ -584,6 +584,39 @@ class KnowledgeBase:
         else:
             response = self._vault.search(json.dumps(request), query_vec)
         search_ms = (time.monotonic() - t0) * 1000
+        return self._finalize_retrieval(
+            query, response, k=k, token_budget=token_budget, rerank=rerank,
+            context_window=context_window,
+            max_chunks_per_document=max_chunks_per_document,
+            explain=explain, trace=trace, trace_data=trace_data,
+            mode=mode, search_ms=search_ms, gpu_note=gpu_note,
+        )
+
+    def _finalize_retrieval(
+        self,
+        query: str,
+        response: dict,
+        *,
+        k: int = 8,
+        token_budget: Optional[int] = None,
+        rerank: Optional[Callable] = None,
+        context_window: Optional[dict] = None,
+        max_chunks_per_document: Optional[int] = None,
+        explain: bool = False,
+        trace: bool = False,
+        trace_data: Optional[dict] = None,
+        mode: Optional[str] = None,
+        search_ms: Optional[float] = None,
+        gpu_note: Optional[str] = None,
+        **_ignored: Any,
+    ) -> RetrievalResult:
+        """Shared post-search pipeline: chunk materialization, rerank,
+        neighbor expansion, context assembly, plan/trace enrichment. Used by
+        both retrieve() and the batched retrieve_many() so their results are
+        equivalent by construction."""
+        token_budget = token_budget or self.config.default_token_budget
+        if trace and trace_data is None:
+            trace_data = {}
 
         doc_cache: dict[str, Optional[dict]] = {}
         chunks: list[RetrievedChunk] = []
@@ -644,11 +677,13 @@ class KnowledgeBase:
             result.plan["reason"] = list(result.plan["reason"]) + [gpu_note]
         if explain or trace:
             result.plan = dict(result.plan)
-            result.plan["search_ms"] = round(search_ms, 3)
+            if search_ms is not None:
+                result.plan["search_ms"] = round(search_ms, 3)
             result.plan["mode"] = mode
             result.plan["token_budget"] = token_budget
         if trace_data is not None:
-            trace_data["search_ms"] = round(search_ms, 3)
+            if search_ms is not None:
+                trace_data["search_ms"] = round(search_ms, 3)
             result.trace = trace_data
         return result
 
@@ -717,7 +752,45 @@ class KnowledgeBase:
         }
 
     def retrieve_many(self, queries: Sequence[str], **kwargs: Any) -> list[RetrievalResult]:
-        return [self.retrieve(q, **kwargs) for q in queries]
+        """Batch retrieval. Uses one batched query-embedding call plus the
+        native parallel `search_many` (GIL released) when possible; falls
+        back to sequential retrieve() for sidecar searchers. Results are
+        equivalent to per-query retrieve() calls (tested)."""
+        queries = list(queries)
+        if not queries or kwargs.get("dense_searcher") is not None:
+            return [self.retrieve(q, **kwargs) for q in queries]
+
+        mode = kwargs.get("mode") or self.config.retrieval_mode
+        k = kwargs.get("k", 8)
+        pool = kwargs.get("candidates") or self.config.candidates
+        merged_filter = self._merged_filter(kwargs.get("filters"))
+        if merged_filter is not None:
+            _native.validate_filter(json.dumps(merged_filter))
+
+        vectors = None
+        if mode in ("dense", "hybrid", "auto"):
+            vectors = np.ascontiguousarray(
+                self.embedder.embed_queries(queries), dtype=np.float32
+            )
+        requests = [{
+            "text": q if mode in ("keyword", "hybrid", "auto") else None,
+            "k": max(pool, k),
+            "mode": mode,
+            "candidates": pool,
+            "filter": merged_filter,
+            "ef_search": kwargs.get("ef_search") or self.config.ef_search,
+            "nprobe": kwargs.get("nprobe") or self.config.nprobe,
+            "weights": {
+                "dense": self.config.dense_weight,
+                "bm25": self.config.bm25_weight,
+                "sparse": self.config.sparse_weight,
+            },
+        } for q in queries]
+        responses = self._vault.search_many(json.dumps(requests), vectors)
+        return [
+            self._finalize_retrieval(query, response, **kwargs)
+            for query, response in zip(queries, responses)
+        ]
 
     async def aretrieve(self, query: str, **kwargs: Any) -> RetrievalResult:
         return await asyncio.to_thread(self.retrieve, query, **kwargs)

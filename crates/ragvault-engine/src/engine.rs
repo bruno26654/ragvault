@@ -1073,6 +1073,14 @@ impl VaultEngine {
         })
     }
 
+    /// Batch search: evaluates requests in parallel under the shared read
+    /// lock (one coherent snapshot per request; results are identical to
+    /// calling `search` sequentially — proven by test).
+    pub fn search_many(&self, requests: &[SearchRequest]) -> Result<Vec<SearchResponse>> {
+        use rayon::prelude::*;
+        requests.par_iter().map(|r| self.search(r)).collect()
+    }
+
     pub fn get_chunk(&self, chunk_id: &str) -> Option<Chunk> {
         let state = self.state.read();
         state
@@ -1770,6 +1778,44 @@ mod tests {
         let before = run(Some(filters[3].clone()), "hybrid");
         engine.compact().unwrap();
         assert_eq!(before, run(Some(filters[3].clone()), "hybrid"));
+    }
+
+    #[test]
+    fn search_many_equals_sequential_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = VaultEngine::open(dir.path(), config(8)).unwrap();
+        for i in 0..80 {
+            let id = format!("d{i}");
+            engine
+                .upsert_document(
+                    doc(&id, json!({"g": i % 4})),
+                    vec![chunk(&id, 0, &format!("text {i} common"))],
+                    &unit_vec(8, i),
+                    None,
+                )
+                .unwrap();
+        }
+        let requests: Vec<SearchRequest> = (0..16)
+            .map(|i| SearchRequest {
+                vector: Some(unit_vec(8, i)),
+                text: Some("text common".into()),
+                sparse: None,
+                k: 5,
+                mode: "hybrid".into(),
+                candidates: None,
+                filter: if i % 2 == 0 { Some(json!({"g": 1})) } else { None },
+                ef_search: None,
+                nprobe: None,
+                weights: None,
+            })
+            .collect();
+        let batch = engine.search_many(&requests).unwrap();
+        for (request, batched) in requests.iter().zip(&batch) {
+            let single = engine.search(request).unwrap();
+            let a: Vec<_> = single.hits.iter().map(|h| (&h.chunk_id, h.score)).collect();
+            let b: Vec<_> = batched.hits.iter().map(|h| (&h.chunk_id, h.score)).collect();
+            assert_eq!(a, b, "batch result must equal sequential result");
+        }
     }
 
     #[test]

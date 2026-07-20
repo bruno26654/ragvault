@@ -223,3 +223,45 @@ class TestDatabase:
         with pytest.raises(NotImplementedError) as err:
             ragvault.connect("https://cluster.example.com")
         assert "planned" in str(err.value)
+
+
+class TestNativeBatch:
+    def test_retrieve_many_equals_individual(self, tmp_path):
+        with ragvault.open(tmp_path / "kb") as kb:
+            kb.add([{"id": f"d{i}", "text": f"batch subject {i} details",
+                     "metadata": {"g": i % 3}} for i in range(60)])
+            queries = [f"batch subject {i}" for i in (3, 17, 41, 59)]
+            batch = kb.retrieve_many(queries, k=4)
+            single = [kb.retrieve(q, k=4) for q in queries]
+            for b, s in zip(batch, single):
+                assert [c.chunk_id for c in b.chunks] == [c.chunk_id for c in s.chunks]
+                assert [round(c.score, 6) for c in b.chunks] == \
+                       [round(c.score, 6) for c in s.chunks]
+                assert b.context == s.context
+
+    def test_retrieve_many_with_filters_and_budget(self, tmp_path):
+        with ragvault.open(tmp_path / "kb") as kb:
+            kb.add([{"id": f"d{i}", "text": f"filtered subject {i}",
+                     "metadata": {"g": i % 2}} for i in range(20)])
+            results = kb.retrieve_many(
+                ["filtered subject 4", "filtered subject 6"],
+                k=5, filters={"g": 0}, token_budget=500,
+            )
+            for r in results:
+                assert r.chunks
+                assert all(int(c.document_id[1:]) % 2 == 0 for c in r.chunks)
+                assert r.token_count <= 500
+
+    def test_empty_and_sidecar_fallback(self, tmp_path):
+        with ragvault.open(tmp_path / "kb") as kb:
+            kb.add("content")
+            assert kb.retrieve_many([]) == []
+            searcher = _FakeCagraModule()  # not a searcher: forces fallback path check
+
+            class Sidecar:
+                def search(self, q, k):
+                    return [("content-id#0", 1.0)]
+
+            # sidecar path falls back to sequential retrieve (documented)
+            out = kb.retrieve_many(["content"], dense_searcher=Sidecar())
+            assert len(out) == 1
