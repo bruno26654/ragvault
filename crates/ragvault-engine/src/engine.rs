@@ -1803,7 +1803,11 @@ mod tests {
                 k: 5,
                 mode: "hybrid".into(),
                 candidates: None,
-                filter: if i % 2 == 0 { Some(json!({"g": 1})) } else { None },
+                filter: if i % 2 == 0 {
+                    Some(json!({"g": 1}))
+                } else {
+                    None
+                },
                 ef_search: None,
                 nprobe: None,
                 weights: None,
@@ -1813,7 +1817,11 @@ mod tests {
         for (request, batched) in requests.iter().zip(&batch) {
             let single = engine.search(request).unwrap();
             let a: Vec<_> = single.hits.iter().map(|h| (&h.chunk_id, h.score)).collect();
-            let b: Vec<_> = batched.hits.iter().map(|h| (&h.chunk_id, h.score)).collect();
+            let b: Vec<_> = batched
+                .hits
+                .iter()
+                .map(|h| (&h.chunk_id, h.score))
+                .collect();
             assert_eq!(a, b, "batch result must equal sequential result");
         }
     }
