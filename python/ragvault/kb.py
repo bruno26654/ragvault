@@ -34,6 +34,7 @@ from .context import (
 )
 from .embeddings import (
     Embedder,
+    bytes_hash,
     content_hash,
     embedding_fingerprint,
     resolve_embedding,
@@ -215,6 +216,20 @@ class KnowledgeBase:
         else:
             if not create:
                 raise ConfigurationError(f"no knowledge base at {self.path}")
+            if preset == "quality" and embedding is None:
+                # quality must be semantically real: never silently degrade
+                # to the lexical baseline, never silently download a model.
+                raise ConfigurationError(
+                    "preset='quality' requires an explicit embedding decision:\n"
+                    "  - semantic (recommended): ragvault.open(path, preset='quality',\n"
+                    "      embedding='sentence-transformers:all-MiniLM-L6-v2')\n"
+                    "    (pip install \"ragvault[local-models]\"; the model downloads\n"
+                    "    on first use of sentence-transformers — an explicit action)\n"
+                    "  - your own embedder: embedding=my_callable_or_Embedder\n"
+                    "  - explicit lexical fallback (NOT semantic):\n"
+                    "      embedding='builtin:hashed-ngram'\n"
+                    "  - or use preset='offline-lite' for the lexical baseline"
+                )
             embedding_spec = embedding if embedding is not None else None
             if isinstance(embedding_spec, str):
                 overrides = {**overrides, "embedding": embedding_spec}
@@ -269,6 +284,21 @@ class KnowledgeBase:
         return f"KnowledgeBase(path={str(self.path)!r}, preset={self.config.preset!r}, {state})"
 
     # -- ingestion ---------------------------------------------------------
+
+    def _processing_fingerprint(self) -> str:
+        """Identifies the parse→chunk→embed pipeline. A change in any stage
+        must invalidate previously synced documents even when the source
+        bytes are unchanged."""
+        import hashlib as _hashlib
+
+        from .parsers import PARSER_VERSION
+
+        payload = json.dumps({
+            "parser": PARSER_VERSION,
+            "chunking": self._chunking_config().to_dict(),
+            "embedding": self._fingerprint,
+        }, sort_keys=True, default=str)
+        return _hashlib.sha256(payload.encode()).hexdigest()[:16]
 
     def _chunking_config(self) -> ChunkingConfig:
         return ChunkingConfig(
@@ -406,6 +436,7 @@ class KnowledgeBase:
             for d in self._vault.list_documents()
             if d.get("source_id") == source_id
         }
+        processing_fp = self._processing_fingerprint()
         seen_ids: set[str] = set()
         for path in files:
             rel = path.relative_to(directory).as_posix()
@@ -413,9 +444,16 @@ class KnowledgeBase:
             seen_ids.add(doc_id)
             try:
                 raw = path.read_bytes()
-                file_hash = content_hash(raw.decode("utf-8", errors="replace"))
+                # Identity = sha256 of ORIGINAL bytes; decoded text must not
+                # collapse distinct binary files. The processing fingerprint
+                # (parser + chunking + embedding) invalidates on pipeline
+                # changes even when the bytes are identical.
+                file_hash = bytes_hash(raw)
                 prior = existing.get(doc_id)
-                if prior and prior.get("metadata", {}).get("file_hash") == file_hash:
+                prior_meta = (prior or {}).get("metadata", {})
+                if (prior
+                        and prior_meta.get("source_content_hash") == file_hash
+                        and prior_meta.get("processing_fingerprint") == processing_fp):
                     report.unchanged += 1
                     continue
                 parsed = parse_file(path)
@@ -428,7 +466,9 @@ class KnowledgeBase:
                     "title": parsed.title,
                     "metadata": {
                         **parsed.metadata,
-                        "file_hash": file_hash,
+                        "source_content_hash": file_hash,
+                        "parsed_content_hash": content_hash(parsed.text),
+                        "processing_fingerprint": processing_fp,
                         "path": rel,
                         "format": parsed.format,
                     },

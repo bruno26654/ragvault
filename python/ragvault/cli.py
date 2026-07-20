@@ -24,7 +24,7 @@ def _open(path: str, **kwargs):
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    kb = _open(args.path, preset=args.preset, create=True)
+    kb = _open(args.path, preset=args.preset, embedding=args.embedding, create=True)
     print(f"initialized knowledge base at {args.path}")
     print(kb.config.explain())
     kb.close()
@@ -208,6 +208,8 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("init", help="create a knowledge base")
     p.add_argument("path")
     p.add_argument("--preset", default="balanced")
+    p.add_argument("--embedding", default=None,
+                   help="embedding spec (required by --preset quality)")
     p.set_defaults(fn=cmd_init)
 
     p = sub.add_parser("sync", help="sync a documents directory")

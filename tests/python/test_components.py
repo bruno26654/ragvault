@@ -195,7 +195,8 @@ class TestConfig:
             ragvault.open(tmp_path / "kb", preset="turbo")
 
     def test_explain_and_export(self, tmp_path):
-        with ragvault.open(tmp_path / "kb", preset="quality") as kb:
+        with ragvault.open(tmp_path / "kb", preset="quality",
+                           embedding="builtin:hashed-ngram") as kb:
             text = kb.config.explain()
             assert "preset: quality" in text
             out = tmp_path / "config.json"

@@ -7,7 +7,11 @@ De documentos a um RAG confiável em minutos, sem montar manualmente uma stack d
 ```python
 import ragvault
 
-kb = ragvault.open("./knowledge", preset="quality")
+kb = ragvault.open(
+    "./knowledge",
+    preset="quality",
+    embedding="sentence-transformers:all-MiniLM-L6-v2",  # decisão explícita
+)
 kb.sync("./documents")
 
 result = kb.retrieve("Quais são as regras de cancelamento?", token_budget=6000)
@@ -53,10 +57,10 @@ pip install "ragvault[local-models]"  # sentence-transformers
 
 ## Três níveis de uso
 
-**Simples** — funciona offline com o embedder lexical embutido (determinístico, sem dependências; documentado como lexical, não semântico — combine com um modelo real para máxima qualidade):
+**Simples** — funciona offline com o embedder lexical embutido (determinístico, sem dependências; documentado como lexical, não semântico). O preset `quality` **exige** uma decisão explícita de embedding — nunca degrada silenciosamente para lexical nem baixa modelos sozinho:
 
 ```python
-kb = ragvault.open("./data")
+kb = ragvault.open("./data")  # preset balanced: lexical explícito por default
 kb.add(["primeiro texto", "segundo texto"])
 result = kb.retrieve("minha pergunta")
 ```

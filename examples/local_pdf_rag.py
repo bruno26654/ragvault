@@ -8,7 +8,8 @@ import ragvault
 if len(sys.argv) != 2:
     raise SystemExit("usage: python local_pdf_rag.py <directory-with-pdfs>")
 
-with ragvault.open(Path(tempfile.mkdtemp()) / "kb", preset="quality") as kb:
+with ragvault.open(Path(tempfile.mkdtemp()) / "kb", preset="quality",
+                   embedding="builtin:hashed-ngram") as kb:
     report = kb.sync(sys.argv[1], include=["**/*.pdf"])
     print(report)
     result = kb.retrieve("summarize the main obligations", token_budget=4000)

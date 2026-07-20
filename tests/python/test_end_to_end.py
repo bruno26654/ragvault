@@ -13,7 +13,8 @@ import ragvault
 
 def test_full_lifecycle(tmp_path, docs_dir):
     kb_path = tmp_path / "kb"
-    with ragvault.open(kb_path, preset="quality") as kb:
+    with ragvault.open(kb_path, preset="quality",
+                       embedding="builtin:hashed-ngram") as kb:
         report = kb.sync(docs_dir)
         assert report.discovered == 3
         assert report.added == 3

@@ -14,7 +14,9 @@ maturin develop --release
 ```python
 import ragvault
 
-kb = ragvault.open("./knowledge", preset="quality")
+# quality exige decisão explícita de embedding (sem degradação silenciosa):
+kb = ragvault.open("./knowledge", preset="quality",
+                   embedding="sentence-transformers:all-MiniLM-L6-v2")
 kb.sync("./documents")           # txt, md, html, json, jsonl, csv, código; pdf/docx com extras
 result = kb.retrieve("Quais são as regras de cancelamento?", token_budget=6000)
 print(result.context)
