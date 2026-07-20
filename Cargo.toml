@@ -22,7 +22,10 @@ crc32fast = "1"
 rand = "0.8"
 rayon = "1.10"
 fs2 = "0.4"
+memmap2 = "0.9"
+bytemuck = "1"
 parking_lot = "0.12"
+proptest = "1"
 
 [profile.release]
 lto = "thin"

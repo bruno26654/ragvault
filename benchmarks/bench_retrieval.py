@@ -251,6 +251,80 @@ def bench_sq8(n: int = 50_000, dim: int = 384, n_queries: int = 100, k: int = 10
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+def bench_ivf(n: int = 50_000, dim: int = 384, n_queries: int = 100, k: int = 10) -> None:
+    """IVF-Flat backend: ingestion + training cost, recall/QPS per nprobe."""
+    from ragvault import _native
+
+    log("")
+    log(f"## IVF-Flat backend (n={n:,}, dim={dim}, k={k})")
+    log("")
+    rng = np.random.default_rng(42)
+    data = rng.standard_normal((n, dim), dtype=np.float32)
+    data /= np.linalg.norm(data, axis=1, keepdims=True)
+    queries = data[rng.integers(0, n, n_queries)] + 0.1 * rng.standard_normal(
+        (n_queries, dim), dtype=np.float32
+    )
+    queries /= np.linalg.norm(queries, axis=1, keepdims=True)
+    truth = []
+    for q in queries:
+        scores = data @ q
+        truth.append(set(np.argpartition(-scores, k)[:k].tolist()))
+
+    tmp = tempfile.mkdtemp(prefix="ragvault-ivf-bench-")
+    config = {
+        "dim": dim, "metric": "cosine",
+        "hnsw": {"m": 16, "ef_construction": 200, "ef_search": 64, "seed": 7},
+        "bm25": {"k1": 1.2, "b": 0.75, "lowercase": True},
+        "wal_sync": "batch", "flat_threshold": 0,
+        "index": "ivf_flat",
+        "ivf": {"nlist": 0, "nprobe": 8, "pq_m": 0, "seed": 7},
+    }
+    vault = _native.Vault.open(tmp, json.dumps(config))
+    t0 = time.monotonic()
+    for start in range(0, n, 500):
+        rows = data[start:start + 500]
+        doc_id = f"doc-{start}"
+        chunks = [
+            {"chunk_id": f"{doc_id}#{i}", "document_id": doc_id, "document_version": 1,
+             "chunk_index": i, "text": "", "metadata": {}, "section_path": []}
+            for i in range(len(rows))
+        ]
+        document = {"document_id": doc_id, "current_version": 1, "metadata": {}}
+        vault.upsert_document(json.dumps(document), json.dumps(chunks),
+                              np.ascontiguousarray(rows))
+    ingest_s = time.monotonic() - t0
+    t0 = time.monotonic()
+    vault.flush()  # trains k-means + assigns lists
+    train_s = time.monotonic() - t0
+    log(f"- ingestion (WAL only, no per-insert index work): {ingest_s:.1f}s "
+        f"({n / ingest_s:,.0f} vectors/s); flush incl. k-means train + assign: "
+        f"{train_s:.1f}s")
+
+    log("")
+    log("| nprobe | recall@10 | QPS (1 thread) | p50 ms | p95 ms |")
+    log("|---|---|---|---|---|")
+    for nprobe in (4, 8, 16, 32):
+        # nprobe is per-open config; reopening also re-verifies + retrains.
+        vault.close()
+        config["ivf"]["nprobe"] = nprobe
+        vault = _native.Vault.open(tmp, json.dumps(config))
+        latencies = []
+        hits = 0
+        for qi, q in enumerate(queries):
+            request = {"k": k, "mode": "dense", "candidates": k}
+            t = time.monotonic()
+            response = vault.search(json.dumps(request), np.ascontiguousarray(q))
+            latencies.append((time.monotonic() - t) * 1000)
+            got = {int(h["chunk_id"].split("#")[1]) + int(h["document_id"].split("-")[1])
+                   for h in response["hits"]}
+            hits += len(got & truth[qi])
+        recall = hits / (n_queries * k)
+        log(f"| {nprobe} | {recall:.3f} | {1000 / statistics.mean(latencies):,.0f} | "
+            f"{pctl(latencies, 0.5):.2f} | {pctl(latencies, 0.95):.2f} |")
+    vault.close()
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
 def bench_rag(n_docs: int = 2_000) -> None:
     import ragvault
 
@@ -319,6 +393,7 @@ def main() -> None:
     log("")
     bench_engine()
     bench_sq8()
+    bench_ivf()
     bench_rag()
     out = Path(__file__).parent / "RESULTS.md"
     out.write_text("\n".join(RESULTS) + "\n")

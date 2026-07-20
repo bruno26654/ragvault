@@ -13,9 +13,24 @@ Números reais medidos neste repositório: **benchmarks/RESULTS.md** (gerado por
 
 Backend `sq8_flat`: cada vetor é quantizado para int8 com escala própria; a busca varre os códigos int8 (4x menos banda de memória), sobreamostra 4x e refina os sobreviventes contra os vetores f32 originais — recall quase exato sem construir grafo (ingestão muito mais rápida, escolha certa para coleções médias com muita escrita ou filtro). Números reais em benchmarks/RESULTS.md. Limitações: métricas cosine/dot (L2 é rejeitada com erro claro); os f32 são mantidos para rescoring, então a economia é no custo de varredura e no grafo, não no total residente.
 
+## IVF-Flat / IVF-PQ (`index="ivf_flat"|"ivf_pq"`)
+
+k-means determinístico por seed em amostra ≤20k; recall cresce monotonicamente
+com `nprobe` (testado); sondagem completa == exato (testado); PQ com rescore
+f32 mantém recall alto com códigos ~m bytes/vetor. Números reais na seção IVF
+de benchmarks/RESULTS.md.
+
+## mmap (`storage="mmap"`)
+
+Vetores do snapshot servidos por page cache; paridade byte-a-byte com o modo
+memory testada. Ganho principal: abrir bases grandes sem materializar os f32
+na heap do processo.
+
 ## O que ainda não está (honesto)
 
-- IVF/PQ/OPQ/binary, mmap, prefetch explícito, intrinsics por arquitetura: planejados (Gate D em TASKS.md). Não há números para eles porque não existem.
+- OPQ/binary quantization, prefetch explícito, intrinsics por arquitetura,
+  índices bitmap de metadados: planejados (TASKS.md). Não há números para
+  eles porque não existem.
 - Snapshot JSON v1 torna reopen de vaults muito grandes mais lento que o necessário — medido em RESULTS.md, correção planejada.
 
 ## Comparações

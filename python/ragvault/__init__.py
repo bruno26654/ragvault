@@ -32,15 +32,21 @@ from .errors import (
     VaultError,
     VaultLockedError,
 )
+from .database import Database, connect
 from .evaluate import EvaluationReport
 from .kb import Answer, KnowledgeBase, SyncReport, open_kb as open  # noqa: A001
+from .rerankers import maxsim_reranker, maxsim_score
 from .parsers import ParsedDocument, parse_file, register_parser
 
 __version__ = _native_version
 
 __all__ = [
     "open",
+    "connect",
+    "Database",
     "KnowledgeBase",
+    "maxsim_reranker",
+    "maxsim_score",
     "RetrievalResult",
     "RetrievedChunk",
     "Citation",

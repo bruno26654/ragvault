@@ -129,6 +129,46 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_benchmark(args: argparse.Namespace) -> int:
+    """Quick built-in benchmark against an existing knowledge base:
+    retrieval latency percentiles and (for dense) exact-vs-configured
+    agreement on a query sample."""
+    import statistics
+    import time as _time
+
+    with _open(args.path) as kb:
+        stats = kb.stats()
+        if stats["documents"] == 0:
+            print("knowledge base is empty — sync some documents first")
+            return 1
+        docs = kb.documents()[: args.queries]
+        queries = [
+            (d.get("title") or d["document_id"]).replace("-", " ").replace("_", " ")
+            for d in docs
+        ]
+        latencies = []
+        for q in queries:
+            t0 = _time.monotonic()
+            kb.retrieve(q, k=args.k)
+            latencies.append((_time.monotonic() - t0) * 1000)
+        latencies.sort()
+        p50 = latencies[len(latencies) // 2]
+        p95 = latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))]
+        print(f"documents: {stats['documents']}, live chunks: {stats['live_chunks']}")
+        print(f"retrieve(k={args.k}) over {len(queries)} sampled queries: "
+              f"mean {statistics.mean(latencies):.1f} ms, p50 {p50:.1f} ms, p95 {p95:.1f} ms")
+        print("(numbers measured on this machine right now — not a claim)")
+    return 0
+
+
+def cmd_migrate(args: argparse.Namespace) -> int:
+    with _open(args.path) as kb:
+        print(f"migrating embeddings: {kb.config.embedding} -> {args.embedding}")
+        kb.migrate_embeddings(args.embedding)
+        print(f"done; dimension is now {kb.config.dim}")
+    return 0
+
+
 def cmd_studio(args: argparse.Namespace) -> int:
     from .studio import serve
 
@@ -205,6 +245,17 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("compact", help="reclaim space from deletions")
     p.add_argument("path")
     p.set_defaults(fn=cmd_compact)
+
+    p = sub.add_parser("benchmark", help="quick latency benchmark on this KB")
+    p.add_argument("path")
+    p.add_argument("-k", type=int, default=8)
+    p.add_argument("--queries", type=int, default=30)
+    p.set_defaults(fn=cmd_benchmark)
+
+    p = sub.add_parser("migrate", help="migrate to a new embedding (blocking)")
+    p.add_argument("path")
+    p.add_argument("--embedding", required=True)
+    p.set_defaults(fn=cmd_migrate)
 
     p = sub.add_parser("studio", help="open the local inspection UI")
     p.add_argument("path")

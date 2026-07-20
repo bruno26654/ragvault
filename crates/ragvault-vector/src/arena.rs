@@ -5,14 +5,35 @@
 //! dense `u32` row indices; deletions are tombstoned in a bitmap and physical
 //! space is reclaimed on compaction.
 
+use std::sync::Arc;
+
 use ragvault_core::{Error, Metric, Result};
 
 use crate::kernels;
+
+/// Read-only mmap-backed prefix of the arena (rows 0..rows). The f32 view is
+/// obtained with `bytemuck::try_cast_slice` — safe, alignment- and
+/// length-checked (mmaps are page-aligned, so the cast never fails after the
+/// length validation in `from_mmap`).
+#[derive(Debug, Clone)]
+struct MmapBase {
+    mmap: Arc<memmap2::Mmap>,
+    rows: usize,
+}
+
+impl MmapBase {
+    #[inline]
+    fn as_f32(&self) -> &[f32] {
+        bytemuck::try_cast_slice(&self.mmap[..]).expect("validated in from_mmap")
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct VectorArena {
     dim: usize,
     metric: Metric,
+    /// Optional mmap-backed prefix (storage="mmap"); owned rows follow it.
+    base: Option<MmapBase>,
     data: Vec<f32>,
     deleted: Vec<bool>,
     live: usize,
@@ -23,10 +44,15 @@ impl VectorArena {
         VectorArena {
             dim,
             metric,
+            base: None,
             data: Vec::new(),
             deleted: Vec::new(),
             live: 0,
         }
+    }
+
+    fn base_rows(&self) -> usize {
+        self.base.as_ref().map(|b| b.rows).unwrap_or(0)
     }
 
     pub fn dim(&self) -> usize {
@@ -72,9 +98,9 @@ impl VectorArena {
             ));
         }
         let id = self.deleted.len() as u32;
+        let start = self.data.len();
         self.data.extend_from_slice(vector);
         if self.metric == Metric::Cosine {
-            let start = id as usize * self.dim;
             kernels::normalize(&mut self.data[start..start + self.dim]);
         }
         self.deleted.push(false);
@@ -95,8 +121,16 @@ impl VectorArena {
 
     #[inline]
     pub fn get(&self, id: u32) -> &[f32] {
-        let start = id as usize * self.dim;
-        &self.data[start..start + self.dim]
+        let idx = id as usize;
+        let base_rows = self.base_rows();
+        if idx < base_rows {
+            let base = self.base.as_ref().expect("base_rows > 0 implies base");
+            let start = idx * self.dim;
+            &base.as_f32()[start..start + self.dim]
+        } else {
+            let start = (idx - base_rows) * self.dim;
+            &self.data[start..start + self.dim]
+        }
     }
 
     /// Similarity score (higher = better) between a stored row and a query.
@@ -133,9 +167,13 @@ impl VectorArena {
         Ok(q)
     }
 
-    /// Raw contiguous storage (for persistence).
-    pub fn raw_data(&self) -> &[f32] {
-        &self.data
+    /// Storage parts for persistence: (mmap-backed prefix, owned tail).
+    /// Concatenated they are the full row-major arena.
+    pub fn vector_parts(&self) -> (&[f32], &[f32]) {
+        match &self.base {
+            Some(base) => (base.as_f32(), &self.data),
+            None => (&[], &self.data),
+        }
     }
 
     pub fn deleted_bitmap(&self) -> &[bool] {
@@ -164,10 +202,55 @@ impl VectorArena {
         Ok(VectorArena {
             dim,
             metric,
+            base: None,
             data,
             deleted,
             live,
         })
+    }
+
+    /// Build an arena whose stored rows are served from a read-only mmap
+    /// (storage="mmap"). New rows appended afterwards live in RAM.
+    pub fn from_mmap(
+        dim: usize,
+        metric: Metric,
+        mmap: memmap2::Mmap,
+        deleted: Vec<bool>,
+    ) -> Result<Self> {
+        let bytes = mmap.len();
+        if dim == 0 || bytes != dim * deleted.len() * 4 {
+            return Err(Error::corrupt(
+                "vector arena (mmap)",
+                format!(
+                    "file has {bytes} bytes, expected dim {dim} x rows {} x 4",
+                    deleted.len()
+                ),
+            ));
+        }
+        if bytemuck::try_cast_slice::<u8, f32>(&mmap[..]).is_err() {
+            return Err(Error::corrupt(
+                "vector arena (mmap)",
+                "mapping is not 4-byte aligned",
+            ));
+        }
+        let live = deleted.iter().filter(|d| !**d).count();
+        let rows = deleted.len();
+        Ok(VectorArena {
+            dim,
+            metric,
+            base: Some(MmapBase {
+                mmap: Arc::new(mmap),
+                rows,
+            }),
+            data: Vec::new(),
+            deleted,
+            live,
+        })
+    }
+
+    /// True when the stored prefix is served from an mmap.
+    pub fn is_mmap(&self) -> bool {
+        self.base.is_some()
     }
 }
 

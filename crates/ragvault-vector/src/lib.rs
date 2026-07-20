@@ -8,6 +8,7 @@
 pub mod arena;
 pub mod flat;
 pub mod hnsw;
+pub mod ivf;
 pub mod kernels;
 pub mod sq8;
 pub mod topk;
@@ -15,5 +16,6 @@ pub mod topk;
 pub use arena::VectorArena;
 pub use flat::FlatIndex;
 pub use hnsw::{Hnsw, HnswConfig};
+pub use ivf::{IvfConfig, IvfIndex};
 pub use sq8::Sq8Arena;
 pub use topk::TopK;

@@ -64,22 +64,32 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 | Kernels auto-vetorizados portáteis + testes diferenciais | validated | unrolled 4-acc; sem intrinsics por arch (deferred) |
 | Top-k limitado com merge por shard | validated | |
 | Comparação com faiss-cpu no mesmo hardware | validated | benchmarks/RESULTS.md (cenário único; sem claim universal) |
-| SQ8 (int8 + rescore f32, backend sq8_flat) | validated | testes Rust+Python, benchmark real em RESULTS.md; IVF/PQ/OPQ/binary not-started |
-| mmap / storage híbrido | not-started | |
+| SQ8 (int8 + rescore f32, backend sq8_flat) | validated | testes Rust+Python, benchmark real em RESULTS.md |
+| IVF-Flat (k-means determinístico, nprobe, delta scan de escritas novas) | validated | `ivf::tests` (full-probe == exato, recall monotônico em nprobe), `ivf_backend_full_lifecycle`, `TestIvfPython`; benchmark em RESULTS.md |
+| IVF-PQ (ADC 8-bit, oversample 8x, rescore f32, pq_m automático) | validated | `pq_with_rescore_reaches_high_recall`, `ivf_pq_auto_subspaces` |
+| OPQ / binary quantization | not-started | mesmo gate de benchmark de SQ8/IVF |
+| mmap (`storage="mmap"`: base mmap + cauda RAM, checksum na abertura) | validated | `mmap_storage_full_lifecycle` (Rust), `TestMmapPython` (paridade byte-a-byte com memory) |
+| Índices bitmap/range de metadados | not-started | predicado por candidato é correto; isto é otimização |
 | Autotuning (kb.tune) | validated | grid retrieval-time com evidência por trial |
+| Property testing (proptest) | validated | `proptest_filter.rs` (parser nunca em pânico; not = complemento; eq == in([x])), `proptest_topk.rs` (equivalência com sort; merge == stream único) |
 
 ## Gate E — GPU
 
 | Tarefa | Status | Nota |
 |---|---|---|
-| Flat GPU / CAGRA / IVF GPU via cuVS | blocked | ambiente sem GPU; nenhuma integração foi iniciada para não criar stubs enganosos |
-| DLPack / CUDA array interface | not-started | |
+| CAGRA sidecar via cuVS (`ragvault.gpu.CagraDenseSearcher`) | implemented-experimental | plumbing testado com cuVS falso (`TestGpuPlumbing`: wiring, pós-filtro via DSL nativa, fallback CPU automático em falha); **não validado em hardware real** — runbook passo a passo em docs/GPU.md; teste real pronto (`pytest -m gpu`) para runner CUDA |
+| `kb.export_dense()` (vetores para builds externos) | validated | usado por GPU sidecar e interop Faiss |
+| Pós-filtro com DSL nativa (`filter_chunks`) | validated | coberto no plumbing GPU |
+| Flat/IVF GPU, multi-GPU, DLPack/CUDA array interface, build GPU + serving CPU | not-started | plano e critérios de aceitação em docs/GPU.md |
 
 ## Outras pendências registradas
 
 - ~~Sparse não persistido no WAL / compact não preserva sparse~~ — resolvido: sparse vai ao WAL (campo opcional, retrocompatível) e `compact()` faz remap de postings; testes `sparse_survives_wal_replay_and_compaction` (Rust) e `TestSparsePersistence` (Python).
-- Snapshot serializa estado como JSON (formato v1) — formato binário de segmentos planejado atrás do mesmo manifest.
-- Named vectors / multivectors (MaxSim) — not-started.
+- Snapshot serializa estado como JSON (formato v1) — formato binário de segmentos planejado atrás do mesmo manifest (vectors.bin já é binário e mmap-able).
+- MaxSim (late interaction) — validated como estágio de reranking (`ragvault.maxsim_reranker`, `TestMaxSim`); armazenamento nativo de multivectors/named vectors — not-started.
+- Interop Faiss (`ragvault.compat.faiss`, nível *convertible*) — validated com faiss-cpu real (`TestFaissCompat`: export → reconstruct → import com paridade de ranking).
+- `Database`/coleções (`ragvault.Database.open`) — validated (`TestDatabase`: isolamento entre coleções, nomes validados contra path traversal, descoberta em reopen). `ragvault.connect()` — assinatura reservada com NotImplementedError explícito (remoto é pós-v0.1, ADR 0001).
+- CLI `benchmark` e `migrate` — implemented (benchmark mede nesta máquina e declara isso; migrate delega à migração blocking testada).
 - Integração LangChain — validated (`TestLangChain`). LlamaIndex/Haystack/DSPy — implemented (não testados contra as libs reais; erro acionável sem a dependência).
 - Wheels multiplataforma: CI cobre Linux x86-64; macOS/Windows/ARM64 exigem runners não disponíveis neste ambiente.
 - `kb.migrate_embeddings` — validated (estratégia blocking com swap atômico e preservação do vault antigo em falha; `TestMigrateEmbeddings`). Estratégias background/copy-on-write — planned.

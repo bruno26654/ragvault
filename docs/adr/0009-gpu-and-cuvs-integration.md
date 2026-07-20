@@ -1,7 +1,7 @@
 # ADR 0009 — GPU / cuVS integration
 
 ## Estado
-**Blocked/planned.** Este ambiente não tem GPU; nenhuma integração foi iniciada para não criar stubs enganosos ou benchmarks inventados.
+**Implemented-experimental (não validado em hardware).** O sidecar `ragvault.gpu.CagraDenseSearcher` está implementado seguindo a API Python documentada do cuVS, com testes de plumbing usando um cuVS falso (wiring, pós-filtro via DSL nativa, fallback CPU) e um teste real marcado `-m gpu` pronto para runner CUDA. Nenhum benchmark GPU foi executado — números só serão publicados após execução real (runbook em docs/GPU.md).
 
 ## Plano registrado
 - Extra `ragvault[gpu-cu12]` isolado do pacote CPU.

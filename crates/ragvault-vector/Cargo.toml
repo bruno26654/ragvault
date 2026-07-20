@@ -11,5 +11,8 @@ serde_json = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
 parking_lot = { workspace = true }
+memmap2 = { workspace = true }
+bytemuck = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }

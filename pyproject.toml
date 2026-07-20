@@ -25,6 +25,8 @@ pdf = ["pypdf>=4"]
 office = ["python-docx>=1"]
 html = ["beautifulsoup4>=4.12"]
 local-models = ["sentence-transformers>=2.6"]
+faiss = ["faiss-cpu>=1.8"]
+gpu-cu12 = ["cuvs-cu12>=24.10"]
 all = ["pypdf>=4", "python-docx>=1", "beautifulsoup4>=4.12", "sentence-transformers>=2.6"]
 
 [project.scripts]
@@ -40,3 +42,5 @@ manifest-path = "crates/ragvault-python/Cargo.toml"
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]
+markers = ["gpu: requires CUDA hardware and cuvs (see docs/GPU.md)"]
+addopts = "-m 'not gpu'"

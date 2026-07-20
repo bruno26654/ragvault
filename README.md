@@ -134,8 +134,12 @@ tenant_kb.retrieve(...)   # filtro de tenant aplicado a toda query
 | Quantização SQ8 (int8 scan + rescore f32, preset `low_memory`) | implemented |
 | `kb.migrate_embeddings` (estratégia blocking, swap atômico) | implemented |
 | RagVault Studio (`ragvault studio` — UI local sem dependências) | implemented |
-| Quantização IVF/PQ, mmap | planned |
-| Backends GPU (cuVS/CAGRA) | planned |
+| IVF-Flat / IVF-PQ (`index="ivf_flat"\|"ivf_pq"`) | implemented |
+| mmap (`storage="mmap"`) | implemented |
+| Interop Faiss (`ragvault.compat.faiss`, nível convertible) | implemented |
+| MaxSim reranking (`ragvault.maxsim_reranker`) | implemented |
+| `Database` multi-coleção | implemented |
+| GPU CAGRA sidecar (`ragvault.gpu`) | experimental — implementado com testes de plumbing; **não validado em GPU real** (runbook: docs/GPU.md) |
 | Integrações LlamaIndex/Haystack/DSPy | implemented (untested: requerem as libs; erro acionável sem elas) |
 | Wheels multiplataforma no PyPI | planned (CI configurado para Linux) |
 
