@@ -226,6 +226,33 @@ impl PyVault {
         json_loads(py, &value)
     }
 
+    /// Export live dense vectors: returns (chunk_ids, flat f32 list, dim).
+    /// The Python layer reshapes to [n, dim].
+    fn export_dense(&self, py: Python<'_>) -> PyResult<(Vec<String>, PyObject, usize)> {
+        let engine = self.engine()?;
+        let (ids, vectors) = py.allow_threads(|| engine.export_dense());
+        let dim = serde_json::from_str::<serde_json::Value>(&self.config_json()?)
+            .ok()
+            .and_then(|c| c["dim"].as_u64())
+            .unwrap_or(0) as usize;
+        let array = numpy::PyArray1::from_vec(py, vectors);
+        Ok((ids, array.into_any().unbind(), dim))
+    }
+
+    /// Evaluate a filter (same DSL as search) against chunk ids; unknown
+    /// ids evaluate to false.
+    fn filter_chunks(
+        &self,
+        py: Python<'_>,
+        chunk_ids: Vec<String>,
+        filter_json: String,
+    ) -> PyResult<Vec<bool>> {
+        let filter = parse_json(&filter_json, "filter")?;
+        let engine = self.engine()?;
+        py.allow_threads(|| engine.filter_chunks(&chunk_ids, &filter))
+            .map_err(to_py_err)
+    }
+
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
         let engine = self.engine()?;
         py.allow_threads(|| engine.flush()).map_err(to_py_err)

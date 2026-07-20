@@ -86,6 +86,9 @@ class Config:
     ef_search: int = 64
     flat_threshold: int = 1000
     quantization: str = "none"  # "none" | "sq8" (int8 scan + f32 rescore)
+    index: str = "auto"  # "auto" | "ivf_flat" | "ivf_pq" (trained on flush)
+    nprobe: int = 8  # IVF lists probed per query
+    storage: str = "memory"  # "memory" | "mmap" (snapshot vectors via mmap)
     # retrieval
     retrieval_mode: str = "hybrid"
     candidates: int = 80
@@ -137,9 +140,11 @@ class Config:
                 self.overlap_tokens,
             ),
             "index: hnsw(M={0}, ef_construction={1}, ef_search={2}), "
-            "flat below {3} vectors, quantization={4}".format(
+            "flat below {3} vectors, quantization={4}, index={5}, "
+            "nprobe={6}, storage={7}".format(
                 self.hnsw_m, self.hnsw_ef_construction, self.ef_search,
-                self.flat_threshold, self.quantization,
+                self.flat_threshold, self.quantization, self.index,
+                self.nprobe, self.storage,
             ),
             "retrieval: mode={0} candidate_pool={1} weights(dense={2}, bm25={3}, "
             "sparse={4})".format(
@@ -171,4 +176,8 @@ class Config:
             "wal_sync": self.wal_sync,
             "flat_threshold": self.flat_threshold,
             "quantization": self.quantization,
+            "index": self.index,
+            "ivf": {"nlist": 0, "nprobe": self.nprobe, "pq_m": 0,
+                    "seed": 0x49564621},
+            "storage": self.storage,
         }

@@ -23,6 +23,17 @@
 - Política de sync: `batch` (default; sobrevive a crash de processo, pode perder a cauda em power loss) ou `sync` (fsync por commit) via `wal_sync`.
 - Um writer por diretório (lock); leitores concorrentes no mesmo processo; leitores cross-process de vault aberto **não são suportados** em v0.1.
 
+## Storage mmap (`storage="mmap"`)
+
+Ao reabrir com `ragvault.open(path, storage="mmap")`, os vetores do snapshot
+são servidos por mmap somente-leitura de `vectors.bin` (residência via page
+cache do SO) e novas escritas vão para uma cauda em RAM até o próximo
+`flush()` + reopen. O checksum do arquivo é verificado na abertura. Em POSIX,
+a generation antiga pode ser removida enquanto mapeada (inode vivo até o
+unmap); em Windows a remoção pode falhar até o processo fechar — caveat
+documentado. `storage` é um knob de runtime: pode variar entre aberturas do
+mesmo vault.
+
 ## Limitações conhecidas e documentadas
 
 - Snapshot v1 serializa estado como JSON — reabertura de vaults muito grandes é mais lenta que um formato binário de segmentos (planejado como format_version 2, com migração explícita).

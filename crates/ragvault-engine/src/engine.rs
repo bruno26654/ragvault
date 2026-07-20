@@ -24,7 +24,10 @@ use serde_json::json;
 
 use ragvault_core::{now_millis, Chunk, Document, Error, Filter, Metric, Result, SparseVector};
 use ragvault_retrieval::{rrf_fuse, Bm25Index, Bm25Params, FusionInput, SparseIndex};
-use ragvault_vector::{FlatIndex, Hnsw, HnswConfig, Sq8Arena, TopK, VectorArena};
+use ragvault_vector::{
+    ivf::MIN_TRAIN_ROWS, FlatIndex, Hnsw, HnswConfig, IvfConfig, IvfIndex, Sq8Arena, TopK,
+    VectorArena,
+};
 
 use crate::snapshot::{self, PersistedStateV1, PersistedVersionV1};
 use crate::wal::{SyncPolicy, Wal, WalOp};
@@ -48,6 +51,28 @@ pub struct EngineConfig {
     /// (4x smaller scan, near-exact recall; see docs/PERFORMANCE.md).
     #[serde(default = "default_quantization")]
     pub quantization: String,
+    /// Dense index selection: "auto" (default; hnsw, or sq8_flat when
+    /// quantization="sq8"), "ivf_flat" or "ivf_pq". IVF indexes are
+    /// rebuildable acceleration structures: trained on open/flush/compact,
+    /// with fresh rows delta-scanned until the next rebuild.
+    #[serde(default = "default_index")]
+    pub index: String,
+    #[serde(default)]
+    pub ivf: IvfConfig,
+    /// "memory" (default) or "mmap": serve snapshotted vectors from a
+    /// read-only mmap of vectors.bin (page-cache resident); rows written
+    /// after open live in RAM until the next flush+reopen. Runtime knob —
+    /// it may differ between opens of the same vault.
+    #[serde(default = "default_storage")]
+    pub storage: String,
+}
+
+fn default_storage() -> String {
+    "memory".to_string()
+}
+
+fn default_index() -> String {
+    "auto".to_string()
 }
 
 fn default_quantization() -> String {
@@ -68,6 +93,9 @@ impl EngineConfig {
             wal_sync: SyncPolicy::default(),
             flat_threshold: default_flat_threshold(),
             quantization: default_quantization(),
+            index: default_index(),
+            ivf: IvfConfig::default(),
+            storage: default_storage(),
         }
     }
 }
@@ -94,6 +122,9 @@ pub struct SearchRequest {
     pub filter: Option<serde_json::Value>,
     #[serde(default)]
     pub ef_search: Option<usize>,
+    /// IVF lists to probe for this query (defaults to the config value).
+    #[serde(default)]
+    pub nprobe: Option<usize>,
     /// Fusion weights per signal.
     #[serde(default)]
     pub weights: Option<HashMap<String, f32>>,
@@ -138,6 +169,7 @@ struct State {
     doc_rows: HashMap<String, Vec<u32>>,
     arena: VectorArena,
     sq8: Option<Sq8Arena>,
+    ivf: Option<IvfIndex>,
     hnsw: Hnsw,
     bm25: Bm25Index,
     sparse: SparseIndex,
@@ -173,6 +205,29 @@ fn effective_metadata(document: &Document, chunk: &Chunk) -> serde_json::Value {
     serde_json::Value::Object(merged)
 }
 
+fn rebuild_ivf(state: &mut State) -> Result<()> {
+    if !state.config.index.starts_with("ivf") {
+        return Ok(());
+    }
+    if state.arena.len() < MIN_TRAIN_ROWS {
+        state.ivf = None; // too small: search falls back to flat, delta-free
+        return Ok(());
+    }
+    let mut ivf_config = state.config.ivf.clone();
+    if state.config.index == "ivf_pq" && ivf_config.pq_m == 0 {
+        // auto pq_m: largest divisor of dim with sub_dim >= 4, capped at 64.
+        let dim = state.config.dim;
+        ivf_config.pq_m = (1..=64.min(dim / 4))
+            .rev()
+            .find(|m| dim.is_multiple_of(*m))
+            .unwrap_or(1);
+    } else if state.config.index == "ivf_flat" {
+        ivf_config.pq_m = 0;
+    }
+    state.ivf = Some(IvfIndex::build(&state.arena, &ivf_config)?);
+    Ok(())
+}
+
 impl VaultEngine {
     /// Open (or create) a vault at `path`. `config` is required on create;
     /// on reopen a differing dimension/metric is rejected.
@@ -198,7 +253,12 @@ impl VaultEngine {
 
         let manifest = snapshot::load_manifest(path)?;
         let mut state = if let Some(manifest) = manifest {
-            let stored_config: EngineConfig = serde_json::from_value(manifest.config.clone())?;
+            let mut stored_config: EngineConfig = serde_json::from_value(manifest.config.clone())?;
+            // Runtime knobs, not data-format properties: honor the values
+            // requested for this open.
+            stored_config.storage = config.storage.clone();
+            stored_config.ivf.nprobe = config.ivf.nprobe;
+            stored_config.flat_threshold = config.flat_threshold;
             if stored_config.dim != config.dim || stored_config.metric != config.metric {
                 return Err(Error::invalid(
                     "config",
@@ -209,10 +269,38 @@ impl VaultEngine {
                     format!("dim={} metric={:?}", config.dim, config.metric),
                 ));
             }
-            let (persisted, vectors) = snapshot::load_state(path, &manifest)?;
-            let deleted = persisted.deleted.clone();
-            let arena =
-                VectorArena::from_parts(stored_config.dim, stored_config.metric, vectors, deleted)?;
+            let arena;
+            let persisted;
+            if stored_config.storage == "mmap" {
+                // load_state verifies the vectors.bin checksum; the parsed
+                // Vec<f32> is dropped and the file is served via mmap.
+                let (state_only, _vectors) = snapshot::load_state(path, &manifest)?;
+                persisted = state_only;
+                let vectors_file =
+                    fs::File::open(snapshot::vectors_path(path, manifest.generation))
+                        .map_err(|e| Error::io("open vectors.bin for mmap", e))?;
+                // SAFETY note: memmap2's Mmap::map is unsafe at the API level
+                // because the file could be mutated externally; RagVault
+                // snapshots are immutable by design (new generations are new
+                // files) and the writer lock excludes concurrent writers.
+                let mmap = unsafe { memmap2::Mmap::map(&vectors_file) }
+                    .map_err(|e| Error::io("mmap vectors.bin", e))?;
+                arena = VectorArena::from_mmap(
+                    stored_config.dim,
+                    stored_config.metric,
+                    mmap,
+                    persisted.deleted.clone(),
+                )?;
+            } else {
+                let (state_only, vectors) = snapshot::load_state(path, &manifest)?;
+                persisted = state_only;
+                arena = VectorArena::from_parts(
+                    stored_config.dim,
+                    stored_config.metric,
+                    vectors,
+                    persisted.deleted.clone(),
+                )?;
+            }
             let chunks: Vec<Option<StoredChunk>> = persisted
                 .chunks
                 .into_iter()
@@ -268,6 +356,7 @@ impl VaultEngine {
                 doc_rows,
                 arena,
                 sq8,
+                ivf: None,
                 hnsw: persisted.hnsw,
                 bm25: persisted.bm25,
                 sparse: persisted.sparse,
@@ -285,6 +374,7 @@ impl VaultEngine {
                 } else {
                     None
                 },
+                ivf: None,
                 hnsw: Hnsw::new(config.hnsw.clone()),
                 bm25: Bm25Index::new(config.bm25.clone()),
                 sparse: SparseIndex::new(),
@@ -328,6 +418,7 @@ impl VaultEngine {
             state.seq = seq;
             state.dirty = true;
         }
+        rebuild_ivf(&mut state)?;
 
         Ok(VaultEngine {
             path: path.to_path_buf(),
@@ -424,6 +515,9 @@ impl VaultEngine {
             if let Some(sq8) = state.sq8.as_mut() {
                 // sq8 mode replaces the graph: quantized scan + f32 rescore.
                 sq8.push(state.arena.get(row))?;
+            } else if state.config.index.starts_with("ivf") {
+                // ivf mode: fresh rows are delta-scanned until the next
+                // rebuild (open/flush/compact); no graph maintained.
             } else {
                 state.hnsw.insert(&state.arena, row);
             }
@@ -563,7 +657,24 @@ impl VaultEngine {
             })?;
             let prepared = state.arena.prepare_query(vector)?;
             let live = state.arena.live();
-            if let Some(sq8) = state.sq8.as_ref() {
+            if state.config.index.starts_with("ivf") {
+                if let Some(ivf) = state.ivf.as_ref() {
+                    dense_backend = if ivf.uses_pq() { "ivf_pq" } else { "ivf_flat" };
+                    let nprobe = request.nprobe.unwrap_or(state.config.ivf.nprobe);
+                    plan_reasons.push(format!(
+                        "ivf: nlist {}, nprobe {nprobe}, delta rows {}",
+                        ivf.nlist(),
+                        state.arena.len() as u32 - ivf.built_rows()
+                    ));
+                    dense = ivf.search(&state.arena, &prepared, pool, nprobe, &accept);
+                } else {
+                    dense_backend = "flat";
+                    plan_reasons.push(format!(
+                        "ivf configured but only {live} rows (< {MIN_TRAIN_ROWS} to train) — exact flat scan"
+                    ));
+                    dense = FlatIndex::search(&state.arena, &prepared, pool, &accept);
+                }
+            } else if let Some(sq8) = state.sq8.as_ref() {
                 dense_backend = "sq8_flat";
                 let oversample = (pool * 4).max(pool + 16);
                 plan_reasons.push(format!(
@@ -742,6 +853,49 @@ impl VaultEngine {
         chunks
     }
 
+    /// Export live rows: (chunk_ids, row-major f32 vectors). Used by the
+    /// faiss interop and GPU sidecar builds.
+    pub fn export_dense(&self) -> (Vec<String>, Vec<f32>) {
+        let state = self.state.read();
+        let dim = state.config.dim;
+        let mut ids = Vec::new();
+        let mut vectors = Vec::new();
+        for row in 0..state.arena.len() as u32 {
+            if state.arena.is_deleted(row) {
+                continue;
+            }
+            if let Some(Some(sc)) = state.chunks.get(row as usize) {
+                ids.push(sc.chunk.chunk_id.clone());
+                vectors.extend_from_slice(state.arena.get(row));
+            }
+        }
+        let _ = dim;
+        (ids, vectors)
+    }
+
+    /// Evaluate a filter against chunks by id (used by sidecar searchers,
+    /// e.g. the GPU path, to post-filter with the same DSL semantics).
+    pub fn filter_chunks(
+        &self,
+        chunk_ids: &[String],
+        filter: &serde_json::Value,
+    ) -> Result<Vec<bool>> {
+        let parsed = Filter::parse(filter)?;
+        let state = self.state.read();
+        Ok(chunk_ids
+            .iter()
+            .map(|cid| {
+                state
+                    .chunk_ids
+                    .get(cid)
+                    .and_then(|&row| state.chunks.get(row as usize))
+                    .and_then(|slot| slot.as_ref())
+                    .map(|sc| parsed.matches(&sc.eff_metadata))
+                    .unwrap_or(false)
+            })
+            .collect())
+    }
+
     pub fn list_documents(&self) -> Vec<Document> {
         let mut docs: Vec<Document> = self.state.read().documents.values().cloned().collect();
         docs.sort_by(|a, b| a.document_id.cmp(&b.document_id));
@@ -761,12 +915,15 @@ impl VaultEngine {
             .unwrap_or_default()
     }
 
-    /// Persist a snapshot generation and truncate the WAL.
+    /// Persist a snapshot generation and truncate the WAL. Also retrains
+    /// the IVF acceleration structure when configured (it is not persisted;
+    /// reopen rebuilds it).
     pub fn flush(&self) -> Result<()> {
         let mut state = self.state.write();
         if !state.dirty {
             return Ok(());
         }
+        rebuild_ivf(&mut state)?;
         state.wal.sync()?;
         let generation = state.generation + 1;
         let persisted = PersistedStateV1 {
@@ -782,13 +939,14 @@ impl VaultEngine {
             hnsw: state.hnsw.clone(),
             sparse: state.sparse.clone(),
         };
+        let (base_part, tail_part) = state.arena.vector_parts();
         snapshot::publish(
             &self.path,
             generation,
             state.seq,
             serde_json::to_value(&state.config)?,
             &persisted,
-            state.arena.raw_data(),
+            &[base_part, tail_part],
         )?;
         state.wal.truncate()?;
         state.generation = generation;
@@ -849,6 +1007,7 @@ impl VaultEngine {
             state.chunks = chunks;
             state.chunk_ids = chunk_ids;
             state.doc_rows = doc_rows;
+            rebuild_ivf(&mut state)?;
             state.dirty = true;
         }
         self.flush()
@@ -870,6 +1029,14 @@ impl VaultEngine {
             "hnsw_nodes": state.hnsw.len(),
             "quantization": state.config.quantization,
             "sq8_bytes": state.sq8.as_ref().map(|q| q.memory_bytes()),
+            "index": state.config.index,
+            "storage": if state.arena.is_mmap() { "mmap" } else { "memory" },
+            "ivf": state.ivf.as_ref().map(|ivf| json!({
+                "nlist": ivf.nlist(),
+                "pq": ivf.uses_pq(),
+                "built_rows": ivf.built_rows(),
+                "memory_bytes": ivf.memory_bytes(),
+            })),
         })
     }
 
@@ -962,6 +1129,7 @@ mod tests {
                 candidates: None,
                 filter: None,
                 ef_search: None,
+                nprobe: None,
                 weights: None,
             })
             .unwrap();
@@ -981,6 +1149,7 @@ mod tests {
                 candidates: None,
                 filter: None,
                 ef_search: None,
+                nprobe: None,
                 weights: None,
             })
             .unwrap();
@@ -1018,6 +1187,7 @@ mod tests {
                 candidates: None,
                 filter: None,
                 ef_search: None,
+                nprobe: None,
                 weights: None,
             })
             .unwrap()
@@ -1052,6 +1222,7 @@ mod tests {
             candidates: None,
             filter: Some(json!({"lang": "en"})),
             ef_search: None,
+            nprobe: None,
             weights: None,
         };
         let hits = engine.search(&request).unwrap().hits;
@@ -1085,6 +1256,7 @@ mod tests {
                 candidates: None,
                 filter: None,
                 ef_search: None,
+                nprobe: None,
                 weights: None,
             })
             .unwrap()
@@ -1128,6 +1300,7 @@ mod tests {
                     candidates: None,
                     filter: None,
                     ef_search: None,
+                    nprobe: None,
                     weights: None,
                 })
                 .unwrap()
@@ -1185,6 +1358,7 @@ mod tests {
                 candidates: None,
                 filter: None,
                 ef_search: None,
+                nprobe: None,
                 weights: None,
             })
             .unwrap()
@@ -1206,6 +1380,7 @@ mod tests {
                 candidates: None,
                 filter: None,
                 ef_search: None,
+                nprobe: None,
                 weights: None,
             })
             .unwrap()
@@ -1257,6 +1432,7 @@ mod tests {
             candidates: None,
             filter: None,
             ef_search: None,
+            nprobe: None,
             weights: None,
         };
         {
@@ -1304,6 +1480,244 @@ mod tests {
     }
 
     #[test]
+    fn ivf_backend_full_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(8);
+        cfg.index = "ivf_flat".to_string();
+        cfg.ivf.nprobe = 64; // small collection: probe everything
+        let dense_req = |hot: usize| SearchRequest {
+            vector: Some(unit_vec(8, hot)),
+            text: None,
+            sparse: None,
+            k: 3,
+            mode: "dense".into(),
+            candidates: None,
+            filter: None,
+            ef_search: None,
+            nprobe: None,
+            weights: None,
+        };
+        {
+            let engine = VaultEngine::open(dir.path(), cfg.clone()).unwrap();
+            // Below MIN_TRAIN_ROWS: planner reports the exact-flat fallback.
+            for i in 0..40 {
+                let id = format!("d{i}");
+                engine
+                    .upsert_document(
+                        doc(&id, json!({})),
+                        vec![chunk(&id, 0, &format!("doc {i}"))],
+                        &unit_vec(8, i),
+                        None,
+                    )
+                    .unwrap();
+            }
+            let response = engine.search(&dense_req(3)).unwrap();
+            assert_eq!(response.plan["dense_backend"], "flat");
+            assert_eq!(response.hits[0].document_id, "d3");
+
+            // Cross the training threshold, then flush() trains the IVF.
+            for i in 40..300 {
+                let id = format!("d{i}");
+                engine
+                    .upsert_document(
+                        doc(&id, json!({})),
+                        vec![chunk(&id, 0, &format!("doc {i}"))],
+                        &unit_vec(8, i),
+                        None,
+                    )
+                    .unwrap();
+            }
+            engine.flush().unwrap();
+            let response = engine.search(&dense_req(5)).unwrap();
+            assert_eq!(response.plan["dense_backend"], "ivf_flat");
+            // per-request nprobe override is honored and visible in the plan
+            let mut one_probe = dense_req(5);
+            one_probe.nprobe = Some(1);
+            let plan = engine.search(&one_probe).unwrap().plan;
+            let reason = plan["reason"].to_string();
+            assert!(
+                reason.contains("nprobe 1"),
+                "plan must show nprobe 1: {reason}"
+            );
+            assert_eq!(response.hits[0].document_id, "d5");
+            assert!(engine.stats()["ivf"]["nlist"].as_u64().unwrap() >= 16);
+
+            // Fresh row after the build is found via the delta scan.
+            engine
+                .upsert_document(
+                    doc("fresh", json!({})),
+                    vec![chunk("fresh", 0, "fresh doc")],
+                    &[0.5; 8],
+                    None,
+                )
+                .unwrap();
+            let mut req = dense_req(0);
+            req.vector = Some(vec![0.5; 8]);
+            let response = engine.search(&req).unwrap();
+            assert_eq!(response.hits[0].document_id, "fresh");
+        }
+        // Reopen rebuilds the IVF from snapshot + WAL.
+        let engine = VaultEngine::open(dir.path(), cfg.clone()).unwrap();
+        let response = engine.search(&dense_req(7)).unwrap();
+        assert_eq!(response.plan["dense_backend"], "ivf_flat");
+        assert_eq!(response.hits[0].document_id, "d7");
+        // Compaction retrains and preserves results (still >= MIN_TRAIN_ROWS).
+        for i in 0..30 {
+            engine.delete_document(&format!("d{i}")).unwrap();
+        }
+        engine.compact().unwrap();
+        let response = engine.search(&dense_req(100)).unwrap();
+        assert_eq!(response.plan["dense_backend"], "ivf_flat");
+        // dim-8 unit vectors alias by i % 8: any live doc in the same class
+        // is a legitimate exact winner (ties break by internal id).
+        let top: usize = response.hits[0].document_id[1..].parse().unwrap();
+        assert_eq!(top % 8, 100 % 8, "top hit must share the query vector");
+        // Shrinking below the training threshold falls back to exact flat.
+        for i in 30..60 {
+            engine.delete_document(&format!("d{i}")).unwrap();
+        }
+        engine.compact().unwrap();
+        let response = engine.search(&dense_req(200)).unwrap();
+        assert_eq!(response.plan["dense_backend"], "flat");
+        let top: usize = response.hits[0].document_id[1..].parse().unwrap();
+        assert_eq!(top % 8, 200 % 8);
+    }
+
+    #[test]
+    fn mmap_storage_full_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mem_cfg = config(4);
+        mem_cfg.flat_threshold = 1_000_000; // flat: deterministic comparison
+        let mut mmap_cfg = mem_cfg.clone();
+        mmap_cfg.storage = "mmap".to_string();
+        let req = |hot: usize| SearchRequest {
+            vector: Some(unit_vec(4, hot)),
+            text: None,
+            sparse: None,
+            k: 5,
+            mode: "dense".into(),
+            candidates: None,
+            filter: None,
+            ef_search: None,
+            nprobe: None,
+            weights: None,
+        };
+        {
+            let engine = VaultEngine::open(dir.path(), mem_cfg.clone()).unwrap();
+            for i in 0..50 {
+                let id = format!("d{i}");
+                engine
+                    .upsert_document(
+                        doc(&id, json!({})),
+                        vec![chunk(&id, 0, &format!("doc {i}"))],
+                        &unit_vec(4, i),
+                        None,
+                    )
+                    .unwrap();
+            }
+            engine.flush().unwrap();
+        }
+        // Reopen with mmap: identical results to a memory reopen.
+        let expected = {
+            let engine = VaultEngine::open(dir.path(), mem_cfg.clone()).unwrap();
+            engine.search(&req(2)).unwrap().hits
+        };
+        {
+            let engine = VaultEngine::open(dir.path(), mmap_cfg.clone()).unwrap();
+            assert_eq!(engine.stats()["storage"], "mmap");
+            let hits = engine.search(&req(2)).unwrap().hits;
+            assert_eq!(
+                hits.iter()
+                    .map(|h| (&h.chunk_id, h.score))
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|h| (&h.chunk_id, h.score))
+                    .collect::<Vec<_>>(),
+                "mmap must serve byte-identical vectors"
+            );
+            // Writes after an mmap open land in the RAM tail and are visible.
+            engine
+                .upsert_document(
+                    doc("tail", json!({})),
+                    vec![chunk("tail", 0, "tail doc")],
+                    &[0.9, 0.1, 0.0, 0.0],
+                    None,
+                )
+                .unwrap();
+            let mut tail_req = req(0);
+            tail_req.vector = Some(vec![0.9, 0.1, 0.0, 0.0]);
+            let hits = engine.search(&tail_req).unwrap().hits;
+            assert_eq!(hits[0].document_id, "tail");
+            // Deleting an mmap-resident row tombstones it like any other.
+            engine.delete_document("d2").unwrap();
+            let hits = engine.search(&req(2)).unwrap().hits;
+            assert!(hits.iter().all(|h| h.document_id != "d2"));
+            // flush() writes base+tail into the next generation (the old
+            // generation file may be unlinked while still mapped — fine on
+            // POSIX; documented Windows caveat in docs/STORAGE.md).
+            engine.flush().unwrap();
+        }
+        // Third open (mmap again) sees the merged state.
+        let engine = VaultEngine::open(dir.path(), mmap_cfg).unwrap();
+        assert_eq!(engine.stats()["documents"], 50); // 50 - d2 + tail
+        let hits = engine
+            .search(&SearchRequest {
+                vector: Some(vec![0.9, 0.1, 0.0, 0.0]),
+                text: None,
+                sparse: None,
+                k: 1,
+                mode: "dense".into(),
+                candidates: None,
+                filter: None,
+                ef_search: None,
+                nprobe: None,
+                weights: None,
+            })
+            .unwrap()
+            .hits;
+        assert_eq!(hits[0].document_id, "tail");
+    }
+
+    #[test]
+    fn ivf_pq_auto_subspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(8);
+        cfg.index = "ivf_pq".to_string();
+        cfg.ivf.nprobe = 64;
+        let engine = VaultEngine::open(dir.path(), cfg).unwrap();
+        for i in 0..300 {
+            let id = format!("d{i}");
+            engine
+                .upsert_document(
+                    doc(&id, json!({})),
+                    vec![chunk(&id, 0, &format!("doc {i}"))],
+                    &unit_vec(8, i),
+                    None,
+                )
+                .unwrap();
+        }
+        engine.flush().unwrap();
+        let response = engine
+            .search(&SearchRequest {
+                vector: Some(unit_vec(8, 6)),
+                text: None,
+                sparse: None,
+                k: 3,
+                mode: "dense".into(),
+                candidates: None,
+                filter: None,
+                ef_search: None,
+                nprobe: None,
+                weights: None,
+            })
+            .unwrap();
+        assert_eq!(response.plan["dense_backend"], "ivf_pq");
+        assert_eq!(response.hits[0].document_id, "d6");
+        assert_eq!(engine.stats()["ivf"]["pq"], true);
+    }
+
+    #[test]
     fn sq8_rejects_l2_metric() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = config(4);
@@ -1328,6 +1742,7 @@ mod tests {
             candidates: None,
             filter: None,
             ef_search: None,
+            nprobe: None,
             weights: None,
         };
         {
@@ -1396,6 +1811,7 @@ mod tests {
                 candidates: None,
                 filter: None,
                 ef_search: None,
+                nprobe: None,
                 weights: None,
             })
             .unwrap()
@@ -1472,6 +1888,7 @@ mod tests {
                 candidates: None,
                 filter: None,
                 ef_search: None,
+                nprobe: None,
                 weights: None,
             })
             .unwrap()

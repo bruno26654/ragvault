@@ -10,6 +10,16 @@
 - **BM25**: k1=1.2, b=0.75, tokenizer Unicode lowercase, estatísticas sobre docs vivos.
 - **Sparse**: vetores esparsos fornecidos por você (SPLADE, BGE-M3...); o core nunca gera sparse embeddings.
 
+### IVF (`index="ivf_flat"` / `index="ivf_pq"`)
+
+Particionamento k-means (nlist automático = √n, limitado a [16, 1024]) com
+`nprobe` listas sondadas por query. O índice é uma estrutura de aceleração
+reconstruível: treinado em open/flush/compact; linhas inseridas depois do
+treino são varridas exatamente (delta scan) até o próximo rebuild — escritas
+novas nunca ficam invisíveis. Com PQ (`ivf_pq`), códigos de 8 bits por
+subespaço + tabelas ADC + oversampling 8× + rescore f32. Abaixo de 256 linhas
+o planner usa Flat exato e diz isso no plan.
+
 ## Fusão
 
 RRF ponderado: `score = Σ w_s / (60 + rank_s)`. Rank-based — escalas de BM25 e cosseno nunca são somadas diretamente. Pesos em `dense_weight`/`bm25_weight`/`sparse_weight`.

@@ -128,7 +128,7 @@ pub fn publish(
     seq: u64,
     config: serde_json::Value,
     state: &PersistedStateV1,
-    vectors: &[f32],
+    vector_parts: &[&[f32]],
 ) -> Result<PersistedManifestV1> {
     let gen_name = format!("gen-{generation}");
     let tmp_dir = dir.join(format!("{gen_name}.tmp"));
@@ -141,7 +141,11 @@ pub fn publish(
         .map_err(|e| Error::io(format!("mkdir {}", tmp_dir.display()), e))?;
 
     let state_bytes = serde_json::to_vec(state)?;
-    let vector_bytes: Vec<u8> = vectors.iter().flat_map(|f| f.to_le_bytes()).collect();
+    let vector_bytes: Vec<u8> = vector_parts
+        .iter()
+        .flat_map(|part| part.iter())
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
 
     write_file_sync(&tmp_dir.join("state.json"), &state_bytes)?;
     write_file_sync(&tmp_dir.join("vectors.bin"), &vector_bytes)?;
@@ -195,6 +199,33 @@ pub fn publish(
         }
     }
     Ok(manifest)
+}
+
+/// Path of a generation's vectors file (for mmap-backed opens).
+pub fn vectors_path(dir: &Path, generation: u64) -> PathBuf {
+    dir.join(format!("gen-{generation}/vectors.bin"))
+}
+
+/// Verify the vectors file checksum without materializing f32s (used by the
+/// mmap open path; reading via the page cache is the verification pass).
+pub fn verify_vectors_file(dir: &Path, manifest: &PersistedManifestV1) -> Result<()> {
+    let rel = format!("gen-{}/vectors.bin", manifest.generation);
+    let meta = manifest
+        .files
+        .get(&rel)
+        .ok_or_else(|| Error::corrupt(rel.clone(), "manifest missing vectors.bin entry"))?;
+    let path = dir.join(&rel);
+    let bytes = fs::read(&path).map_err(|e| Error::io(format!("read {}", path.display()), e))?;
+    if bytes.len() as u64 != meta.len || crc_of(&bytes) != meta.crc32 {
+        return Err(Error::corrupt(
+            path.display().to_string(),
+            format!(
+                "checksum/length mismatch (expected {} bytes crc {:#x})",
+                meta.len, meta.crc32
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Load the snapshot referenced by a manifest, verifying checksums.

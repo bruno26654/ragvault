@@ -179,6 +179,23 @@ class KnowledgeBase:
         if config_path.exists():
             stored = json.loads(config_path.read_text())
             self.config = Config.from_dict(stored)
+            # Runtime knobs may be overridden per open; identity fields
+            # (embedding/dim/metric/chunking) are fixed at creation.
+            runtime_fields = {
+                "storage", "nprobe", "ef_search", "candidates", "retrieval_mode",
+                "flat_threshold", "dense_weight", "bm25_weight", "sparse_weight",
+                "default_token_budget", "max_chunks_per_document", "mmr_lambda",
+                "context_window", "wal_sync",
+            }
+            for key, value in overrides.items():
+                if value is None:
+                    continue
+                if key not in runtime_fields:
+                    raise ConfigurationError(
+                        f"{key!r} is fixed at creation time for an existing "
+                        f"knowledge base (runtime-overridable: {sorted(runtime_fields)})"
+                    )
+                setattr(self.config, key, value)
             if embedding is not None:
                 requested = embedding if isinstance(embedding, str) else None
                 if requested is not None and requested != self.config.embedding:
@@ -476,7 +493,9 @@ class KnowledgeBase:
         mode: Optional[str] = None,
         candidates: Optional[int] = None,
         ef_search: Optional[int] = None,
+        nprobe: Optional[int] = None,
         rerank: Optional[Callable[[str, list[RetrievedChunk]], list[RetrievedChunk]]] = None,
+        dense_searcher: Optional[object] = None,
         context_window: Optional[dict] = None,
         max_chunks_per_document: Optional[int] = None,
         explain: bool = False,
@@ -506,13 +525,24 @@ class KnowledgeBase:
             "candidates": pool,
             "filter": merged_filter,
             "ef_search": ef_search or self.config.ef_search,
+            "nprobe": nprobe or self.config.nprobe,
             "weights": {
                 "dense": self.config.dense_weight,
                 "bm25": self.config.bm25_weight,
                 "sparse": self.config.sparse_weight,
             },
         }
-        response = self._vault.search(json.dumps(request), query_vec)
+        gpu_note: Optional[str] = None
+        if dense_searcher is not None and query_vec is not None:
+            try:
+                response = self._search_with_dense_override(
+                    dense_searcher, query, query_vec, pool, k, mode, merged_filter,
+                )
+            except Exception as exc:
+                gpu_note = f"dense_searcher failed ({exc}); fell back to CPU path"
+                response = self._vault.search(json.dumps(request), query_vec)
+        else:
+            response = self._vault.search(json.dumps(request), query_vec)
         search_ms = (time.monotonic() - t0) * 1000
 
         doc_cache: dict[str, Optional[dict]] = {}
@@ -568,6 +598,10 @@ class KnowledgeBase:
             trace=trace_data,
         )
         result.plan = response.get("plan", {})
+        if gpu_note is not None:
+            result.plan = dict(result.plan)
+            result.plan.setdefault("reason", [])
+            result.plan["reason"] = list(result.plan["reason"]) + [gpu_note]
         if explain or trace:
             result.plan = dict(result.plan)
             result.plan["search_ms"] = round(search_ms, 3)
@@ -577,6 +611,70 @@ class KnowledgeBase:
             trace_data["search_ms"] = round(search_ms, 3)
             result.trace = trace_data
         return result
+
+    def _search_with_dense_override(
+        self,
+        searcher: object,
+        query: str,
+        query_vec: np.ndarray,
+        pool: int,
+        k: int,
+        mode: str,
+        merged_filter: Optional[dict],
+    ) -> dict:
+        """Dense candidates from a sidecar searcher (e.g. GPU CAGRA), BM25
+        from the engine, weighted-RRF fusion in Python. Filters on the dense
+        side are a post-filter with oversampling — recorded in the plan."""
+        raw = searcher.search(query_vec, pool * 4)
+        if merged_filter is not None and raw:
+            mask = self._vault.filter_chunks(
+                [cid for cid, _ in raw], json.dumps(merged_filter)
+            )
+            raw = [pair for pair, ok in zip(raw, mask) if ok]
+        dense = raw[:pool]
+
+        bm25: list[tuple[str, float]] = []
+        if mode in ("hybrid", "auto", "keyword"):
+            response = self._vault.search(json.dumps({
+                "text": query, "k": pool, "mode": "keyword",
+                "candidates": pool, "filter": merged_filter,
+            }))
+            bm25 = [(h["chunk_id"], h["bm25_score"]) for h in response["hits"]]
+
+        fused: dict[str, float] = {}
+        for weight, ranked in (
+            (self.config.dense_weight, dense),
+            (self.config.bm25_weight, bm25),
+        ):
+            for rank, (cid, _) in enumerate(ranked):
+                fused[cid] = fused.get(cid, 0.0) + weight / (60.0 + rank + 1.0)
+        ordered = sorted(fused.items(), key=lambda kv: (-kv[1], kv[0]))[: max(pool, k)]
+        dense_map = dict(dense)
+        bm25_map = dict(bm25)
+        hits = []
+        for cid, score in ordered:
+            doc_id = cid.rsplit("#", 1)[0]
+            hits.append({
+                "chunk_id": cid, "document_id": doc_id, "score": score,
+                "dense_score": dense_map.get(cid), "bm25_score": bm25_map.get(cid),
+                "sparse_score": None, "internal_id": 0,
+            })
+        return {
+            "hits": hits,
+            "plan": {
+                "mode": mode,
+                "dense_backend": "gpu_sidecar",
+                "reason": [
+                    "dense candidates from external searcher "
+                    f"({type(searcher).__name__})",
+                    "filters applied as post-filter with 4x oversampling on "
+                    "the dense side (integrated filtering stays on the CPU "
+                    "backends)",
+                ],
+                "candidate_pool": pool,
+                "filtered": merged_filter is not None,
+            },
+        }
 
     def retrieve_many(self, queries: Sequence[str], **kwargs: Any) -> list[RetrievalResult]:
         return [self.retrieve(q, **kwargs) for q in queries]
@@ -658,6 +756,13 @@ class KnowledgeBase:
         from .tuning import apply_recommendation
 
         apply_recommendation(self, recommendation)
+
+    def export_dense(self) -> tuple[list[str], np.ndarray]:
+        """Export live dense vectors as (chunk_ids, float32 [n, dim])."""
+        ids, flat, dim = self._vault.export_dense()
+        vectors = np.asarray(flat, dtype=np.float32).reshape(-1, dim) if ids else \
+            np.zeros((0, self.config.dim or 0), dtype=np.float32)
+        return ids, np.ascontiguousarray(vectors)
 
     # -- embedding migration -------------------------------------------------
 

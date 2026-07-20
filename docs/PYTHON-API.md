@@ -28,6 +28,12 @@ Presets: `quality, balanced, fast, offline, multilingual, code, long_documents, 
 | `as_llamaindex_retriever(k=8)` | retriever LlamaIndex (requer llama-index-core) |
 | `as_haystack_retriever(k=8)` / `as_dspy_retriever(k=8)` | adaptadores Haystack 2.x / DSPy (deps opcionais) |
 | `migrate_embeddings(new_embedding, strategy="blocking")` | re-embeda tudo e troca o vault atomicamente |
+| `export_dense()` | (chunk_ids, float32 [n, dim]) dos vetores vivos |
+| `retrieve(..., dense_searcher=s)` | candidatos densos de um sidecar (ex.: GPU CAGRA); fallback CPU automático |
+| `ragvault.Database.open(root)` / `.collection(name)` | múltiplas coleções sob um diretório |
+| `ragvault.maxsim_reranker(encoder)` | reranking MaxSim (late interaction) |
+| `ragvault.compat.faiss` | export/import de vetores de/para Faiss (convertible) |
+| `ragvault.connect(url)` | reservado para backend remoto (NotImplementedError em v0.1) |
 | `for_tenant(tenant_id)` | view com isolamento automático de tenant |
 | `stats()` / `inspect(document_id)` / `documents()` | introspecção |
 | `flush()` / `compact()` / `close()` | durabilidade e manutenção |
