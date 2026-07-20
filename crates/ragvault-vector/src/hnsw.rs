@@ -15,7 +15,13 @@
 //!   filtered Flat scan (decided by the engine's planner).
 //! - Invariants tested below: no self-loops, no duplicate neighbors, degree
 //!   bounds, valid entry point, recall vs Flat, serialization round-trip.
+//! - The per-layer `visited` set is a generation-stamped scratch buffer held
+//!   in a thread-local (see [`VisitedSet`]). A search resets it in O(1) by
+//!   bumping a generation counter instead of allocating and zeroing an
+//!   `O(nodes)` bitmap on every `search_layer` call. This is safe under the
+//!   rayon batch path because each worker thread owns its own buffer.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -25,6 +31,53 @@ use serde::{Deserialize, Serialize};
 
 use crate::arena::VectorArena;
 use crate::topk::TopK;
+
+/// Generation-stamped visited set. `stamp[id] == generation` means "visited in
+/// the current traversal". Resetting bumps the generation (O(1)); the buffer is
+/// only zeroed on the rare `u32` wraparound. Reused across `search_layer` calls
+/// and across queries within a thread, so a hot loop of many small searches
+/// pays no `O(nodes)` allocation per search.
+struct VisitedSet {
+    stamp: Vec<u32>,
+    generation: u32,
+}
+
+impl VisitedSet {
+    fn new() -> Self {
+        VisitedSet {
+            stamp: Vec::new(),
+            generation: 0,
+        }
+    }
+
+    /// Begin a new traversal over `n` nodes.
+    fn reset(&mut self, n: usize) {
+        if self.stamp.len() < n {
+            self.stamp.resize(n, 0);
+        }
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            // Wrapped: every stamp could now spuriously equal 0. Clear once.
+            self.stamp.iter_mut().for_each(|s| *s = 0);
+            self.generation = 1;
+        }
+    }
+
+    /// Mark `id` visited; return whether it was already visited.
+    #[inline]
+    fn test_and_set(&mut self, id: usize) -> bool {
+        if self.stamp[id] == self.generation {
+            true
+        } else {
+            self.stamp[id] = self.generation;
+            false
+        }
+    }
+}
+
+thread_local! {
+    static VISITED: RefCell<VisitedSet> = RefCell::new(VisitedSet::new());
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HnswConfig {
@@ -326,70 +379,74 @@ impl Hnsw {
         layer: usize,
         accept: Option<&dyn Fn(u32) -> bool>,
     ) -> Vec<Candidate> {
-        let mut visited = vec![false; self.nodes.len()];
-        let mut to_visit: BinaryHeap<Candidate> = BinaryHeap::new();
-        let mut results: BinaryHeap<FarCandidate> = BinaryHeap::new();
+        // Generation-stamped visited set from a thread-local scratch buffer:
+        // O(1) reset, no per-call O(nodes) allocation. The borrow is held for
+        // the whole traversal; `accept` is a pure metadata predicate and never
+        // re-enters the graph, so there is no re-entrant borrow.
+        VISITED.with(|cell| {
+            let mut visited = cell.borrow_mut();
+            visited.reset(self.nodes.len());
+            let mut to_visit: BinaryHeap<Candidate> = BinaryHeap::new();
+            let mut results: BinaryHeap<FarCandidate> = BinaryHeap::new();
 
-        let admit = |id: u32| -> bool {
-            if arena.is_deleted(id) {
-                return false;
-            }
-            accept.map(|f| f(id)).unwrap_or(true)
-        };
+            let admit = |id: u32| -> bool {
+                if arena.is_deleted(id) {
+                    return false;
+                }
+                accept.map(|f| f(id)).unwrap_or(true)
+            };
 
-        for &ep in entry_points {
-            if ep as usize >= self.nodes.len() || visited[ep as usize] {
-                continue;
-            }
-            visited[ep as usize] = true;
-            let d = Self::distance(arena, ep, query);
-            to_visit.push(Candidate { dist: d, id: ep });
-            if admit(ep) {
-                results.push(FarCandidate { dist: d, id: ep });
-            }
-        }
-
-        while let Some(closest) = to_visit.pop() {
-            let worst = results.peek().map(|f| f.dist).unwrap_or(f32::INFINITY);
-            if closest.dist > worst && results.len() >= ef {
-                break;
-            }
-            for &neighbor in &self.nodes[closest.id as usize].layers[layer] {
-                let slot = &mut visited[neighbor as usize];
-                if *slot {
+            for &ep in entry_points {
+                if ep as usize >= self.nodes.len() || visited.test_and_set(ep as usize) {
                     continue;
                 }
-                *slot = true;
-                let d = Self::distance(arena, neighbor, query);
+                let d = Self::distance(arena, ep, query);
+                to_visit.push(Candidate { dist: d, id: ep });
+                if admit(ep) {
+                    results.push(FarCandidate { dist: d, id: ep });
+                }
+            }
+
+            while let Some(closest) = to_visit.pop() {
                 let worst = results.peek().map(|f| f.dist).unwrap_or(f32::INFINITY);
-                if d < worst || results.len() < ef {
-                    to_visit.push(Candidate {
-                        dist: d,
-                        id: neighbor,
-                    });
-                    if admit(neighbor) {
-                        results.push(FarCandidate {
+                if closest.dist > worst && results.len() >= ef {
+                    break;
+                }
+                for &neighbor in &self.nodes[closest.id as usize].layers[layer] {
+                    if visited.test_and_set(neighbor as usize) {
+                        continue;
+                    }
+                    let d = Self::distance(arena, neighbor, query);
+                    let worst = results.peek().map(|f| f.dist).unwrap_or(f32::INFINITY);
+                    if d < worst || results.len() < ef {
+                        to_visit.push(Candidate {
                             dist: d,
                             id: neighbor,
                         });
-                        if results.len() > ef {
-                            results.pop();
+                        if admit(neighbor) {
+                            results.push(FarCandidate {
+                                dist: d,
+                                id: neighbor,
+                            });
+                            if results.len() > ef {
+                                results.pop();
+                            }
                         }
                     }
                 }
             }
-        }
 
-        let mut out: Vec<Candidate> = results
-            .into_vec()
-            .into_iter()
-            .map(|f| Candidate {
-                dist: f.dist,
-                id: f.id,
-            })
-            .collect();
-        out.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
-        out
+            let mut out: Vec<Candidate> = results
+                .into_vec()
+                .into_iter()
+                .map(|f| Candidate {
+                    dist: f.dist,
+                    id: f.id,
+                })
+                .collect();
+            out.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap_or(Ordering::Equal));
+            out
+        })
     }
 
     /// Approximate top-k search. Returns (id, score) with arena semantics

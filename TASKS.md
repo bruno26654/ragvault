@@ -125,6 +125,6 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 
 | Tarefa | Status | Critério de conclusão |
 |---|---|---|
-| Profiling HNSW e correção de gargalos comprovados | not-started | Perfil medido primeiro; primeiro alvo: alocação O(N) de `visited`/scratch por busca em `hnsw.rs` → pool geracional + scratch por thread. Refazer curvas recall / p50/p95/p99 / QPS / memória vs Faiss no mesmo recall. Só aplicar o que o perfil justificar. |
+| Profiling HNSW e correção de gargalos comprovados | validated | Perfil medido (`examples/hnsw_bench.rs`): a alocação O(N) de `visited` por `search_layer` foi provada como gargalo em escala. Substituída por `VisitedSet` geracional thread-local (reset O(1), reuso por thread). Recall idêntico; em N=200k: mean 1.9×, p95 3.7×, p99 10.4×, QPS 1.9× (RESULTS-HNSW.md). Neutro em N=50k. Heaps de scratch (limitados por ef, não N) e SIMD não perseguidos — sem gargalo comprovado. |
 | Storage v2 binário segmentado | not-started | Segmentos imutáveis + mutable segment, manifest atômico versionado, checksums em streaming, query multi-segmento, compactação segura, compat/migração de formato, testes crash/reopen/read-durante-compactação. Base atual: snapshot JSON v1 + `vectors.bin` mmap-able. |
 | Roaring bitmaps / histogramas / OPQ / binary quantization | deferred | Só substituir posting lists / quantizadores atuais quando profiling ou benchmark demonstrar necessidade. |
