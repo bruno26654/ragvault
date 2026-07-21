@@ -292,3 +292,99 @@ fn differential_mmap_reopen() {
     engine.compact().unwrap();
     assert_eq!(before, observe(&engine, dim), "mmap compact differs");
 }
+
+/// Storage v2 (ADR 0016): a base plus several delta segments, with replaces
+/// and deletes spanning segment boundaries, must reconstruct byte-identical
+/// observable state on reopen, and compaction (which collapses the deltas)
+/// must not change it either.
+#[test]
+fn differential_multi_segment_deltas() {
+    let dim = 16;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = VaultEngine::open(dir.path(), base_config(dim)).unwrap();
+
+    // Full base, then interleaved writes + flushes so deltas accumulate.
+    engine
+        .upsert_document(
+            doc("seed", "acme"),
+            vec![chunk("seed", 0, "seed subject0")],
+            &vector(dim, 1),
+            None,
+        )
+        .unwrap();
+    engine.flush().unwrap(); // full base
+    for i in 0..40 {
+        let id = format!("d{i}");
+        let tenant = if i % 2 == 0 { "acme" } else { "globex" };
+        engine
+            .upsert_document(
+                doc(&id, tenant),
+                vec![chunk(&id, 0, &format!("doc {i} subject{}", i % 7))],
+                &vector(dim, i * 3 + 1),
+                None,
+            )
+            .unwrap();
+        if i % 5 == 4 {
+            engine.flush().unwrap(); // a delta segment every 5 docs
+        }
+    }
+    // Replaces and deletes that reference rows in earlier segments.
+    for i in (0..40).step_by(4) {
+        let id = format!("d{i}");
+        let tenant = if i % 2 == 0 { "acme" } else { "globex" };
+        engine
+            .upsert_document(
+                doc(&id, tenant),
+                vec![chunk(&id, 0, &format!("replaced {i} fresh"))],
+                &vector(dim, 9000 + i),
+                None,
+            )
+            .unwrap();
+    }
+    for i in (0..40).step_by(7) {
+        engine.delete_document(&format!("d{i}")).unwrap();
+    }
+    engine.flush().unwrap();
+
+    let manifest = ragvault_engine::snapshot::load_manifest(dir.path())
+        .unwrap()
+        .unwrap();
+    assert!(
+        manifest.segments.len() >= 2,
+        "expected multiple delta segments, got {}",
+        manifest.segments.len()
+    );
+
+    let before = observe(&engine, dim);
+    drop(engine);
+
+    // Reopen reconstructs base + deltas + WAL.
+    let engine = VaultEngine::open(dir.path(), base_config(dim)).unwrap();
+    assert_eq!(
+        before,
+        observe(&engine, dim),
+        "multi-segment reopen changed observable state"
+    );
+
+    // Compaction collapses the deltas; state must be unchanged.
+    engine.compact().unwrap();
+    assert_eq!(
+        before,
+        observe(&engine, dim),
+        "compaction after deltas changed observable state"
+    );
+    let compacted = ragvault_engine::snapshot::load_manifest(dir.path())
+        .unwrap()
+        .unwrap();
+    assert!(
+        compacted.segments.is_empty(),
+        "compaction must collapse delta segments"
+    );
+    drop(engine);
+    let engine = VaultEngine::open(dir.path(), base_config(dim)).unwrap();
+    assert_eq!(
+        before,
+        observe(&engine, dim),
+        "compact + reopen changed observable state"
+    );
+}

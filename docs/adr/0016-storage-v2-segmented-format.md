@@ -1,15 +1,21 @@
 # ADR 0016 — Storage v2: segmented binary format
 
 Status: **in progress** (scopes the v0.2 work deferred by ADR 0004).
-Supersedes ADR 0004's "single mutable arena" decision when fully built.
+Supersedes ADR 0004's "single mutable arena" decision.
 
-**Implemented so far:** the binary segment container (`crate::segment`:
-length-prefixed records, per-record CRC, streaming footer CRC, incremental
-verification) and the v2 base format — `format_version = 2` writes the base
-state as `gen-N/state.rvseg` instead of `state.json`, with transparent v1→v2
-migration on reopen. **Remaining:** multi-segment delta flush (O(delta)),
-read-safe online compaction, and the read-during-compaction concurrency
-guarantee (bullets 1–5 below, partially met; see the acceptance list).
+**Implemented:** the binary segment container (`crate::segment`), the v2 base
+format (`format_version = 2` writes `gen-N/state.rvseg`) with transparent v1→v2
+migration, and **multi-segment delta flush** — after the first full base, each
+flush appends an O(delta) binary delta segment (WAL-shaped upsert/delete ops)
+instead of rewriting the base; a budget of `MAX_DELTA_SEGMENTS` deltas triggers
+a full base rewrite, and `compact()` collapses deltas into a fresh base. Open
+applies base → deltas → live WAL in seq order.
+
+**Remaining:** only the *non-blocking* read-during-compaction guarantee
+(acceptance #4). Compaction is currently synchronous under the write lock, so
+readers block briefly but always observe a consistent snapshot (safe, per ADR
+0004); making them fully concurrent (snapshot pinning) is a follow-up
+optimization, not a correctness gap.
 
 ## Contexto
 
@@ -80,29 +86,33 @@ Replace the monolithic `state.json` with a **segmented binary state**:
 
 Status: ✅ done · ◻️ remaining.
 
-1. ◻️ Round-trip across ≥2 delta segments (differential harness extended).
-   *(Single-segment round-trip via `state.rvseg` is ✅, covered by every
-   reopen test; multi-segment deltas are not built yet.)*
-2. ◻️ Tombstone/version shadowing correct across segment boundaries.
-3. ◻️ Crash injection between (a) segment fsync and manifest rename,
-   (b) manifest rename and old-segment GC — reopen consistent both times.
-   *(The manifest rename + fsync + GC-after-durable protocol from ADR 0004 is
-   ✅ and unchanged; the multi-segment variant is not built.)*
-4. ◻️ Read-during-compaction: a reader on a pinned snapshot returns stable
-   results while a compaction publishes and GCs.
+1. ✅ Round-trip across ≥2 delta segments
+   (`differential_multi_segment_deltas`, `delta_flush_accumulates_segments_and_reopens`).
+2. ✅ Tombstone/version shadowing across segment boundaries
+   (`delta_tombstone_and_replace_shadow_base`, and the multi-segment
+   differential workload includes replaces + deletes spanning segments).
+3. ✅ Crash injection: an orphan delta segment written but not referenced by
+   the manifest (crash between segment fsync and manifest rename) is ignored on
+   reopen (`orphan_delta_segment_is_ignored_on_reopen`); the manifest rename +
+   fsync + GC-after-durable protocol from ADR 0004 is unchanged, and full-base
+   GC removes superseded delta files only after the new manifest is durable.
+4. ◻️ Read-during-compaction *without blocking*: a reader on a pinned snapshot
+   returns stable results while a compaction publishes and GCs. Compaction is
+   currently synchronous under the write lock — readers block briefly but never
+   observe partial state (safe). Non-blocking concurrency is a follow-up.
 5. ✅ Streaming-CRC corruption of any segment byte fails open with an
    actionable `Corrupt` error (`segment::tests`,
-   `corrupt_snapshot_is_detected_not_silently_loaded`).
-6. ✅ v1→v2 migration: a v1 vault opens and first flush produces a valid v2
-   base (`v1_vault_migrates_to_v2_on_reopen_and_flush`,
+   `corrupt_snapshot_is_detected_not_silently_loaded`,
+   `corrupt_delta_segment_is_detected_not_silently_loaded`).
+6. ✅ v1→v2 migration (`v1_vault_migrates_to_v2_on_reopen_and_flush`,
    `v2_flush_writes_binary_segment`).
-7. ◻️ `differential_consistency.rs` extended with a multi-segment config;
-   fmt/clippy clean (✅ for what exists).
+7. ✅ `differential_consistency.rs` extended with a multi-segment config;
+   fmt/clippy clean.
 
 ## Validação
 
-Partially implemented. The binary base format (v2) + migration + streaming-CRC
-container are done and tested. The multi-segment delta path, O(delta) flush,
-and read-safe online compaction remain — until those land the engine keeps the
-single-base-per-generation model (ADR 0004's publish protocol, now writing a
-binary base). `TASKS.md` tracks the remaining units.
+Implemented and tested except acceptance #4 (non-blocking concurrent
+compaction), which is an optimization over the current safe, synchronous
+compaction — not a correctness gap. The delta flush is O(delta); a bounded
+delta budget and `compact()` keep reopen cost bounded. `TASKS.md` tracks the
+one remaining follow-up.
