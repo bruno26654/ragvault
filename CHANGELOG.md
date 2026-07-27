@@ -12,6 +12,16 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.0.0-rc1] — 2026-07-27
+
+First release candidate for v1.0: CPU single-node, production-hardened. All
+release gates in [docs/RELEASE.md](docs/RELEASE.md) are green (full CI matrix
+including Linux x86-64/aarch64, macOS Apple Silicon and Windows x86-64 wheels
+with clean-install smoke tests, plus real framework integration roundtrips at
+pinned versions). Storage v2 (ADR 0016) is complete.
+
 ### Added
 - **Storage format v2 (binary base + O(delta) delta segments).** The snapshot
   base is written as `gen-N/state.rvseg` — a binary segment container with
