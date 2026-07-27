@@ -20,8 +20,11 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
   rewriting the base. A bounded delta budget triggers a full base rewrite, and
   `compact()` collapses deltas into a fresh base; open applies base → deltas →
   live WAL. Manifests are `format_version = 2`; v1 vaults migrate transparently.
-  The one remaining v2 follow-up is non-blocking concurrent compaction (ADR
-  0016) — current compaction is synchronous but always crash- and read-safe.
+- **Read-friendly compaction.** The compaction rebuild runs off-lock on a
+  cloned snapshot, so concurrent readers keep searching for its whole duration;
+  the write lock is held only for the final swap + publish. Concurrent writes
+  are detected by seq and never lost (off-lock retry, then an under-lock
+  fallback). Completes ADR 0016 — all storage v2 acceptance criteria are met.
 - **Native batch retrieval.** `kb.retrieve_many()` / `kb.search_many()` run a
   list of queries through one GIL-released Rust call with per-query
   parallelism, returning results identical to sequential `retrieve()`

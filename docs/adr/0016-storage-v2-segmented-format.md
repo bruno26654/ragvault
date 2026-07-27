@@ -1,6 +1,6 @@
 # ADR 0016 — Storage v2: segmented binary format
 
-Status: **in progress** (scopes the v0.2 work deferred by ADR 0004).
+Status: **implemented and validated** (the v0.2 work deferred by ADR 0004).
 Supersedes ADR 0004's "single mutable arena" decision.
 
 **Implemented:** the binary segment container (`crate::segment`), the v2 base
@@ -11,11 +11,14 @@ instead of rewriting the base; a budget of `MAX_DELTA_SEGMENTS` deltas triggers
 a full base rewrite, and `compact()` collapses deltas into a fresh base. Open
 applies base → deltas → live WAL in seq order.
 
-**Remaining:** only the *non-blocking* read-during-compaction guarantee
-(acceptance #4). Compaction is currently synchronous under the write lock, so
-readers block briefly but always observe a consistent snapshot (safe, per ADR
-0004); making them fully concurrent (snapshot pinning) is a follow-up
-optimization, not a correctness gap.
+**Read-during-compaction (acceptance #4):** implemented. The expensive
+rebuild runs on a snapshot cloned under a short read lock, so concurrent
+readers keep searching for the whole rebuild; the write lock is held only for
+the final swap + durable publish. A concurrent write invalidates the snapshot
+(detected by seq) — the rebuild retries off-lock, then falls back to building
+under the write lock (always correct). Readers never reference on-disk files
+directly (state lives in memory; an mmap keeps its old generation readable
+even after GC), so segment GC can never pull data out from under a reader.
 
 ## Contexto
 
@@ -96,10 +99,11 @@ Status: ✅ done · ◻️ remaining.
    reopen (`orphan_delta_segment_is_ignored_on_reopen`); the manifest rename +
    fsync + GC-after-durable protocol from ADR 0004 is unchanged, and full-base
    GC removes superseded delta files only after the new manifest is durable.
-4. ◻️ Read-during-compaction *without blocking*: a reader on a pinned snapshot
-   returns stable results while a compaction publishes and GCs. Compaction is
-   currently synchronous under the write lock — readers block briefly but never
-   observe partial state (safe). Non-blocking concurrency is a follow-up.
+4. ✅ Read-during-compaction: the rebuild runs off-lock on a cloned snapshot;
+   readers search concurrently throughout and observe either fully-pre or
+   fully-post state, never partial (`readers_keep_searching_during_compaction`);
+   concurrent writes are never lost — seq-checked swap with off-lock retry and
+   an under-lock fallback (`concurrent_write_during_compaction_is_preserved`).
 5. ✅ Streaming-CRC corruption of any segment byte fails open with an
    actionable `Corrupt` error (`segment::tests`,
    `corrupt_snapshot_is_detected_not_silently_loaded`,
@@ -111,8 +115,8 @@ Status: ✅ done · ◻️ remaining.
 
 ## Validação
 
-Implemented and tested except acceptance #4 (non-blocking concurrent
-compaction), which is an optimization over the current safe, synchronous
-compaction — not a correctness gap. The delta flush is O(delta); a bounded
-delta budget and `compact()` keep reopen cost bounded. `TASKS.md` tracks the
-one remaining follow-up.
+**All acceptance criteria are met.** The delta flush is O(delta); a bounded
+delta budget and `compact()` keep reopen cost bounded; compaction rebuilds
+off-lock so readers are never starved. Storage v2 is complete per this ADR.
+Future niceties (background-scheduled compaction, delta-segment mmap) would be
+new ADRs, gated on measured need.

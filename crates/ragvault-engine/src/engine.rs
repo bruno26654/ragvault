@@ -307,6 +307,7 @@ fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
     out
 }
 
+#[derive(Clone)]
 struct StoredChunk {
     chunk: Chunk,
     /// Effective metadata for filtering: document metadata overlaid with
@@ -345,6 +346,32 @@ pub struct VaultEngine {
     path: PathBuf,
     state: RwLock<State>,
     _lock_file: fs::File,
+}
+
+/// Cloned inputs for an off-lock compaction rebuild (ADR 0016 acceptance #4).
+/// `live` holds `(old_row, chunk, vector)` in ascending old-row order; `seq`
+/// is the state's seq at snapshot time, used to detect concurrent writes
+/// before the swap.
+struct CompactionSnapshot {
+    config: EngineConfig,
+    has_sq8: bool,
+    sparse: SparseIndex,
+    live: Vec<(u32, StoredChunk, Vec<f32>)>,
+    seq: u64,
+}
+
+/// Output of a compaction rebuild, ready to swap into `State` under the
+/// write lock.
+struct CompactedParts {
+    arena: VectorArena,
+    sq8: Option<Sq8Arena>,
+    hnsw: Hnsw,
+    bm25: Bm25Index,
+    chunks: Vec<Option<StoredChunk>>,
+    chunk_ids: HashMap<String, u32>,
+    doc_rows: HashMap<String, Vec<u32>>,
+    meta_index: MetaIndex,
+    sparse: SparseIndex,
 }
 
 fn effective_metadata(document: &Document, chunk: &Chunk) -> serde_json::Value {
@@ -1300,71 +1327,131 @@ impl VaultEngine {
         Ok(())
     }
 
-    /// Rebuild arenas and indexes without tombstones, then flush.
-    /// Synchronous and deterministic (v0.1 — background compaction is
-    /// planned).
+    /// Rebuild arenas and indexes without tombstones, then persist a fresh
+    /// full base (collapsing any delta segments).
+    ///
+    /// Read-safe and read-friendly (ADR 0016 acceptance #4): the expensive
+    /// rebuild runs on a snapshot taken under a short read lock, so
+    /// concurrent readers keep searching throughout it. The write lock is
+    /// held only for the final swap + durable publish. If a write lands
+    /// while the rebuild runs, the stale result is discarded and rebuilt
+    /// (bounded retries), then as a last resort the rebuild happens under
+    /// the write lock — always correct, briefly blocking.
     pub fn compact(&self) -> Result<()> {
-        {
-            let mut state = self.state.write();
-            let config = state.config.clone();
-            let mut arena = VectorArena::new(config.dim, config.metric);
-            let mut hnsw = Hnsw::new(config.hnsw.clone());
-            let mut bm25 = Bm25Index::new(config.bm25.clone());
-            let mut sq8 = if state.sq8.is_some() {
-                Some(Sq8Arena::new(config.dim, config.metric)?)
-            } else {
-                None
+        for _ in 0..2 {
+            let snap = {
+                let state = self.state.read();
+                Self::snapshot_for_compaction(&state)
             };
-            let mut chunks: Vec<Option<StoredChunk>> = Vec::new();
-            let mut chunk_ids = HashMap::new();
-            let mut doc_rows: HashMap<String, Vec<u32>> = HashMap::new();
-            let mut row_map: HashMap<u32, u32> = HashMap::new();
-            let mut meta_index = MetaIndex::default();
-
-            let mut live_rows: Vec<u32> = (0..state.chunks.len() as u32)
-                .filter(|&r| !state.arena.is_deleted(r) && state.chunks[r as usize].is_some())
-                .collect();
-            live_rows.sort();
-            for old_row in live_rows {
-                let sc = state.chunks[old_row as usize].as_ref().expect("live row");
-                let vector = state.arena.get(old_row).to_vec();
-                let new_row = arena.push(&vector)?;
-                if let Some(q) = sq8.as_mut() {
-                    q.push(arena.get(new_row))?;
-                } else {
-                    hnsw.insert(&arena, new_row);
-                }
-                bm25.add(new_row, &sc.chunk.text);
-                row_map.insert(old_row, new_row);
-                meta_index.add_row(new_row, &sc.eff_metadata);
-                chunk_ids.insert(sc.chunk.chunk_id.clone(), new_row);
-                doc_rows
-                    .entry(sc.chunk.document_id.clone())
-                    .or_default()
-                    .push(new_row);
-                chunks.push(Some(StoredChunk {
-                    chunk: sc.chunk.clone(),
-                    eff_metadata: sc.eff_metadata.clone(),
-                }));
+            let seq = snap.seq;
+            let parts = Self::build_compacted(snap)?;
+            let mut state = self.state.write();
+            if state.seq == seq {
+                return self.install_and_publish(&mut state, parts);
             }
-            state.sparse = state.sparse.remap(&row_map, arena.len() as u32);
-            state.meta_index = meta_index;
-            state.arena = arena;
-            state.sq8 = sq8;
-            state.hnsw = hnsw;
-            state.bm25 = bm25;
-            state.chunks = chunks;
-            state.chunk_ids = chunk_ids;
-            state.doc_rows = doc_rows;
-            rebuild_ivf(&mut state)?;
-            state.dirty = true;
-            // Compaction rewrote every row: the base must be rewritten in full
-            // (a delta segment would reference the old row numbering). This
-            // also collapses any existing delta segments.
-            state.wal.sync()?;
-            self.write_full_base(&mut state)?;
+            // A concurrent write invalidated the snapshot: retry off-lock.
         }
-        Ok(())
+        // Writes keep interleaving; rebuild under the write lock (previous
+        // synchronous behavior — always correct).
+        let mut state = self.state.write();
+        let snap = Self::snapshot_for_compaction(&state);
+        let parts = Self::build_compacted(snap)?;
+        self.install_and_publish(&mut state, parts)
+    }
+
+    /// Clone everything the compaction rebuild needs (live rows in ascending
+    /// old-row order, with their vectors), so the rebuild can run without any
+    /// lock. Cost is one pass over live data — the same copy the rebuild made
+    /// under the write lock before.
+    fn snapshot_for_compaction(state: &State) -> CompactionSnapshot {
+        // Single ascending pass keeps old-row ids and their data aligned.
+        let mut live: Vec<(u32, StoredChunk, Vec<f32>)> = Vec::new();
+        for row in 0..state.chunks.len() as u32 {
+            if state.arena.is_deleted(row) {
+                continue;
+            }
+            if let Some(sc) = &state.chunks[row as usize] {
+                live.push((row, sc.clone(), state.arena.get(row).to_vec()));
+            }
+        }
+        CompactionSnapshot {
+            config: state.config.clone(),
+            has_sq8: state.sq8.is_some(),
+            sparse: state.sparse.clone(),
+            live,
+            seq: state.seq,
+        }
+    }
+
+    /// Pure rebuild from a snapshot: no locks, no I/O. Deterministic — rows
+    /// are re-assigned in ascending old-row order (the documented tie-break
+    /// rule of the differential suite).
+    fn build_compacted(snap: CompactionSnapshot) -> Result<CompactedParts> {
+        let config = &snap.config;
+        let mut arena = VectorArena::new(config.dim, config.metric);
+        let mut hnsw = Hnsw::new(config.hnsw.clone());
+        let mut bm25 = Bm25Index::new(config.bm25.clone());
+        let mut sq8 = if snap.has_sq8 {
+            Some(Sq8Arena::new(config.dim, config.metric)?)
+        } else {
+            None
+        };
+        let mut chunks: Vec<Option<StoredChunk>> = Vec::new();
+        let mut chunk_ids = HashMap::new();
+        let mut doc_rows: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut row_map: HashMap<u32, u32> = HashMap::new();
+        let mut meta_index = MetaIndex::default();
+
+        for (old_row, sc, vector) in &snap.live {
+            let new_row = arena.push(vector)?;
+            if let Some(q) = sq8.as_mut() {
+                q.push(arena.get(new_row))?;
+            } else {
+                hnsw.insert(&arena, new_row);
+            }
+            bm25.add(new_row, &sc.chunk.text);
+            row_map.insert(*old_row, new_row);
+            meta_index.add_row(new_row, &sc.eff_metadata);
+            chunk_ids.insert(sc.chunk.chunk_id.clone(), new_row);
+            doc_rows
+                .entry(sc.chunk.document_id.clone())
+                .or_default()
+                .push(new_row);
+            chunks.push(Some(sc.clone()));
+        }
+        let sparse = snap.sparse.remap(&row_map, arena.len() as u32);
+        Ok(CompactedParts {
+            arena,
+            sq8,
+            hnsw,
+            bm25,
+            chunks,
+            chunk_ids,
+            doc_rows,
+            meta_index,
+            sparse,
+        })
+    }
+
+    /// Swap the compacted structures in and persist a full base. Caller holds
+    /// the write lock and has verified the snapshot is still current.
+    fn install_and_publish(&self, state: &mut State, parts: CompactedParts) -> Result<()> {
+        state.sparse = parts.sparse;
+        state.meta_index = parts.meta_index;
+        state.arena = parts.arena;
+        state.sq8 = parts.sq8;
+        state.hnsw = parts.hnsw;
+        state.bm25 = parts.bm25;
+        state.chunks = parts.chunks;
+        state.chunk_ids = parts.chunk_ids;
+        state.doc_rows = parts.doc_rows;
+        rebuild_ivf(state)?;
+        state.dirty = true;
+        // Compaction rewrote every row: the base must be rewritten in full
+        // (a delta segment would reference the old row numbering). This also
+        // collapses any existing delta segments.
+        state.wal.sync()?;
+        self.write_full_base(state)
     }
 
     pub fn stats(&self) -> serde_json::Value {
@@ -2659,6 +2746,140 @@ mod tests {
         let gen_dir = dir.path().join(format!("gen-{}", migrated.generation));
         assert!(gen_dir.join("state.rvseg").exists(), "base migrated to v2");
         assert!(!gen_dir.join("state.json").exists());
+    }
+
+    #[test]
+    fn readers_keep_searching_during_compaction() {
+        // ADR 0016 acceptance #4: the compaction rebuild runs off-lock, so
+        // concurrent readers are never starved and always observe a
+        // consistent state (either fully pre- or fully post-compaction).
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        // Exact Flat search: identical results across compaction are only
+        // guaranteed for exact backends (an HNSW graph rebuilt without
+        // tombstone bridge nodes may legitimately differ on the margin).
+        let mut cfg = config(8);
+        cfg.flat_threshold = 1_000_000;
+        let engine = VaultEngine::open(dir.path(), cfg).unwrap();
+        for i in 0..300 {
+            let id = format!("d{i}");
+            engine
+                .upsert_document(
+                    doc(&id, json!({})),
+                    vec![chunk(&id, 0, &format!("subject {} content", i % 9))],
+                    &unit_vec(8, i % 8),
+                    None,
+                )
+                .unwrap();
+        }
+        // Tombstones so compaction has real work.
+        for i in (0..300).step_by(3) {
+            engine.delete_document(&format!("d{i}")).unwrap();
+        }
+        engine.flush().unwrap();
+
+        let request = SearchRequest {
+            vector: Some(unit_vec(8, 1)),
+            text: Some("subject 1 content".into()),
+            sparse: None,
+            k: 5,
+            mode: "hybrid".into(),
+            candidates: None,
+            filter: None,
+            ef_search: None,
+            nprobe: None,
+            weights: None,
+        };
+        let expected: Vec<(String, u32)> = engine
+            .search(&request)
+            .unwrap()
+            .hits
+            .iter()
+            .map(|h| (h.chunk_id.clone(), 0))
+            .collect();
+
+        let done = AtomicBool::new(false);
+        let reads = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    while !done.load(Ordering::Relaxed) {
+                        let out = engine.search(&request).expect("read during compaction");
+                        assert!(!out.hits.is_empty(), "reader saw empty state");
+                        reads.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+            s.spawn(|| {
+                engine.compact().unwrap();
+                done.store(true, Ordering::Relaxed);
+            });
+        });
+        assert!(reads.load(Ordering::Relaxed) > 0, "readers must have run");
+        // Post-compaction results identical (chunk ids stable across compact).
+        let after: Vec<(String, u32)> = engine
+            .search(&request)
+            .unwrap()
+            .hits
+            .iter()
+            .map(|h| (h.chunk_id.clone(), 0))
+            .collect();
+        assert_eq!(expected, after, "compaction changed observable results");
+    }
+
+    #[test]
+    fn concurrent_write_during_compaction_is_preserved() {
+        // Whatever the interleaving (write before the snapshot, during the
+        // rebuild — triggering retry/fallback — or after the swap), no
+        // acknowledged write may be lost and the vault must reopen cleanly.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = VaultEngine::open(dir.path(), config(8)).unwrap();
+        for i in 0..200 {
+            let id = format!("d{i}");
+            engine
+                .upsert_document(
+                    doc(&id, json!({})),
+                    vec![chunk(&id, 0, "existing content")],
+                    &unit_vec(8, i % 8),
+                    None,
+                )
+                .unwrap();
+        }
+        engine.flush().unwrap();
+
+        std::thread::scope(|s| {
+            s.spawn(|| engine.compact().unwrap());
+            s.spawn(|| {
+                for i in 0..20 {
+                    let id = format!("mid{i}");
+                    engine
+                        .upsert_document(
+                            doc(&id, json!({})),
+                            vec![chunk(&id, 0, "written during compaction")],
+                            &unit_vec(8, i % 8),
+                            None,
+                        )
+                        .unwrap();
+                }
+            });
+        });
+
+        for i in 0..20 {
+            assert!(
+                engine.get_document(&format!("mid{i}")).is_some(),
+                "acknowledged write mid{i} lost after compaction"
+            );
+        }
+        assert!(engine.get_document("d0").is_some());
+        drop(engine);
+        let engine = VaultEngine::open(dir.path(), config(8)).unwrap();
+        for i in 0..20 {
+            assert!(
+                engine.get_document(&format!("mid{i}")).is_some(),
+                "acknowledged write mid{i} lost after reopen"
+            );
+        }
     }
 
     #[test]
