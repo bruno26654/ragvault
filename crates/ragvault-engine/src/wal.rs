@@ -53,7 +53,7 @@ pub enum WalOp {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalRecord {
     pub seq: u64,
     pub op: WalOp,

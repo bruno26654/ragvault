@@ -9,7 +9,7 @@
 //! ├── wal.log
 //! ├── manifest.json     (points at the current generation, atomic rename)
 //! └── gen-<N>/
-//!     ├── state.json    (docs, chunks, bm25, hnsw graph — versioned DTO)
+//!     ├── state.rvseg   (docs, chunks, bm25, hnsw graph — binary segment, v2)
 //!     └── vectors.bin   (raw f32 LE, row-major)
 //! ```
 //!
@@ -18,10 +18,13 @@
 //! directory. The previous generation is removed only after the new
 //! manifest is durable, so a crash at any point leaves a readable vault.
 //!
-//! v0.1 serializes state as JSON DTOs (`format_version = 1`). This is
-//! honest about its trade-off: robust and debuggable, but not the fastest
-//! reopen for very large vaults. A binary segment format is planned
-//! (TASKS.md) behind the same manifest, with format_version gating.
+//! `format_version = 2` writes the base state as a binary segment
+//! (`gen-N/state.rvseg`, see [`crate::segment`]) with a streaming CRC, instead
+//! of the `format_version = 1` `state.json`. A v1 vault still opens
+//! (migration is transparent: the next flush rewrites it as v2), and a
+//! manifest whose `format_version` exceeds what this build supports still
+//! fails closed. ADR 0016 tracks the remaining v2 work (multi-segment
+//! deltas, read-safe online compaction).
 
 use std::collections::HashMap;
 use std::fs;
@@ -34,17 +37,46 @@ use ragvault_core::{Chunk, Document, Error, Result};
 use ragvault_retrieval::Bm25Index;
 use ragvault_vector::Hnsw;
 
-pub const FORMAT_VERSION: u32 = 1;
+use crate::segment::{self, SegmentWriter};
+
+/// Highest manifest format this build writes and can read.
+pub const FORMAT_VERSION: u32 = 2;
+
+/// Base state file name for a v2 generation (binary segment).
+const STATE_SEGMENT: &str = "state.rvseg";
+/// Base state file name for a legacy v1 generation (JSON).
+const STATE_JSON: &str = "state.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedManifestV1 {
     pub format_version: u32,
     pub generation: u64,
-    /// Highest sequence number included in this snapshot.
+    /// Highest sequence number durably captured (base seq if no deltas, else
+    /// the highest delta `seq_hi`).
     pub seq: u64,
     pub files: HashMap<String, PersistedFileV1>,
     /// Engine configuration JSON (dim, metric, hnsw, bm25 params).
     pub config: serde_json::Value,
+    /// Seq at which the base generation was published. `None` in legacy
+    /// manifests (no delta segments) — callers fall back to `seq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_seq: Option<u64>,
+    /// Ordered delta segments layered on the base (storage v2). Empty for a
+    /// freshly compacted/full-flushed vault.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub segments: Vec<PersistedSegmentEntry>,
+}
+
+/// A delta segment referenced by the manifest. Carries WAL-shaped records
+/// (upsert/delete ops) with seq in `(seq_lo, seq_hi]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedSegmentEntry {
+    /// Path relative to the vault directory.
+    pub file: String,
+    pub len: u64,
+    pub crc32: u32,
+    pub seq_lo: u64,
+    pub seq_hi: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,22 +172,31 @@ pub fn publish(
     fs::create_dir_all(&tmp_dir)
         .map_err(|e| Error::io(format!("mkdir {}", tmp_dir.display()), e))?;
 
-    let state_bytes = serde_json::to_vec(state)?;
+    // Base state as a binary segment (one record = the full state blob). The
+    // segment self-verifies with a streaming CRC; we also record a file-level
+    // CRC in the manifest so a corrupt base is caught before it is parsed.
+    let state_blob = serde_json::to_vec(state)?;
+    let state_seg_path = tmp_dir.join(STATE_SEGMENT);
+    let mut seg = SegmentWriter::create(&state_seg_path)?;
+    seg.append(&state_blob)?;
+    seg.finish()?;
+    let state_seg_bytes = fs::read(&state_seg_path)
+        .map_err(|e| Error::io(format!("read {}", state_seg_path.display()), e))?;
+
     let vector_bytes: Vec<u8> = vector_parts
         .iter()
         .flat_map(|part| part.iter())
         .flat_map(|f| f.to_le_bytes())
         .collect();
 
-    write_file_sync(&tmp_dir.join("state.json"), &state_bytes)?;
     write_file_sync(&tmp_dir.join("vectors.bin"), &vector_bytes)?;
 
     let mut files = HashMap::new();
     files.insert(
-        format!("{gen_name}/state.json"),
+        format!("{gen_name}/{STATE_SEGMENT}"),
         PersistedFileV1 {
-            len: state_bytes.len() as u64,
-            crc32: crc_of(&state_bytes),
+            len: state_seg_bytes.len() as u64,
+            crc32: crc_of(&state_seg_bytes),
         },
     );
     files.insert(
@@ -180,25 +221,110 @@ pub fn publish(
         seq,
         files,
         config,
+        base_seq: Some(seq),
+        segments: Vec::new(),
     };
-    let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-    let tmp_manifest = dir.join("manifest.json.tmp");
-    write_file_sync(&tmp_manifest, &manifest_bytes)?;
-    fs::rename(&tmp_manifest, manifest_path(dir)).map_err(|e| Error::io("publish manifest", e))?;
-    fsync_dir(dir)?;
+    write_manifest(dir, &manifest)?;
 
-    // Garbage-collect older generations only after the manifest is durable.
+    // Garbage-collect older generations and any stale delta segments only
+    // after the new manifest (which references neither) is durable.
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if (name.starts_with("gen-") && name != gen_name)
-                || name.ends_with(".tmp") && name != "manifest.json.tmp"
+                || (name.ends_with(".tmp") && name != "manifest.json.tmp")
             {
                 let _ = fs::remove_dir_all(entry.path());
+            } else if name.starts_with("seg-") && name.ends_with(".rvseg") {
+                // A full base supersedes every delta segment.
+                let _ = fs::remove_file(entry.path());
             }
         }
     }
     Ok(manifest)
+}
+
+/// Write `manifest.json` atomically (tmp + fsync + rename + dir fsync).
+fn write_manifest(dir: &Path, manifest: &PersistedManifestV1) -> Result<()> {
+    let manifest_bytes = serde_json::to_vec_pretty(manifest)?;
+    let tmp_manifest = dir.join("manifest.json.tmp");
+    write_file_sync(&tmp_manifest, &manifest_bytes)?;
+    fs::rename(&tmp_manifest, manifest_path(dir)).map_err(|e| Error::io("publish manifest", e))?;
+    fsync_dir(dir)?;
+    Ok(())
+}
+
+/// Append a delta segment (storage v2): persist `records` as an immutable
+/// binary segment and publish a manifest that references it, keeping the
+/// existing base and prior deltas. O(delta) — the base is not rewritten.
+///
+/// `encoded` are the per-record payloads (already serialized by the caller),
+/// ordered by ascending seq; `seq_lo`/`seq_hi` bound them.
+pub fn publish_delta(
+    dir: &Path,
+    prev: &PersistedManifestV1,
+    encoded: &[Vec<u8>],
+    seq_lo: u64,
+    seq_hi: u64,
+) -> Result<PersistedManifestV1> {
+    let rel = format!("seg-{seq_hi}.rvseg");
+    let tmp = dir.join(format!("{rel}.tmp"));
+    let final_path = dir.join(&rel);
+
+    let mut seg = SegmentWriter::create(&tmp)?;
+    for payload in encoded {
+        seg.append(payload)?;
+    }
+    seg.finish()?;
+    let seg_bytes = fs::read(&tmp).map_err(|e| Error::io(format!("read {}", tmp.display()), e))?;
+    fs::rename(&tmp, &final_path)
+        .map_err(|e| Error::io(format!("publish {}", final_path.display()), e))?;
+    fsync_dir(dir)?;
+
+    let mut manifest = prev.clone();
+    manifest.format_version = FORMAT_VERSION;
+    manifest.seq = seq_hi;
+    if manifest.base_seq.is_none() {
+        // Legacy base without an explicit base_seq: its seq is the base seq.
+        manifest.base_seq = Some(prev.seq);
+    }
+    manifest.segments.push(PersistedSegmentEntry {
+        file: rel,
+        len: seg_bytes.len() as u64,
+        crc32: crc_of(&seg_bytes),
+        seq_lo,
+        seq_hi,
+    });
+    write_manifest(dir, &manifest)?;
+    Ok(manifest)
+}
+
+/// Load and verify every delta segment referenced by the manifest, returning
+/// their record payloads concatenated in manifest (seq) order.
+pub fn load_segments(dir: &Path, manifest: &PersistedManifestV1) -> Result<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    for entry in &manifest.segments {
+        let path = dir.join(&entry.file);
+        let bytes =
+            fs::read(&path).map_err(|e| Error::io(format!("read {}", path.display()), e))?;
+        if bytes.len() as u64 != entry.len || crc_of(&bytes) != entry.crc32 {
+            return Err(Error::corrupt(
+                path.display().to_string(),
+                format!(
+                    "delta segment checksum/length mismatch (expected {} bytes crc {:#x})",
+                    entry.len, entry.crc32
+                ),
+            ));
+        }
+        let records = segment::decode(&bytes, &path.display().to_string())?;
+        out.extend(records);
+    }
+    Ok(out)
+}
+
+/// Base seq for a manifest: explicit `base_seq`, or `seq` for legacy bases.
+pub fn base_seq(manifest: &PersistedManifestV1) -> u64 {
+    manifest.base_seq.unwrap_or(manifest.seq)
 }
 
 /// Path of a generation's vectors file (for mmap-backed opens).
@@ -249,7 +375,18 @@ pub fn load_state(
                 ),
             ));
         }
-        if rel.ends_with("state.json") {
+        if rel.ends_with(STATE_SEGMENT) {
+            // v2: binary segment holding one record (the state blob).
+            let records = segment::decode(&bytes, &path.display().to_string())?;
+            let blob = records
+                .first()
+                .ok_or_else(|| Error::corrupt(path.display().to_string(), "empty state segment"))?;
+            state = Some(
+                serde_json::from_slice(blob)
+                    .map_err(|e| Error::corrupt(path.display().to_string(), e.to_string()))?,
+            );
+        } else if rel.ends_with(STATE_JSON) {
+            // v1 legacy: plain JSON state (transparently migrated on next flush).
             state = Some(
                 serde_json::from_slice(&bytes)
                     .map_err(|e| Error::corrupt(path.display().to_string(), e.to_string()))?,
@@ -264,7 +401,10 @@ pub fn load_state(
         }
     }
     let state = state.ok_or_else(|| {
-        Error::corrupt(gen_name.clone(), "manifest missing state.json".to_string())
+        Error::corrupt(
+            gen_name.clone(),
+            "manifest missing state.rvseg/state.json".to_string(),
+        )
     })?;
     let vectors = vectors
         .ok_or_else(|| Error::corrupt(gen_name, "manifest missing vectors.bin".to_string()))?;

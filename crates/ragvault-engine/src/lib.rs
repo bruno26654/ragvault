@@ -5,6 +5,7 @@
 //! what the Python bindings expose.
 
 pub mod engine;
+pub mod segment;
 pub mod snapshot;
 pub mod wal;
 

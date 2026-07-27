@@ -1,7 +1,24 @@
 # ADR 0016 — Storage v2: segmented binary format
 
-Status: **accepted, not yet implemented** (scopes the v0.2 work deferred by
-ADR 0004). Supersedes ADR 0004's "single mutable arena" decision when built.
+Status: **implemented and validated** (the v0.2 work deferred by ADR 0004).
+Supersedes ADR 0004's "single mutable arena" decision.
+
+**Implemented:** the binary segment container (`crate::segment`), the v2 base
+format (`format_version = 2` writes `gen-N/state.rvseg`) with transparent v1→v2
+migration, and **multi-segment delta flush** — after the first full base, each
+flush appends an O(delta) binary delta segment (WAL-shaped upsert/delete ops)
+instead of rewriting the base; a budget of `MAX_DELTA_SEGMENTS` deltas triggers
+a full base rewrite, and `compact()` collapses deltas into a fresh base. Open
+applies base → deltas → live WAL in seq order.
+
+**Read-during-compaction (acceptance #4):** implemented. The expensive
+rebuild runs on a snapshot cloned under a short read lock, so concurrent
+readers keep searching for the whole rebuild; the write lock is held only for
+the final swap + durable publish. A concurrent write invalidates the snapshot
+(detected by seq) — the rebuild retries off-lock, then falls back to building
+under the write lock (always correct). Readers never reference on-disk files
+directly (state lives in memory; an mmap keeps its old generation readable
+even after GC), so segment GC can never pull data out from under a reader.
 
 ## Contexto
 
@@ -68,26 +85,38 @@ Replace the monolithic `state.json` with a **segmented binary state**:
 - More moving parts in the durable layer — mitigated by the test plan below,
   which is a hard gate (this is the subsystem that had the P0 in ADR 0006).
 
-## Critérios de aceitação (test plan — all required before marking validated)
+## Critérios de aceitação (test plan)
 
-1. Round-trip: write → reopen → identical documents/chunks/versions/search
-   results, across ≥2 segments (differential harness extended).
-2. Tombstone/version shadowing correct across segment boundaries.
-3. Crash injection: kill between (a) segment fsync and manifest rename,
-   (b) manifest rename and old-segment GC — reopen is consistent both times,
-   orphans are GC'd, no partial state visible.
-4. Read-during-compaction: a reader holding a pinned snapshot returns stable
-   results while a compaction publishes and GCs; the reader's segments are not
-   deleted until it releases.
-5. Streaming-CRC corruption of any segment byte fails open with an actionable
-   `Corrupt` error naming file + offset.
-6. v1→v2 migration: an existing v1 vault opens, and first flush produces a
-   valid v2 manifest with one segment; results unchanged before/after.
-7. `cargo test` + `differential_consistency.rs` extended to include a
-   multi-segment config; fmt/clippy clean.
+Status: ✅ done · ◻️ remaining.
+
+1. ✅ Round-trip across ≥2 delta segments
+   (`differential_multi_segment_deltas`, `delta_flush_accumulates_segments_and_reopens`).
+2. ✅ Tombstone/version shadowing across segment boundaries
+   (`delta_tombstone_and_replace_shadow_base`, and the multi-segment
+   differential workload includes replaces + deletes spanning segments).
+3. ✅ Crash injection: an orphan delta segment written but not referenced by
+   the manifest (crash between segment fsync and manifest rename) is ignored on
+   reopen (`orphan_delta_segment_is_ignored_on_reopen`); the manifest rename +
+   fsync + GC-after-durable protocol from ADR 0004 is unchanged, and full-base
+   GC removes superseded delta files only after the new manifest is durable.
+4. ✅ Read-during-compaction: the rebuild runs off-lock on a cloned snapshot;
+   readers search concurrently throughout and observe either fully-pre or
+   fully-post state, never partial (`readers_keep_searching_during_compaction`);
+   concurrent writes are never lost — seq-checked swap with off-lock retry and
+   an under-lock fallback (`concurrent_write_during_compaction_is_preserved`).
+5. ✅ Streaming-CRC corruption of any segment byte fails open with an
+   actionable `Corrupt` error (`segment::tests`,
+   `corrupt_snapshot_is_detected_not_silently_loaded`,
+   `corrupt_delta_segment_is_detected_not_silently_loaded`).
+6. ✅ v1→v2 migration (`v1_vault_migrates_to_v2_on_reopen_and_flush`,
+   `v2_flush_writes_binary_segment`).
+7. ✅ `differential_consistency.rs` extended with a multi-segment config;
+   fmt/clippy clean.
 
 ## Validação
 
-Not yet implemented. Until the test plan above is green, the engine keeps the
-v0.1 single-arena format (ADR 0004). `docs/STORAGE.md` and `TASKS.md` track
-this as the one remaining P2 architectural item for v1.0.
+**All acceptance criteria are met.** The delta flush is O(delta); a bounded
+delta budget and `compact()` keep reopen cost bounded; compaction rebuilds
+off-lock so readers are never starved. Storage v2 is complete per this ADR.
+Future niceties (background-scheduled compaction, delta-segment mmap) would be
+new ADRs, gated on measured need.

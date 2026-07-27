@@ -30,7 +30,7 @@ use ragvault_vector::{
 };
 
 use crate::snapshot::{self, PersistedStateV1, PersistedVersionV1};
-use crate::wal::{SyncPolicy, Wal, WalOp};
+use crate::wal::{SyncPolicy, Wal, WalOp, WalRecord};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EngineConfig {
@@ -307,6 +307,7 @@ fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
     out
 }
 
+#[derive(Clone)]
 struct StoredChunk {
     chunk: Chunk,
     /// Effective metadata for filtering: document metadata overlaid with
@@ -333,12 +334,44 @@ struct State {
     wal: Wal,
     dirty: bool,
     generation: u64,
+    /// Seq at which the current base generation was published. Delta segments
+    /// and the WAL carry everything with seq in `(base_seq, seq]`.
+    base_seq: u64,
+    /// Number of delta segments layered on the base (storage v2). A full
+    /// flush resets this to 0; it grows by one per delta flush.
+    segment_count: usize,
 }
 
 pub struct VaultEngine {
     path: PathBuf,
     state: RwLock<State>,
     _lock_file: fs::File,
+}
+
+/// Cloned inputs for an off-lock compaction rebuild (ADR 0016 acceptance #4).
+/// `live` holds `(old_row, chunk, vector)` in ascending old-row order; `seq`
+/// is the state's seq at snapshot time, used to detect concurrent writes
+/// before the swap.
+struct CompactionSnapshot {
+    config: EngineConfig,
+    has_sq8: bool,
+    sparse: SparseIndex,
+    live: Vec<(u32, StoredChunk, Vec<f32>)>,
+    seq: u64,
+}
+
+/// Output of a compaction rebuild, ready to swap into `State` under the
+/// write lock.
+struct CompactedParts {
+    arena: VectorArena,
+    sq8: Option<Sq8Arena>,
+    hnsw: Hnsw,
+    bm25: Bm25Index,
+    chunks: Vec<Option<StoredChunk>>,
+    chunk_ids: HashMap<String, u32>,
+    doc_rows: HashMap<String, Vec<u32>>,
+    meta_index: MetaIndex,
+    sparse: SparseIndex,
 }
 
 fn effective_metadata(document: &Document, chunk: &Chunk) -> serde_json::Value {
@@ -407,8 +440,8 @@ impl VaultEngine {
             owner: "another process".to_string(),
         })?;
 
-        let manifest = snapshot::load_manifest(path)?;
-        let mut state = if let Some(manifest) = manifest {
+        let loaded_manifest = snapshot::load_manifest(path)?;
+        let mut state = if let Some(manifest) = &loaded_manifest {
             let mut stored_config: EngineConfig = serde_json::from_value(manifest.config.clone())?;
             // Runtime knobs, not data-format properties: honor the values
             // requested for this open.
@@ -430,7 +463,7 @@ impl VaultEngine {
             if stored_config.storage == "mmap" {
                 // load_state verifies the vectors.bin checksum; the parsed
                 // Vec<f32> is dropped and the file is served via mmap.
-                let (state_only, _vectors) = snapshot::load_state(path, &manifest)?;
+                let (state_only, _vectors) = snapshot::load_state(path, manifest)?;
                 persisted = state_only;
                 let vectors_file =
                     fs::File::open(snapshot::vectors_path(path, manifest.generation))
@@ -448,7 +481,7 @@ impl VaultEngine {
                     persisted.deleted.clone(),
                 )?;
             } else {
-                let (state_only, vectors) = snapshot::load_state(path, &manifest)?;
+                let (state_only, vectors) = snapshot::load_state(path, manifest)?;
                 persisted = state_only;
                 arena = VectorArena::from_parts(
                     stored_config.dim,
@@ -517,10 +550,12 @@ impl VaultEngine {
                 hnsw: persisted.hnsw,
                 bm25: persisted.bm25,
                 sparse: persisted.sparse,
-                seq: manifest.seq,
+                seq: snapshot::base_seq(manifest),
                 wal,
                 dirty: false,
                 generation: manifest.generation,
+                base_seq: snapshot::base_seq(manifest),
+                segment_count: manifest.segments.len(),
             }
         } else {
             let wal = Wal::open(path, config.wal_sync)?;
@@ -546,6 +581,8 @@ impl VaultEngine {
                 wal,
                 dirty: false,
                 generation: 0,
+                base_seq: 0,
+                segment_count: 0,
             }
         };
 
@@ -557,8 +594,44 @@ impl VaultEngine {
             }
         }
 
-        // Recovery: replay WAL operations newer than the snapshot.
+        // Storage v2: apply durable delta segments layered on the base, in
+        // seq order, before replaying the live WAL. Deltas are already durable
+        // so they do not mark the state dirty.
+        if let Some(manifest) = &loaded_manifest {
+            let encoded = snapshot::load_segments(path, manifest)?;
+            let mut records = Vec::with_capacity(encoded.len());
+            for blob in &encoded {
+                let record: WalRecord = serde_json::from_slice(blob).map_err(|e| {
+                    Error::corrupt("delta segment", format!("undecodable record: {e}"))
+                })?;
+                records.push(record);
+            }
+            Self::apply_records(&mut state, records, "delta segment", false)?;
+        }
+
+        // Recovery: replay WAL operations newer than everything durable.
         let records = Wal::replay(path, state.seq)?;
+        Self::apply_records(&mut state, records, "wal", true)?;
+        rebuild_ivf(&mut state)?;
+
+        Ok(VaultEngine {
+            path: path.to_path_buf(),
+            state: RwLock::new(state),
+            _lock_file: lock_file,
+        })
+    }
+
+    /// Apply WAL-shaped records (from the WAL or a durable delta segment) to
+    /// `state` in order, advancing `state.seq`. `mark_dirty` is true for WAL
+    /// replay (those records still need folding into a snapshot) and false for
+    /// delta segments (already durable). A record that fails to apply means a
+    /// committed batch is corrupt — surfaced as an explicit error.
+    fn apply_records(
+        state: &mut State,
+        records: Vec<WalRecord>,
+        source: &str,
+        mark_dirty: bool,
+    ) -> Result<()> {
         for record in records {
             let seq = record.seq;
             match record.op {
@@ -568,12 +641,8 @@ impl VaultEngine {
                     dim,
                     sparse,
                 } => {
-                    // Records in the WAL passed prepared-write validation
-                    // before being appended; a failure here means the
-                    // committed batch is corrupt — fail clearly instead of
-                    // opening with partial state.
                     Self::apply_upsert_with_sparse(
-                        &mut state,
+                        state,
                         document,
                         chunks,
                         &record.payload,
@@ -582,25 +651,21 @@ impl VaultEngine {
                     )
                     .map_err(|e| {
                         Error::corrupt(
-                            "wal",
+                            source,
                             format!("committed batch seq {seq} failed to apply: {e}"),
                         )
                     })?;
                 }
                 WalOp::DeleteDocument { document_id } => {
-                    Self::apply_delete(&mut state, &document_id);
+                    Self::apply_delete(state, &document_id);
                 }
             }
             state.seq = seq;
-            state.dirty = true;
+            if mark_dirty {
+                state.dirty = true;
+            }
         }
-        rebuild_ivf(&mut state)?;
-
-        Ok(VaultEngine {
-            path: path.to_path_buf(),
-            state: RwLock::new(state),
-            _lock_file: lock_file,
-        })
+        Ok(())
     }
 
     /// Upsert (insert or atomically replace) a document with its chunks and
@@ -1177,9 +1242,17 @@ impl VaultEngine {
             .unwrap_or_default()
     }
 
-    /// Persist a snapshot generation and truncate the WAL. Also retrains
-    /// the IVF acceleration structure when configured (it is not persisted;
-    /// reopen rebuilds it).
+    /// Maximum delta segments layered on a base before a flush rewrites the
+    /// base instead of appending another delta (storage v2, ADR 0016). Keeps
+    /// reopen cost bounded while making the common flush O(delta).
+    const MAX_DELTA_SEGMENTS: usize = 16;
+
+    /// Persist durably and truncate the WAL. When a base already exists and
+    /// the delta count is under [`Self::MAX_DELTA_SEGMENTS`], this appends an
+    /// O(delta) binary delta segment (the ops since the last durable point)
+    /// instead of rewriting the whole base; otherwise it rewrites the base.
+    /// Also retrains the IVF acceleration structure when configured (it is not
+    /// persisted; reopen rebuilds it).
     pub fn flush(&self) -> Result<()> {
         let mut state = self.state.write();
         if !state.dirty {
@@ -1187,6 +1260,42 @@ impl VaultEngine {
         }
         rebuild_ivf(&mut state)?;
         state.wal.sync()?;
+
+        let can_delta = state.generation > 0 && state.segment_count < Self::MAX_DELTA_SEGMENTS;
+        if can_delta {
+            // Delta path: the WAL currently holds exactly the ops since the
+            // last durable point (it is truncated on every flush). Persist
+            // them as an immutable binary delta segment.
+            let records = Wal::replay(&self.path, state.base_seq)?;
+            if records.is_empty() {
+                // Nothing beyond the base is uncaptured; make the WAL match.
+                state.wal.truncate()?;
+                state.dirty = false;
+                return Ok(());
+            }
+            let seq_lo = records.first().map(|r| r.seq).unwrap_or(state.base_seq);
+            let seq_hi = records.last().map(|r| r.seq).unwrap_or(state.seq);
+            let mut encoded = Vec::with_capacity(records.len());
+            for record in &records {
+                encoded.push(serde_json::to_vec(record)?);
+            }
+            let manifest = snapshot::load_manifest(&self.path)?.ok_or_else(|| {
+                Error::corrupt("manifest", "base generation vanished before delta flush")
+            })?;
+            snapshot::publish_delta(&self.path, &manifest, &encoded, seq_lo, seq_hi)?;
+            state.wal.truncate()?;
+            state.segment_count += 1;
+            state.dirty = false;
+            Ok(())
+        } else {
+            self.write_full_base(&mut state)
+        }
+    }
+
+    /// Rewrite the full base generation, collapsing any delta segments, and
+    /// truncate the WAL. Used on the first flush, when the delta budget is
+    /// exhausted, and by [`Self::compact`].
+    fn write_full_base(&self, state: &mut State) -> Result<()> {
         let generation = state.generation + 1;
         let persisted = PersistedStateV1 {
             documents: state.documents.values().cloned().collect(),
@@ -1212,70 +1321,137 @@ impl VaultEngine {
         )?;
         state.wal.truncate()?;
         state.generation = generation;
+        state.base_seq = state.seq;
+        state.segment_count = 0;
         state.dirty = false;
         Ok(())
     }
 
-    /// Rebuild arenas and indexes without tombstones, then flush.
-    /// Synchronous and deterministic (v0.1 — background compaction is
-    /// planned).
+    /// Rebuild arenas and indexes without tombstones, then persist a fresh
+    /// full base (collapsing any delta segments).
+    ///
+    /// Read-safe and read-friendly (ADR 0016 acceptance #4): the expensive
+    /// rebuild runs on a snapshot taken under a short read lock, so
+    /// concurrent readers keep searching throughout it. The write lock is
+    /// held only for the final swap + durable publish. If a write lands
+    /// while the rebuild runs, the stale result is discarded and rebuilt
+    /// (bounded retries), then as a last resort the rebuild happens under
+    /// the write lock — always correct, briefly blocking.
     pub fn compact(&self) -> Result<()> {
-        {
-            let mut state = self.state.write();
-            let config = state.config.clone();
-            let mut arena = VectorArena::new(config.dim, config.metric);
-            let mut hnsw = Hnsw::new(config.hnsw.clone());
-            let mut bm25 = Bm25Index::new(config.bm25.clone());
-            let mut sq8 = if state.sq8.is_some() {
-                Some(Sq8Arena::new(config.dim, config.metric)?)
-            } else {
-                None
+        for _ in 0..2 {
+            let snap = {
+                let state = self.state.read();
+                Self::snapshot_for_compaction(&state)
             };
-            let mut chunks: Vec<Option<StoredChunk>> = Vec::new();
-            let mut chunk_ids = HashMap::new();
-            let mut doc_rows: HashMap<String, Vec<u32>> = HashMap::new();
-            let mut row_map: HashMap<u32, u32> = HashMap::new();
-            let mut meta_index = MetaIndex::default();
-
-            let mut live_rows: Vec<u32> = (0..state.chunks.len() as u32)
-                .filter(|&r| !state.arena.is_deleted(r) && state.chunks[r as usize].is_some())
-                .collect();
-            live_rows.sort();
-            for old_row in live_rows {
-                let sc = state.chunks[old_row as usize].as_ref().expect("live row");
-                let vector = state.arena.get(old_row).to_vec();
-                let new_row = arena.push(&vector)?;
-                if let Some(q) = sq8.as_mut() {
-                    q.push(arena.get(new_row))?;
-                } else {
-                    hnsw.insert(&arena, new_row);
-                }
-                bm25.add(new_row, &sc.chunk.text);
-                row_map.insert(old_row, new_row);
-                meta_index.add_row(new_row, &sc.eff_metadata);
-                chunk_ids.insert(sc.chunk.chunk_id.clone(), new_row);
-                doc_rows
-                    .entry(sc.chunk.document_id.clone())
-                    .or_default()
-                    .push(new_row);
-                chunks.push(Some(StoredChunk {
-                    chunk: sc.chunk.clone(),
-                    eff_metadata: sc.eff_metadata.clone(),
-                }));
+            let seq = snap.seq;
+            let parts = Self::build_compacted(snap)?;
+            let mut state = self.state.write();
+            if state.seq == seq {
+                return self.install_and_publish(&mut state, parts);
             }
-            state.sparse = state.sparse.remap(&row_map, arena.len() as u32);
-            state.meta_index = meta_index;
-            state.arena = arena;
-            state.sq8 = sq8;
-            state.hnsw = hnsw;
-            state.bm25 = bm25;
-            state.chunks = chunks;
-            state.chunk_ids = chunk_ids;
-            state.doc_rows = doc_rows;
-            rebuild_ivf(&mut state)?;
-            state.dirty = true;
+            // A concurrent write invalidated the snapshot: retry off-lock.
         }
-        self.flush()
+        // Writes keep interleaving; rebuild under the write lock (previous
+        // synchronous behavior — always correct).
+        let mut state = self.state.write();
+        let snap = Self::snapshot_for_compaction(&state);
+        let parts = Self::build_compacted(snap)?;
+        self.install_and_publish(&mut state, parts)
+    }
+
+    /// Clone everything the compaction rebuild needs (live rows in ascending
+    /// old-row order, with their vectors), so the rebuild can run without any
+    /// lock. Cost is one pass over live data — the same copy the rebuild made
+    /// under the write lock before.
+    fn snapshot_for_compaction(state: &State) -> CompactionSnapshot {
+        // Single ascending pass keeps old-row ids and their data aligned.
+        let mut live: Vec<(u32, StoredChunk, Vec<f32>)> = Vec::new();
+        for row in 0..state.chunks.len() as u32 {
+            if state.arena.is_deleted(row) {
+                continue;
+            }
+            if let Some(sc) = &state.chunks[row as usize] {
+                live.push((row, sc.clone(), state.arena.get(row).to_vec()));
+            }
+        }
+        CompactionSnapshot {
+            config: state.config.clone(),
+            has_sq8: state.sq8.is_some(),
+            sparse: state.sparse.clone(),
+            live,
+            seq: state.seq,
+        }
+    }
+
+    /// Pure rebuild from a snapshot: no locks, no I/O. Deterministic — rows
+    /// are re-assigned in ascending old-row order (the documented tie-break
+    /// rule of the differential suite).
+    fn build_compacted(snap: CompactionSnapshot) -> Result<CompactedParts> {
+        let config = &snap.config;
+        let mut arena = VectorArena::new(config.dim, config.metric);
+        let mut hnsw = Hnsw::new(config.hnsw.clone());
+        let mut bm25 = Bm25Index::new(config.bm25.clone());
+        let mut sq8 = if snap.has_sq8 {
+            Some(Sq8Arena::new(config.dim, config.metric)?)
+        } else {
+            None
+        };
+        let mut chunks: Vec<Option<StoredChunk>> = Vec::new();
+        let mut chunk_ids = HashMap::new();
+        let mut doc_rows: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut row_map: HashMap<u32, u32> = HashMap::new();
+        let mut meta_index = MetaIndex::default();
+
+        for (old_row, sc, vector) in &snap.live {
+            let new_row = arena.push(vector)?;
+            if let Some(q) = sq8.as_mut() {
+                q.push(arena.get(new_row))?;
+            } else {
+                hnsw.insert(&arena, new_row);
+            }
+            bm25.add(new_row, &sc.chunk.text);
+            row_map.insert(*old_row, new_row);
+            meta_index.add_row(new_row, &sc.eff_metadata);
+            chunk_ids.insert(sc.chunk.chunk_id.clone(), new_row);
+            doc_rows
+                .entry(sc.chunk.document_id.clone())
+                .or_default()
+                .push(new_row);
+            chunks.push(Some(sc.clone()));
+        }
+        let sparse = snap.sparse.remap(&row_map, arena.len() as u32);
+        Ok(CompactedParts {
+            arena,
+            sq8,
+            hnsw,
+            bm25,
+            chunks,
+            chunk_ids,
+            doc_rows,
+            meta_index,
+            sparse,
+        })
+    }
+
+    /// Swap the compacted structures in and persist a full base. Caller holds
+    /// the write lock and has verified the snapshot is still current.
+    fn install_and_publish(&self, state: &mut State, parts: CompactedParts) -> Result<()> {
+        state.sparse = parts.sparse;
+        state.meta_index = parts.meta_index;
+        state.arena = parts.arena;
+        state.sq8 = parts.sq8;
+        state.hnsw = parts.hnsw;
+        state.bm25 = parts.bm25;
+        state.chunks = parts.chunks;
+        state.chunk_ids = parts.chunk_ids;
+        state.doc_rows = parts.doc_rows;
+        rebuild_ivf(state)?;
+        state.dirty = true;
+        // Compaction rewrote every row: the base must be rewritten in full
+        // (a delta segment would reference the old row numbering). This also
+        // collapses any existing delta segments.
+        state.wal.sync()?;
+        self.write_full_base(state)
     }
 
     pub fn stats(&self) -> serde_json::Value {
@@ -2442,7 +2618,7 @@ mod tests {
             .find(|e| e.file_name().to_string_lossy().starts_with("gen-"))
             .unwrap()
             .path();
-        let state_path = gen_dir.join("state.json");
+        let state_path = gen_dir.join("state.rvseg");
         let mut bytes = std::fs::read(&state_path).unwrap();
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0xFF;
@@ -2452,6 +2628,470 @@ mod tests {
         assert!(
             matches!(result, Err(Error::Corrupt { .. })),
             "corruption must surface as an explicit error"
+        );
+    }
+
+    #[test]
+    fn v2_flush_writes_binary_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+            engine
+                .upsert_document(
+                    doc("a", json!({})),
+                    vec![chunk("a", 0, "content")],
+                    &unit_vec(4, 0),
+                    None,
+                )
+                .unwrap();
+            engine.flush().unwrap();
+        }
+        let manifest = snapshot::load_manifest(dir.path()).unwrap().unwrap();
+        assert_eq!(manifest.format_version, 2, "flush must write v2");
+        let gen_dir = dir.path().join(format!("gen-{}", manifest.generation));
+        assert!(gen_dir.join("state.rvseg").exists(), "binary base segment");
+        assert!(!gen_dir.join("state.json").exists(), "no legacy json");
+    }
+
+    #[test]
+    fn v1_vault_migrates_to_v2_on_reopen_and_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        // 1. Build a real v2 vault.
+        {
+            let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+            engine
+                .upsert_document(
+                    doc("a", json!({})),
+                    vec![chunk("a", 0, "legacy content")],
+                    &unit_vec(4, 0),
+                    None,
+                )
+                .unwrap();
+            engine.flush().unwrap();
+        }
+        // 2. Downgrade it on disk to the v1 JSON layout: extract the state blob
+        //    from the binary segment, write it as state.json, drop the segment,
+        //    and rewrite the manifest as format_version = 1.
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("manifest.json")).unwrap())
+                .unwrap();
+        let generation = manifest["generation"].as_u64().unwrap();
+        let gen_dir = dir.path().join(format!("gen-{generation}"));
+        let seg_bytes = std::fs::read(gen_dir.join("state.rvseg")).unwrap();
+        let blob = crate::segment::decode(&seg_bytes, "state.rvseg")
+            .unwrap()
+            .remove(0);
+        std::fs::write(gen_dir.join("state.json"), &blob).unwrap();
+        std::fs::remove_file(gen_dir.join("state.rvseg")).unwrap();
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&blob);
+        let mut files = manifest["files"].as_object().unwrap().clone();
+        files.remove(&format!("gen-{generation}/state.rvseg"));
+        files.insert(
+            format!("gen-{generation}/state.json"),
+            serde_json::json!({ "len": blob.len(), "crc32": crc.finalize() }),
+        );
+        let mut m = manifest.clone();
+        m["format_version"] = serde_json::json!(1);
+        m["files"] = serde_json::Value::Object(files);
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_vec_pretty(&m).unwrap(),
+        )
+        .unwrap();
+
+        // 3. Reopen: the v1 vault loads, search still works.
+        {
+            let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+            let hits = engine
+                .search(&SearchRequest {
+                    vector: Some(unit_vec(4, 0)),
+                    text: Some("legacy content".into()),
+                    sparse: None,
+                    k: 5,
+                    mode: "hybrid".into(),
+                    candidates: None,
+                    filter: None,
+                    ef_search: None,
+                    nprobe: None,
+                    weights: None,
+                })
+                .unwrap()
+                .hits;
+            assert_eq!(hits.len(), 1, "v1 data must be readable after migration");
+            // 4. A write + flush lands the manifest at v2 (delta path: a v1
+            //    base may keep its state.json while v2 delta segments layer on
+            //    top). Data stays correct across reopen.
+            engine
+                .upsert_document(
+                    doc("b", json!({})),
+                    vec![chunk("b", 0, "new content")],
+                    &unit_vec(4, 1),
+                    None,
+                )
+                .unwrap();
+            engine.flush().unwrap();
+        }
+        {
+            // Reopen through the v1-base + v2-delta layering: both docs present.
+            let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+            assert!(engine.get_document("a").is_some(), "base doc survives");
+            assert!(engine.get_document("b").is_some(), "delta doc survives");
+            // 5. Compaction converges the base to a full v2 binary segment.
+            engine.compact().unwrap();
+        }
+        let migrated = snapshot::load_manifest(dir.path()).unwrap().unwrap();
+        assert_eq!(migrated.format_version, 2, "vault is v2");
+        assert!(migrated.segments.is_empty(), "compaction collapses deltas");
+        let gen_dir = dir.path().join(format!("gen-{}", migrated.generation));
+        assert!(gen_dir.join("state.rvseg").exists(), "base migrated to v2");
+        assert!(!gen_dir.join("state.json").exists());
+    }
+
+    #[test]
+    fn readers_keep_searching_during_compaction() {
+        // ADR 0016 acceptance #4: the compaction rebuild runs off-lock, so
+        // concurrent readers are never starved and always observe a
+        // consistent state (either fully pre- or fully post-compaction).
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        // Exact Flat search: identical results across compaction are only
+        // guaranteed for exact backends (an HNSW graph rebuilt without
+        // tombstone bridge nodes may legitimately differ on the margin).
+        let mut cfg = config(8);
+        cfg.flat_threshold = 1_000_000;
+        let engine = VaultEngine::open(dir.path(), cfg).unwrap();
+        for i in 0..300 {
+            let id = format!("d{i}");
+            engine
+                .upsert_document(
+                    doc(&id, json!({})),
+                    vec![chunk(&id, 0, &format!("subject {} content", i % 9))],
+                    &unit_vec(8, i % 8),
+                    None,
+                )
+                .unwrap();
+        }
+        // Tombstones so compaction has real work.
+        for i in (0..300).step_by(3) {
+            engine.delete_document(&format!("d{i}")).unwrap();
+        }
+        engine.flush().unwrap();
+
+        let request = SearchRequest {
+            vector: Some(unit_vec(8, 1)),
+            text: Some("subject 1 content".into()),
+            sparse: None,
+            k: 5,
+            mode: "hybrid".into(),
+            candidates: None,
+            filter: None,
+            ef_search: None,
+            nprobe: None,
+            weights: None,
+        };
+        let expected: Vec<(String, u32)> = engine
+            .search(&request)
+            .unwrap()
+            .hits
+            .iter()
+            .map(|h| (h.chunk_id.clone(), 0))
+            .collect();
+
+        let done = AtomicBool::new(false);
+        let reads = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    while !done.load(Ordering::Relaxed) {
+                        let out = engine.search(&request).expect("read during compaction");
+                        assert!(!out.hits.is_empty(), "reader saw empty state");
+                        reads.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+            s.spawn(|| {
+                engine.compact().unwrap();
+                done.store(true, Ordering::Relaxed);
+            });
+        });
+        assert!(reads.load(Ordering::Relaxed) > 0, "readers must have run");
+        // Post-compaction results identical (chunk ids stable across compact).
+        let after: Vec<(String, u32)> = engine
+            .search(&request)
+            .unwrap()
+            .hits
+            .iter()
+            .map(|h| (h.chunk_id.clone(), 0))
+            .collect();
+        assert_eq!(expected, after, "compaction changed observable results");
+    }
+
+    #[test]
+    fn concurrent_write_during_compaction_is_preserved() {
+        // Whatever the interleaving (write before the snapshot, during the
+        // rebuild — triggering retry/fallback — or after the swap), no
+        // acknowledged write may be lost and the vault must reopen cleanly.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = VaultEngine::open(dir.path(), config(8)).unwrap();
+        for i in 0..200 {
+            let id = format!("d{i}");
+            engine
+                .upsert_document(
+                    doc(&id, json!({})),
+                    vec![chunk(&id, 0, "existing content")],
+                    &unit_vec(8, i % 8),
+                    None,
+                )
+                .unwrap();
+        }
+        engine.flush().unwrap();
+
+        std::thread::scope(|s| {
+            s.spawn(|| engine.compact().unwrap());
+            s.spawn(|| {
+                for i in 0..20 {
+                    let id = format!("mid{i}");
+                    engine
+                        .upsert_document(
+                            doc(&id, json!({})),
+                            vec![chunk(&id, 0, "written during compaction")],
+                            &unit_vec(8, i % 8),
+                            None,
+                        )
+                        .unwrap();
+                }
+            });
+        });
+
+        for i in 0..20 {
+            assert!(
+                engine.get_document(&format!("mid{i}")).is_some(),
+                "acknowledged write mid{i} lost after compaction"
+            );
+        }
+        assert!(engine.get_document("d0").is_some());
+        drop(engine);
+        let engine = VaultEngine::open(dir.path(), config(8)).unwrap();
+        for i in 0..20 {
+            assert!(
+                engine.get_document(&format!("mid{i}")).is_some(),
+                "acknowledged write mid{i} lost after reopen"
+            );
+        }
+    }
+
+    #[test]
+    fn delta_flush_accumulates_segments_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+            engine
+                .upsert_document(
+                    doc("a", json!({})),
+                    vec![chunk("a", 0, "alpha")],
+                    &unit_vec(4, 0),
+                    None,
+                )
+                .unwrap();
+            engine.flush().unwrap(); // full base (gen 0 -> 1)
+            for (i, id) in ["b", "c"].iter().enumerate() {
+                engine
+                    .upsert_document(
+                        doc(id, json!({})),
+                        vec![chunk(id, 0, "content")],
+                        &unit_vec(4, i + 1),
+                        None,
+                    )
+                    .unwrap();
+                engine.flush().unwrap(); // delta segments
+            }
+        }
+        let m = snapshot::load_manifest(dir.path()).unwrap().unwrap();
+        assert_eq!(m.segments.len(), 2, "two delta flushes after the base");
+        assert_eq!(m.generation, 1, "deltas do not rewrite the base");
+        // Reopen reconstructs base + deltas + (empty) WAL.
+        let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+        for id in ["a", "b", "c"] {
+            assert!(
+                engine.get_document(id).is_some(),
+                "{id} must survive a multi-segment reopen"
+            );
+        }
+    }
+
+    #[test]
+    fn delta_tombstone_and_replace_shadow_base() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+            engine
+                .upsert_document(
+                    doc("keep", json!({})),
+                    vec![chunk("keep", 0, "keep me")],
+                    &unit_vec(4, 0),
+                    None,
+                )
+                .unwrap();
+            engine
+                .upsert_document(
+                    doc("drop", json!({})),
+                    vec![chunk("drop", 0, "drop me")],
+                    &unit_vec(4, 1),
+                    None,
+                )
+                .unwrap();
+            engine.flush().unwrap(); // full base with both docs
+            engine.delete_document("drop").unwrap();
+            engine
+                .upsert_document(
+                    doc("keep", json!({})),
+                    vec![chunk("keep", 0, "keep me v2")],
+                    &unit_vec(4, 2),
+                    None,
+                )
+                .unwrap();
+            engine.flush().unwrap(); // delta: delete + replace
+        }
+        let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+        assert!(
+            engine.get_document("drop").is_none(),
+            "a delete in a delta must shadow the base doc"
+        );
+        let chunks = engine.get_document_chunks("keep");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].text, "keep me v2",
+            "a replace in a delta must shadow the base version"
+        );
+    }
+
+    #[test]
+    fn delta_budget_exhaustion_rewrites_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+        engine
+            .upsert_document(
+                doc("d0", json!({})),
+                vec![chunk("d0", 0, "x")],
+                &unit_vec(4, 0),
+                None,
+            )
+            .unwrap();
+        engine.flush().unwrap(); // full base
+        let base_gen = snapshot::load_manifest(dir.path())
+            .unwrap()
+            .unwrap()
+            .generation;
+        for i in 1..=VaultEngine::MAX_DELTA_SEGMENTS {
+            let id = format!("d{i}");
+            engine
+                .upsert_document(
+                    doc(&id, json!({})),
+                    vec![chunk(&id, 0, "x")],
+                    &unit_vec(4, i % 4),
+                    None,
+                )
+                .unwrap();
+            engine.flush().unwrap();
+        }
+        let m = snapshot::load_manifest(dir.path()).unwrap().unwrap();
+        assert_eq!(m.segments.len(), VaultEngine::MAX_DELTA_SEGMENTS);
+        assert_eq!(m.generation, base_gen, "deltas do not bump the generation");
+        // The next flush exhausts the budget and rewrites a full base.
+        engine
+            .upsert_document(
+                doc("final", json!({})),
+                vec![chunk("final", 0, "x")],
+                &unit_vec(4, 0),
+                None,
+            )
+            .unwrap();
+        engine.flush().unwrap();
+        let m2 = snapshot::load_manifest(dir.path()).unwrap().unwrap();
+        assert!(m2.segments.is_empty(), "budget exhaustion collapses deltas");
+        assert_eq!(m2.generation, base_gen + 1, "base is rewritten");
+        drop(engine);
+        let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+        assert!(engine.get_document("final").is_some());
+        assert!(engine.get_document("d0").is_some());
+    }
+
+    #[test]
+    fn orphan_delta_segment_is_ignored_on_reopen() {
+        // A delta segment file on disk that the manifest does not reference
+        // (crash between segment fsync and manifest rename) must be ignored;
+        // reopen stays at the last durable state.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+            engine
+                .upsert_document(
+                    doc("a", json!({})),
+                    vec![chunk("a", 0, "alpha")],
+                    &unit_vec(4, 0),
+                    None,
+                )
+                .unwrap();
+            engine.flush().unwrap();
+            engine
+                .upsert_document(
+                    doc("b", json!({})),
+                    vec![chunk("b", 0, "bravo")],
+                    &unit_vec(4, 1),
+                    None,
+                )
+                .unwrap();
+            engine.flush().unwrap();
+        }
+        // Orphan segment with garbage: not in the manifest, must be untouched.
+        let orphan = dir.path().join("seg-999999.rvseg");
+        let mut w = crate::segment::SegmentWriter::create(&orphan).unwrap();
+        w.append(b"not a wal record").unwrap();
+        w.finish().unwrap();
+        let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+        assert!(engine.get_document("a").is_some());
+        assert!(engine.get_document("b").is_some());
+    }
+
+    #[test]
+    fn corrupt_delta_segment_is_detected_not_silently_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+            engine
+                .upsert_document(
+                    doc("a", json!({})),
+                    vec![chunk("a", 0, "alpha")],
+                    &unit_vec(4, 0),
+                    None,
+                )
+                .unwrap();
+            engine.flush().unwrap();
+            engine
+                .upsert_document(
+                    doc("b", json!({})),
+                    vec![chunk("b", 0, "bravo")],
+                    &unit_vec(4, 1),
+                    None,
+                )
+                .unwrap();
+            engine.flush().unwrap(); // delta
+        }
+        let m = snapshot::load_manifest(dir.path()).unwrap().unwrap();
+        let seg = m.segments.last().unwrap();
+        let path = dir.path().join(&seg.file);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            matches!(
+                VaultEngine::open(dir.path(), config(4)),
+                Err(Error::Corrupt { .. })
+            ),
+            "a corrupt delta segment must surface as an explicit error"
         );
     }
 

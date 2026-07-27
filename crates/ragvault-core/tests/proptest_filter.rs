@@ -38,6 +38,10 @@ proptest! {
     /// De Morgan-ish sanity: not(f) is the complement of f on any metadata.
     #[test]
     fn not_is_complement(field in "[a-z]{1,4}", needle in "[a-z]{0,4}", metadata in arb_json()) {
+        // A bare key that is a logical operator (and/or/not) is parsed as that
+        // operator, not a field predicate — skip those, this property is about
+        // field-equality vs its negation.
+        prop_assume!(!matches!(field.as_str(), "and" | "or" | "not"));
         let f = Filter::parse(&json!({ field.clone(): needle.clone() })).unwrap();
         let nf = Filter::parse(&json!({ "$not": { field: needle } })).unwrap();
         prop_assert_ne!(f.matches(&metadata), nf.matches(&metadata));
@@ -46,6 +50,7 @@ proptest! {
     /// eq and in([x]) agree everywhere.
     #[test]
     fn eq_equals_singleton_in(field in "[a-z]{1,4}", needle in -50i32..50, metadata in arb_json()) {
+        prop_assume!(!matches!(field.as_str(), "and" | "or" | "not"));
         let eq = Filter::parse(&json!({ field.clone(): needle })).unwrap();
         let inn = Filter::parse(&json!({ field: { "in": [needle] } })).unwrap();
         prop_assert_eq!(eq.matches(&metadata), inn.matches(&metadata));
