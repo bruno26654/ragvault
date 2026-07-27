@@ -6,6 +6,16 @@ still explicitly out of scope. Nothing here authorizes publishing: **no PyPI
 upload and no public GitHub release happens without an explicit human
 decision.**
 
+> **Status — 1.0.0-rc1 (main `22e880d`, 2026-07-27):** every Section 2 gate is
+> green: fmt/clippy clean; 122 Rust + 89 Python tests; real integration
+> roundtrips at pinned versions; wheels built for all four platforms with
+> clean-venv install smoke (plus a local re-run of wheel/CLI/compaction
+> smokes on this tree). Versions: Rust `1.0.0-rc1` / Python `1.0.0rc1`.
+> Externally pending (not code gates): semantic eval rows (network policy
+> denies huggingface.co — see benchmarks/RESULTS-RAG.md for the exact
+> reproduction command) and real-GPU validation (docs/GPU.md). The
+> `v1.0.0-rc1` tag and any publication remain manual steps per §6.
+
 ## 1. Supported scope for v1.0
 
 - **Target:** single-node, CPU. Local-first, embedded (no server).

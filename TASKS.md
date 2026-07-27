@@ -3,19 +3,20 @@
 Rastreabilidade de requisitos → implementação → evidência. Estados:
 `not-started | in-progress | blocked | implemented | under-review | validated | experimental | deferred`
 
-> **Auditoria (hardening, HEAD 221ef7e):** baseline real re-executado —
-> fmt/clippy limpos; testes Rust (unit/lib + differential + proptest) e 87
-> Python verdes (6 skipped: roundtrips de framework sem a lib + teste `gpu`).
-> **P0 de atomicidade foi encontrado, reproduzido e corrigido** (5aec3b9):
-> até então o Gate A estava superestimado — escrita rejeitada podia deixar
-> mutação parcial e WAL envenenado. Com o fix + suíte diferencial (04dc12a)
-> + identidade de ingestão por bytes e presets honestos (5d996c7), context v2
-> (dd1ce16), eval texto real (ae8fe9f), filtros tipados (3b7fddf), batch
-> nativo (cd95482) e CI multiplataforma + integrações reais (221ef7e), os
-> Gates A–D estão `validated` com evidência nova. **Restam apenas itens de
-> performance/formato:** profiling HNSW e storage v2 segmentado (ver rodapé).
-> Limitações do ambiente: CUDA/cuVS e a *execução* de wheels não-Linux não são
-> validáveis aqui — a matriz de CI existe e roda nos runners.
+> **Auditoria final (1.0.0-rc1, main 22e880d):** gates re-executados —
+> fmt/clippy limpos; **122 testes Rust** (unit/lib + differential multi-segmento
+> + proptest) e **89 Python** verdes (6 skipped: roundtrips de framework sem a
+> lib local + teste `gpu`; os roundtrips rodam no job `integrations` do CI com
+> versões fixadas). Matriz completa de CI verde na main: rust, py 3.9/3.11/3.12,
+> integrações reais, wheels Linux x86-64/aarch64 + macOS arm64 + Windows x86-64
+> com smoke de clean-install. Histórico do hardening: P0 de atomicidade
+> reproduzido e corrigido (5aec3b9), suíte diferencial (04dc12a), identidade
+> por raw-bytes + presets honestos (5d996c7), context v2 (dd1ce16), eval texto
+> real (ae8fe9f), filtros tipados (3b7fddf), batch nativo (cd95482), HNSW
+> `VisitedSet` geracional comprovado (RESULTS-HNSW.md), correções Windows,
+> **storage v2 completo (ADR 0016)** e compactação read-friendly. Gates A–D
+> `validated`. **Nenhum P0/P1/P2 arquitetural aberto.** Pendências externas:
+> eval semântico (rede nega huggingface.co) e GPU real (sem hardware).
 
 ## Gate A — Fundação confiável (VALIDATED)
 

@@ -149,7 +149,10 @@ tenant_kb.retrieve(...)   # filtro de tenant aplicado a toda query
 | MaxSim reranking (`ragvault.maxsim_reranker`) | implemented |
 | `Database` multi-coleção | implemented |
 | GPU CAGRA sidecar (`ragvault.gpu`) | experimental — implementado com testes de plumbing; **não validado em GPU real** (runbook: docs/GPU.md) |
-| Integrações LlamaIndex/Haystack/DSPy | implemented (untested: requerem as libs; erro acionável sem elas) |
+| Integrações LlamaIndex/Haystack/DSPy | implemented — roundtrips reais testados no CI com versões fixadas (job `integrations`) |
+| Storage v2: base binária segmentada + flush O(delta) + compactação read-friendly (ADR 0016) | implemented — CRC por registro/stream, migração v1→v2 transparente, leitores não bloqueiam durante a compactação |
+| Filtros tipados de metadados (posting lists + ranges) | implemented — até 484× em seletividade 0.1% (benchmarks/RESULTS-FILTERS.md) |
+| Batch nativo (`kb.retrieve_many`, GIL liberado, paralelo por query) | implemented |
 | Wheels multiplataforma no PyPI | planned (CI configurado para Linux) |
 
 Detalhes de arquitetura interna (segmentos, HNSW, WAL): [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Limitações conhecidas: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
