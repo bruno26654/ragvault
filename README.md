@@ -45,7 +45,7 @@ A maioria dos projetos RAG monta manualmente: parser + chunker + embeddings + ve
 pip install ragvault
 ```
 
-> **Estado atual (0.1):** wheels pré-compiladas ainda não estão publicadas no PyPI; instale a partir do código-fonte com `maturin` (veja [Desenvolvimento](#desenvolvimento)). O pacote CPU não depende de CUDA.
+> **Estado atual (1.0.0-rc1):** release candidate CPU single-node. Wheels são construídas e testadas no CI para Linux x86-64/aarch64, macOS Apple Silicon e Windows x86-64, mas ainda não estão publicadas no PyPI; instale a partir do código-fonte com `maturin` (veja [Desenvolvimento](#desenvolvimento)) ou baixe os artefatos do CI. O pacote CPU não depende de CUDA.
 
 Extras opcionais:
 

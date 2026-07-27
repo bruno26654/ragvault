@@ -38,7 +38,18 @@ from .kb import Answer, KnowledgeBase, SyncReport, open_kb as open  # noqa: A001
 from .rerankers import maxsim_reranker, maxsim_score
 from .parsers import ParsedDocument, parse_file, register_parser
 
-__version__ = _native_version
+# Prefer the installed distribution's version (always matches the wheel's
+# pip metadata, e.g. "1.0.0rc1"); fall back to the native crate version for
+# source/editable layouts where no distribution metadata exists.
+try:  # pragma: no cover - depends on install layout
+    from importlib.metadata import PackageNotFoundError, version as _dist_version
+
+    try:
+        __version__ = _dist_version("ragvault")
+    except PackageNotFoundError:
+        __version__ = _native_version
+except ImportError:  # pragma: no cover - python < 3.8 never reaches here
+    __version__ = _native_version
 
 __all__ = [
     "open",

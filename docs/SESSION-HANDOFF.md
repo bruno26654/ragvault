@@ -3,11 +3,11 @@
 Atualizado ao final de cada sessão de trabalho (disciplina de continuidade).
 
 ```
-branch:        claude/ragvault-python-library-xeltxs (rebased em main pós-PR#3)
-main:          7426e3c (merge da PR #3 — hardening P0/P1+P2 completo)
-último commit: storage v2 completo (ADR 0016) — ver git log; todos pushed
-PR:            #1/#2/#3 mergeadas; PR #4 (storage v2) aberta para main,
-               CI verde nas 4 plataformas. Merge pendente de autorização humana.
+branch:        claude/ragvault-python-library-xeltxs (reiniciada em main pós-PR#4)
+main:          03bd768 (merge da PR #4 — storage v2 completo, ADR 0016)
+PR:            #1/#2/#3/#4 mergeadas. Nenhuma PR aberta.
+CI:            matriz completa verde em 5a00b8c (rust, py 3.9/3.11/3.12,
+               integrations fixadas, wheels 4 plataformas com smoke).
 ```
 
 ## Baseline auditado (neste hardware: CPU, sem GPU)
@@ -43,8 +43,7 @@ CI multiplataforma + integrações reais, CHANGELOG + docs/RELEASE.
 
 ## Próximas ações possíveis (nada obrigatório para v1.0)
 
-1. **Merge da PR #4** — aguarda autorização humana explícita.
-2. Release candidate: seguir `docs/RELEASE.md` §6 (bump de versão, tag) —
+1. Release candidate: seguir `docs/RELEASE.md` §6 (bump de versão, tag) —
    **não publicar PyPI/release sem autorização**.
 3. Eval semântico real — requer ambiente com acesso a huggingface.co
    (comando documentado em benchmarks/RESULTS-RAG.md; não inventar números).

@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "ragvault"
-version = "0.1.0"
+version = "1.0.0rc1"
 description = "Python-first, local-first library that turns documents into a high-quality RAG knowledge base: ingestion, hybrid retrieval, context assembly, citations and evaluation in one API."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -12,7 +12,7 @@ requires-python = ">=3.9"
 authors = [{ name = "RagVault contributors" }]
 keywords = ["rag", "retrieval", "vector-search", "knowledge-base", "bm25", "hnsw"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Rust",
