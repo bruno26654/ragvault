@@ -13,6 +13,21 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
 ## [Unreleased]
 
 ### Added
+- **Post-generation semantic validation** — optional `verify=` callback on
+  `ask()` and `ask_multi()`, with `verification_mode` in
+  `report`/`annotate`/`repair`/`strict`. Citation-marker sanitizing already
+  blocked *invented* `[n]`; this catches the harder failures: a citation that
+  exists but does not support its claim, a premise from the user's question
+  presented as documented evidence, and a claim contradicted by the source it
+  cites. Verdicts are `supported`, `unsupported`, `contradicted`, `uncited`,
+  `question_fact` and `inference`. The verifier receives each claim with its
+  citations resolved to real chunk ids, and may return a `replacement`.
+  A verifier that raises, returns `None` or returns the wrong number of
+  verdicts **preserves the original answer** and records the failure; an
+  unknown verdict or mode is an actionable `ConfigurationError` rather than a
+  silent pass. `answer.verification` and `trace["verification"]` carry claim,
+  citations, chunk ids, verdict, rationale, applied action and elapsed time.
+  No provider dependency: the verifier is a plain callable.
 - **Multi-query pipeline for composed questions** — `kb.retrieve_multi()` and
   `kb.ask_multi()` (plus async variants). Optional question decomposition via
   an external LLM callback or manual `subqueries=`, batched execution through

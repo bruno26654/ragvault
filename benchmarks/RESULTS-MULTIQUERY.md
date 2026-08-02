@@ -14,14 +14,14 @@ partial answer to a two-hop question is a wrong answer.
 
 | config | full-recall | recall | precision | MRR | ctx tokens | p50 ms | p95 ms |
 |---|---|---|---|---|---|---|---|
-| single | 0.167 | 0.493 | 0.174 | 0.758 | 196 | 3.50 | 3.75 |
-| multi-manual | 0.875 | 0.951 | 0.340 | 0.889 | 200 | 4.42 | 5.24 |
-| multi-decomposed | 0.333 | 0.618 | 0.215 | 0.585 | 197 | 4.28 | 5.00 |
+| single | 0.167 | 0.493 | 0.174 | 0.758 | 196 | 6.08 | 6.61 |
+| multi-manual | 0.875 | 0.951 | 0.340 | 0.889 | 200 | 7.34 | 9.48 |
+| multi-decomposed | 0.333 | 0.618 | 0.215 | 0.585 | 197 | 6.94 | 7.53 |
 
 ## Reading
 
 - multi-query (committed subqueries) changes full-recall by **+0.708** and recall by **+0.458** vs a single query.
-- latency cost: **1.26x** the single-query p50 for 3 queries — the subqueries run in one batched native call (`search_many`, GIL released), not sequentially.
+- latency cost: **1.21x** the single-query p50 for 3 queries — the subqueries run in one batched native call (`search_many`, GIL released), not sequentially.
 - context tokens sent to the LLM: **1.02x** the baseline (the same global token budget applies; more of it is spent on evidence that is actually needed).
 
 The `multi-decomposed` row uses a deliberately simple offline splitter so

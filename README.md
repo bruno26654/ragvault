@@ -117,6 +117,30 @@ full-recall **0,167 → 0,875**, recall 0,493 → 0,951, a 1,02× dos tokens
 enviados ao LLM. Exemplo completo (com Groq opcional):
 [`examples/multi_query_rag.py`](examples/multi_query_rag.py).
 
+## Validação semântica da resposta (`verify=`)
+
+Citação inventada já é removida automaticamente. O caso difícil é a citação
+que **existe mas não sustenta** a afirmação — ou o fato que veio da pergunta e
+foi apresentado como se um documento dissesse. Um verificador opcional (também
+um callable seu) julga cada afirmação contra a fonte que ela cita:
+
+```python
+answer = kb.ask_multi(
+    question, llm=answer_llm,
+    verify=semantic_verifier,
+    verification_mode="repair",   # report | annotate | repair | strict
+)
+
+print(answer.text)                # afirmações sem suporte já removidas
+print(answer.verification.ok)     # False se algo não se sustenta
+for c in answer.unverified_claims:
+    print(c.verdict, c.claim, "→", c.rationale)
+```
+
+Vereditos: `supported`, `unsupported`, `contradicted`, `uncited`,
+`question_fact`, `inference`. Verificador que falhar **preserva a resposta
+original** e registra o erro — nunca destrói uma resposta válida.
+
 ## Embeddings plugáveis
 
 ```python
@@ -180,6 +204,7 @@ tenant_kb.retrieve(...)   # filtro de tenant aplicado a toda query
 | Storage v2: base binária segmentada + flush O(delta) + compactação read-friendly (ADR 0016) | implemented — CRC por registro/stream, migração v1→v2 transparente, leitores não bloqueiam durante a compactação |
 | Filtros tipados de metadados (posting lists + ranges) | implemented — até 484× em seletividade 0.1% (benchmarks/RESULTS-FILTERS.md) |
 | Batch nativo (`kb.retrieve_many`, GIL liberado, paralelo por query) | implemented |
+| Validação semântica pós-geração (`verify=`, modos report/annotate/repair/strict) | implemented — pega citação que existe mas não sustenta a afirmação, fato da pergunta como evidência e contradição com a fonte |
 | Multi-query (`kb.retrieve_multi` / `kb.ask_multi`): decomposição, Weighted RRF global, cobertura por subconsulta, precedência de versões, citações verificadas | implemented — full-recall 0.167 → 0.875 em perguntas compostas (benchmarks/RESULTS-MULTIQUERY.md) |
 | Wheels multiplataforma no PyPI | planned (CI configurado para Linux) |
 

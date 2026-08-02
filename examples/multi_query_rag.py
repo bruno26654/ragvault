@@ -92,6 +92,35 @@ def offline_llm(prompt: str) -> str:
     return ", and ".join(parts) + "."
 
 
+def offline_verifier(payload):
+    """Deterministic stand-in for an LLM judge.
+
+    Checks each claim's numbers against the block it cites — enough to show
+    the contract without a network call. A real judge (see --groq) reasons
+    semantically instead.
+    """
+    blocks = dict(re.findall(r"^\[(\d+)\][^\n]*\n(.*?)(?=\n\n\[|\n\n#|\Z)",
+                             payload["context"], re.DOTALL | re.MULTILINE))
+    out = []
+    for item in payload["claims"]:
+        claim = item["claim"]
+        if not item["citations"]:
+            out.append({"verdict": "uncited", "rationale": "no [n] marker"})
+            continue
+        cited = " ".join(blocks.get(str(n), "") for n in item["citations"])
+        numbers = set(re.findall(r"\d+", claim))
+        if numbers and not numbers & set(re.findall(r"\d+", cited)):
+            out.append({
+                "verdict": "contradicted",
+                "rationale": (f"claim states {sorted(numbers)} but the cited "
+                              "block does not contain those figures"),
+            })
+        else:
+            out.append({"verdict": "supported",
+                        "rationale": "figures match the cited block"})
+    return out
+
+
 def groq_callables():
     """Real Groq-backed decomposer + answerer (optional dependency)."""
     from groq import Groq  # imported only when --groq is passed
@@ -119,7 +148,29 @@ def groq_callables():
         # back to the single original question.
         return [str(s) for s in json.loads(match.group(0) if match else raw)]
 
-    return decompose, complete
+    def verify(payload):
+        """LLM-as-judge: one verdict per claim, grounded in the context."""
+        claims = "\n".join(
+            f"{i}. {c['claim']}  (cites: {c['citations'] or 'none'})"
+            for i, c in enumerate(payload["claims"], start=1)
+        )
+        prompt = (
+            "You verify whether each claim is supported by the numbered "
+            "context blocks it cites.\n\n"
+            f"# Context\n{payload['context']}\n\n"
+            f"# Question asked by the user\n{payload['question']}\n\n"
+            f"# Claims\n{claims}\n\n"
+            "For each claim reply with one JSON object having 'verdict' "
+            f"(one of {payload['verdicts']}) and 'rationale'. Use "
+            "'question_fact' when the claim merely restates something the "
+            "user asserted in the question, and 'contradicted' when the cited "
+            "block says otherwise. Reply with a JSON array only."
+        )
+        raw = complete(prompt).strip()
+        match = re.search(r"\[.*\]", raw, re.DOTALL)
+        return json.loads(match.group(0) if match else raw)
+
+    return decompose, complete, verify
 
 
 def main() -> None:
@@ -129,9 +180,9 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.groq:
-        decompose, llm = groq_callables()
+        decompose, llm, verify = groq_callables()
     else:
-        decompose, llm = offline_decomposer, offline_llm
+        decompose, llm, verify = offline_decomposer, offline_llm, offline_verifier
 
     with tempfile.TemporaryDirectory() as tmp:
         with ragvault.open(tmp, preset="offline-lite") as kb:
@@ -146,6 +197,8 @@ def main() -> None:
                 filters={"status": "VIGENTE"},   # revoked docs never searched
                 resolve_versions=True,           # precedence among versions
                 citations=True,
+                verify=verify,                   # post-generation validation
+                verification_mode="repair",
                 explain=True,
                 trace=True,
                 k=5,
@@ -171,6 +224,14 @@ def main() -> None:
                     for dropped in conflict["dropped"]:
                         print(f"  {conflict['group']}: kept {kept}, dropped "
                               f"{dropped['document_id']} — {dropped['reason']}")
+
+            report = answer.verification
+            print(f"\nVerification ({report.mode}): ok={report.ok} "
+                  f"{report.counts()} in {report.elapsed_ms:.1f} ms")
+            for claim in report.claims:
+                print(f"  [{claim.verdict}/{claim.action}] {claim.claim}")
+                if claim.rationale:
+                    print(f"      ↳ {claim.rationale}")
 
             print("\nStage timings (ms):", result.trace["stage_ms"])
             print("Documents in context:", result.documents)
