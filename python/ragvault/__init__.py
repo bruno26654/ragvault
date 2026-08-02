@@ -35,6 +35,7 @@ from .errors import (
 from .database import Database, connect
 from .evaluate import EvaluationReport
 from .kb import Answer, KnowledgeBase, SyncReport, open_kb as open  # noqa: A001
+from .multiquery import MultiRetrievalResult
 from .rerankers import maxsim_reranker, maxsim_score
 from .parsers import ParsedDocument, parse_file, register_parser
 
@@ -59,6 +60,7 @@ __all__ = [
     "maxsim_reranker",
     "maxsim_score",
     "RetrievalResult",
+    "MultiRetrievalResult",
     "RetrievedChunk",
     "Citation",
     "Answer",

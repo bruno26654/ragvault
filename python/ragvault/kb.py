@@ -821,6 +821,38 @@ class KnowledgeBase:
     async def aretrieve_many(self, queries: Sequence[str], **kwargs: Any) -> list[RetrievalResult]:
         return await asyncio.gather(*(self.aretrieve(q, **kwargs) for q in queries))
 
+    # -- multi-query -------------------------------------------------------
+
+    def retrieve_multi(self, question: str, **kwargs: Any):
+        """Multi-query retrieval for composed questions.
+
+        Decomposes the question (optional external LLM callback, or manual
+        ``subqueries=[...]``), runs every query through the native batch
+        search, fuses globally with Weighted RRF, optionally resolves
+        document version precedence by metadata, reranks, then assembles one
+        context under a single global token budget. Returns a
+        :class:`~ragvault.multiquery.MultiRetrievalResult` (a RetrievalResult
+        with ``.subqueries`` and ``.conflicts``).
+        """
+        from .multiquery import retrieve_multi
+
+        return retrieve_multi(self, question, **kwargs)
+
+    def ask_multi(self, question: str, *, llm: Callable[[str], str],
+                  **kwargs: Any) -> Answer:
+        """``retrieve_multi`` + a user-provided LLM, with citation integrity:
+        ``[n]`` markers the context does not contain are stripped from the
+        answer, and version conflicts are stated explicitly in the prompt."""
+        from .multiquery import ask_multi
+
+        return ask_multi(self, question, llm=llm, **kwargs)
+
+    async def aretrieve_multi(self, question: str, **kwargs: Any):
+        return await asyncio.to_thread(self.retrieve_multi, question, **kwargs)
+
+    async def aask_multi(self, question: str, **kwargs: Any) -> Answer:
+        return await asyncio.to_thread(self.ask_multi, question, **kwargs)
+
     # -- ask ---------------------------------------------------------------
 
     def ask(

@@ -122,6 +122,29 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 - Wheels multiplataforma — implemented: matriz de CI (`.github/workflows/ci.yml` job `wheels`) constrói Linux x86-64/aarch64, macOS arm64 (macos-14) e Windows x86-64, cada um com smoke de clean-install (`open → add → retrieve`). Execução dos runners não-Linux ocorre no CI, não neste ambiente. Changelog/checklist de release em `CHANGELOG.md` e `docs/RELEASE.md`.
 - `kb.migrate_embeddings` — validated (estratégia blocking com swap atômico e preservação do vault antigo em falha; `TestMigrateEmbeddings`). Estratégias background/copy-on-write — planned.
 
+## Pipeline multi-query (perguntas compostas)
+
+Motivado por falhas reais de uso: perda de recall em perguntas compostas,
+entrada de distratores, citações inconsistentes e rerank caro em CPU.
+
+| Tarefa | Status | Evidência |
+|---|---|---|
+| `retrieve_multi()` / `ask_multi()` (+ `aretrieve_multi`/`aask_multi`) | validated | `TestMultiHopRecall`, `TestAskMulti`; API pública exportada (`MultiRetrievalResult`) |
+| Decomposição por callback externo + subconsultas manuais + fallback seguro | validated | `TestDecomposerFallback` (exceção, `None` e lixo → consulta única, registrado no trace) |
+| Execução em lote via `search_many` (uma chamada nativa, GIL liberado) | validated | `TestCpuPerformance::test_multi_query_stays_within_a_small_factor_of_single` (6 consultas < 6× uma) |
+| Fusão global Weighted RRF + dedup por `chunk_id` | validated | `trace.fusion` com contribuição por ranking; determinístico (desempate por chunk_id) |
+| **Garantia de cobertura por subconsulta** | validated | Defeito real encontrado por benchmark: pool continha 24/24 evidências mas o contexto final só 5/24 — RRF (k0=60) achata rank 1 vs 10 em ~16%, então distratores de consenso raso enterravam a evidência especialista. Tier de reserva corrige: full-recall 0.167 → 0.875 (`TestCoverageGuarantee`, RESULTS-MULTIQUERY.md) |
+| Precedência documental por metadados (status/data/versão/tipo) | validated | `TestVersionPrecedence`; conflitos explícitos em `result.conflicts` + trace + prompt |
+| Filtros obrigatórios (prefilter nativo) e boosts semânticos pós-fusão | validated | `test_mandatory_filter_excludes_revoked_before_search`, `test_boost_prefers_document_type` |
+| Rerank global que não destrói recall + tolerante a falha | validated | `TestRerankSafety` (reranker adversarial que descarta tudo → candidatos recuperados; exceção → ordem fundida mantida) |
+| MMR + Context Builder após a fusão, orçamento **global** de tokens | validated | `test_global_token_budget_is_respected` |
+| Expansão de vizinhos só após a seleção final (distratores não expandem) | validated | `test_distractors_do_not_get_neighbor_expansion` |
+| Proveniência e citações: só documentos recuperados, sem `[n]` inventado | validated | `test_only_retrieved_documents_are_cited`, `test_answer_keeps_only_real_citations`, `test_prompt_forbids_question_facts_as_evidence` |
+| Trace completo (subconsultas, candidatos, contribuições, fusão, eliminados+motivo, scores pré/pós rerank, filtrados, tempo por etapa) | validated | `TestTraceCompleteness` |
+| Compatibilidade com `retrieve()`/`retrieve_many()`/`ask()` | validated | `TestCompatibility` (comportamento single-query inalterado) |
+| Benchmark single vs multi (precisão, recall, latência, tokens) | validated | `benchmarks/bench_multiquery.py` + dataset multi-hop commitado (24 perguntas: 20 two-hop + 4 three-hop) → RESULTS-MULTIQUERY.md |
+| Exemplo funcional com Groq (sem dependência obrigatória) | validated | `examples/multi_query_rag.py` (roda offline por padrão; `--groq` opcional) |
+
 ## Backlog v1.0 restante (apenas performance/formato — nenhum P0/P1 aberto)
 
 | Tarefa | Status | Critério de conclusão |
