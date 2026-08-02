@@ -13,6 +13,33 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
 ## [Unreleased]
 
 ### Added
+- **Per-subquery filters** (`subquery_filters=`). A single global filter cannot
+  express "the decisional facet needs only current documents, the historical
+  facet needs the superseded ones". Each entry replaces the global filter for
+  that query (it does not intersect it — otherwise "only REVOGADO" would be
+  unreachable under a global "only VIGENTE"); `None` keeps the global filter.
+- **Verification: completeness as a separate axis from fidelity.** When the
+  question was decomposed, the facets travel in the verifier payload and the
+  verifier may report per-facet coverage; the report exposes `facet_coverage`,
+  `uncovered_facets` and `complete` — `None` when coverage was not reported,
+  because no report is not proof of coverage. An uncovered facet is reported,
+  never auto-filled: regenerating would mean an extra LLM call the caller did
+  not ask for, with cost and loop risk.
+- **Verification: replacements are themselves verified.** A `replacement` was
+  generated text entering the answer unchecked. `repair`/`strict` now run
+  exactly one extra pass over the replacements (never a loop); a rejected
+  replacement is dropped rather than replaced again, `replacement_verdict`
+  records the outcome, and a failing recheck keeps the repair while declaring
+  it unchecked via `recheck_error`.
+- **Verification: original formatting survives a repair.** Rebuilding used
+  `" ".join`, which flattened a bulleted or multi-paragraph answer into one
+  line whenever a claim was dropped; the original separators are now reused.
+  List markers also count as claim boundaries — without that a whole bullet
+  list was a single claim, so one bad bullet condemned or spared all of them.
+- **Citation metadata.** `Citation.metadata` carries the cited document's
+  effective metadata (status, effective date, version), and it travels with
+  each `evidence` entry — a verifier could not otherwise tell a current rule
+  from a revoked one.
 - **Answer facet checklist in `ask_multi`.** The decomposition already
   guaranteed coverage in *retrieval*; it did nothing for coverage in the
   *answer*, so a model handed every required document could still address only

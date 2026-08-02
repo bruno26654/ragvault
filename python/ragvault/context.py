@@ -46,6 +46,11 @@ class Citation:
     section: Optional[str] = None
     page_number: Optional[int] = None
     score: float = 0.0
+    #: Effective metadata of the cited document (document metadata overlaid
+    #: with chunk metadata). Carries the fields that decide precedence —
+    #: status, effective date, version — so callers and verifiers can judge
+    #: *which* version they are looking at without a second lookup.
+    metadata: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -58,6 +63,7 @@ class Citation:
             "section": self.section,
             "page_number": self.page_number,
             "score": self.score,
+            "metadata": dict(self.metadata),
         }
 
 
@@ -240,6 +246,7 @@ def assemble_context(
                 section=" > ".join(first.section_path) or None,
                 page_number=first.page_number,
                 score=first.score,
+                metadata=dict(first.metadata),
             )
             citations.append(citation)
             doc_to_citation[first.document_id] = citation

@@ -164,6 +164,11 @@ a citação que **existe mas não sustenta** a afirmação.
 | Falha do verificador preserva a resposta válida | validated | `TestVerifierFailure` (exceção, `None`, contagem errada de vereditos → resposta intacta + erro registrado) |
 | Veredito/modo inválido são erro acionável (não "ok" silencioso) | validated | `test_unknown_verdict_is_an_actionable_error`, `test_unknown_mode_is_rejected` |
 | Trace: afirmação, citações, status, justificativa, correções e tempo | validated | `TestTraceAndReport` |
+| Formatação preservada no reparo (listas/parágrafos) + bullets como fronteira de claim | validated | `TestFormattingPreserved` (bug real: o regex exigia maiúscula após o separador, então uma lista inteira era uma única claim) |
+| Segunda verificação sobre os `replacement` (uma passagem, sem laço) | validated | `TestReplacementRecheck` (rejeitado → descartado; falha → reparo mantido + `recheck_error`) |
+| Cobertura de facetas (completude ≠ fidelidade), sem preenchimento automático | validated | `TestFacetCoverage` (`complete` é `None` quando não reportado — ausência de relatório não é prova de cobertura) |
+| Metadados de precedência na evidência e em `Citation.metadata` | validated | `TestEvidenceMetadata` |
+| Filtros por subconsulta (`subquery_filters`) | validated | `TestPerSubqueryFilters` (faceta decisória em `VIGENTE` + histórica em `REVOGADO` na mesma chamada) |
 | Sem dependência obrigatória de provedor | validated | verificador é callable; exemplo roda offline, `--groq` opcional |
 
 ## Backlog v1.0 restante (apenas performance/formato — nenhum P0/P1 aberto)

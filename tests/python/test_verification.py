@@ -31,14 +31,25 @@ def kb(tmp_path):
     base.close()
 
 
-def verdicts(*items):
-    """Build a verifier returning fixed verdicts, in claim order."""
+def verdicts(*items, recheck="supported"):
+    """Build a verifier returning fixed verdicts, in claim order.
+
+    `repair`/`strict` re-verify the replacements they applied, so the stub
+    answers that second pass separately: a coherent verifier stands by the
+    correction it proposed. Pass ``recheck=`` to simulate one that does not.
+    """
+    state = {"first": True}
+
     def _verify(payload):
-        assert len(payload["claims"]) == len(items), (
-            f"expected {len(items)} claims, got {len(payload['claims'])}: "
-            f"{[c['claim'] for c in payload['claims']]}"
-        )
-        return list(items)
+        if state["first"]:
+            state["first"] = False
+            assert len(payload["claims"]) == len(items), (
+                f"expected {len(items)} claims, got {len(payload['claims'])}: "
+                f"{[c['claim'] for c in payload['claims']]}"
+            )
+            return list(items)
+        # second pass: judge only the replacements
+        return [recheck] * len(payload["claims"])
     return _verify
 
 
@@ -327,6 +338,222 @@ class TestTraceAndReport:
         assert answer.unverified_claims == report.unsupported
         assert "issues" in repr(answer)
         assert "VerificationReport" in repr(report)
+
+
+class TestFormattingPreserved:
+    """A repair must not flatten the answer's layout: dropping one bullet
+    cannot turn a list into a run-on paragraph."""
+
+    def test_bullet_list_survives_a_removal(self, kb):
+        answer = kb.ask(
+            "refund rules",
+            llm=lambda p: ("- Refunds take 30 days [1].\n"
+                           "- Refunds are instant [1].\n"
+                           "- Shipping takes five days [1]."),
+            verify=verdicts("supported", "contradicted", "supported"),
+            verification_mode="repair", k=3,
+        )
+        assert "\n" in answer.text, f"layout was flattened: {answer.text!r}"
+        assert answer.text.count("- ") == 2
+        assert "instant" not in answer.text
+
+    def test_paragraph_breaks_survive(self, kb):
+        answer = kb.ask(
+            "refund rules",
+            llm=lambda p: "First para [1].\n\nSecond para [1].\n\nThird para [1].",
+            verify=verdicts("supported", "contradicted", "supported"),
+            verification_mode="repair", k=3,
+        )
+        assert "\n\n" in answer.text
+        assert "Second para" not in answer.text
+
+    def test_single_space_answers_are_unaffected(self, kb):
+        answer = kb.ask(
+            "refund rules",
+            llm=lambda p: "One [1]. Two [1]. Three [1].",
+            verify=verdicts("supported", "contradicted", "supported"),
+            verification_mode="repair", k=3,
+        )
+        assert answer.text == "One [1]. Three [1]."
+
+    def test_split_preserves_the_original_text(self):
+        from ragvault.verification import _split_with_separators
+
+        text = "- A one.\n- B two.\n\n- C three."
+        claims, seps = _split_with_separators(text)
+        rebuilt = claims[0] + "".join(s + c for s, c in zip(seps, claims[1:]))
+        assert rebuilt == text.strip()
+
+
+class TestReplacementRecheck:
+    """A `replacement` is generated text that would otherwise enter the answer
+    unchecked — the repair itself can introduce an inaccuracy."""
+
+    def test_rejected_replacement_is_dropped(self, kb):
+        answer = kb.ask(
+            "refund deadline",
+            llm=lambda p: "Refunds are instant [1].",
+            verify=verdicts(
+                {"verdict": "contradicted", "rationale": "wrong",
+                 "replacement": "Refunds are also instant, honestly [1]."},
+                recheck="unsupported",   # verificador rejeita a própria correção
+            ),
+            verification_mode="repair", k=3,
+        )
+        assert "instant" not in answer.text
+        claim = answer.verification.claims[0]
+        assert claim.replacement_verdict == "unsupported"
+        assert claim.action == "removed"
+        assert "replacement also rejected" in claim.rationale
+
+    def test_accepted_replacement_is_kept(self, kb):
+        answer = kb.ask(
+            "refund deadline",
+            llm=lambda p: "Refunds are instant [1].",
+            verify=verdicts(
+                {"verdict": "contradicted", "rationale": "wrong",
+                 "replacement": "Refunds must be filed within 30 days [1]."},
+                recheck="supported",
+            ),
+            verification_mode="repair", k=3,
+        )
+        assert answer.text == "Refunds must be filed within 30 days [1]."
+        assert answer.verification.claims[0].replacement_verdict == "supported"
+        assert answer.verification.claims[0].action == "rewritten"
+
+    def test_recheck_runs_only_once_no_loop(self, kb):
+        calls = {"n": 0}
+
+        def counting(payload):
+            calls["n"] += 1
+            return [{"verdict": "contradicted", "rationale": "no",
+                     "replacement": "Another attempt [1]."}
+                    ] * len(payload["claims"])
+
+        kb.ask("refund", llm=lambda p: "Bad claim [1].",
+               verify=counting, verification_mode="repair", k=3)
+        assert calls["n"] == 2, "exactly one extra pass, never a loop"
+
+    def test_failing_recheck_keeps_the_repair_and_says_so(self, kb):
+        state = {"first": True}
+
+        def flaky(payload):
+            if state["first"]:
+                state["first"] = False
+                return [{"verdict": "contradicted", "rationale": "wrong",
+                         "replacement": "Corrected text [1]."}]
+            raise RuntimeError("judge offline")
+
+        answer = kb.ask("refund", llm=lambda p: "Bad claim [1].",
+                        verify=flaky, verification_mode="repair", k=3)
+        assert answer.text == "Corrected text [1]."
+        assert "judge offline" in answer.verification.recheck_error
+
+    def test_no_recheck_without_replacements(self, kb):
+        calls = {"n": 0}
+
+        def counting(payload):
+            calls["n"] += 1
+            return ["supported"] * len(payload["claims"])
+
+        kb.ask("refund", llm=lambda p: "Fine claim [1].",
+               verify=counting, verification_mode="repair", k=3)
+        assert calls["n"] == 1
+
+
+class TestFacetCoverage:
+    """Fidelity and completeness are different axes: every claim can be
+    supported and the answer still miss a facet entirely."""
+
+    def test_facets_reach_the_verifier(self, kb):
+        seen = {}
+
+        def capture(payload):
+            seen["facets"] = payload["facets"]
+            return ["supported"]
+
+        kb.ask_multi("refund deadline and payment", llm=lambda p: "30 days [1].",
+                     subqueries=["refund deadline", "refund payment"],
+                     verify=capture, k=5)
+        assert seen["facets"] == ["refund deadline", "refund payment"]
+
+    def test_uncovered_facet_is_reported_without_touching_the_text(self, kb):
+        def verifier(payload):
+            return {
+                "claims": ["supported"] * len(payload["claims"]),
+                "facets": [
+                    {"facet": "refund deadline", "covered": True},
+                    {"facet": "refund payment", "covered": False,
+                     "rationale": "a resposta não trata do pagamento"},
+                ],
+            }
+
+        answer = kb.ask_multi(
+            "refund deadline and payment", llm=lambda p: "30 days [1].",
+            subqueries=["refund deadline", "refund payment"],
+            verify=verifier, verification_mode="repair", k=5,
+        )
+        # fidelity is fine, completeness is not — and repair must not invent
+        assert answer.verification.ok
+        assert answer.verification.complete is False
+        assert answer.text == "30 days [1]."
+        assert answer.verification.uncovered_facets[0]["facet"] == "refund payment"
+
+    def test_complete_is_none_when_not_reported(self, kb):
+        answer = kb.ask_multi(
+            "refund deadline", llm=lambda p: "30 days [1].",
+            subqueries=["refund deadline"], verify=verdicts("supported"), k=5,
+        )
+        assert answer.verification.complete is None, (
+            "no report is not the same as full coverage"
+        )
+
+    def test_coverage_lands_in_the_trace(self, kb):
+        def verifier(payload):
+            return {"claims": ["supported"] * len(payload["claims"]),
+                    "facets": [{"facet": "refund deadline", "covered": True}]}
+
+        answer = kb.ask_multi(
+            "refund rules", llm=lambda p: "30 days [1].",
+            subqueries=["refund deadline"], verify=verifier, trace=True, k=5,
+        )
+        v = answer.result.trace["verification"]
+        assert v["complete"] is True
+        assert v["facet_coverage"][0]["facet"] == "refund deadline"
+
+    def test_subquery_equal_to_the_question_is_not_a_facet(self, kb):
+        """Dedup drops a subquery identical to the question, so there is no
+        facet left to report coverage on."""
+        seen = {}
+
+        def capture(payload):
+            seen["facets"] = payload["facets"]
+            return ["supported"]
+
+        kb.ask_multi("refund deadline", llm=lambda p: "30 days [1].",
+                     subqueries=["refund deadline"], verify=capture, k=5)
+        assert seen["facets"] == []
+
+
+class TestEvidenceMetadata:
+    def test_precedence_fields_travel_with_the_evidence(self, kb):
+        seen = {}
+
+        def capture(payload):
+            seen["p"] = payload
+            return ["supported"]
+
+        kb.ask("refund deadline", llm=lambda p: "30 days [1].",
+               verify=capture, k=3)
+        meta = seen["p"]["claims"][0]["evidence"][0]["metadata"]
+        assert meta["status"] == "VIGENTE"
+        assert meta["doc_group"] == "refund"
+        assert meta["version"] == 2
+
+    def test_citations_expose_metadata(self, kb):
+        result = kb.retrieve("refund deadline", k=3)
+        assert result.citations[0].metadata
+        assert "status" in result.citations[0].to_dict()["metadata"]
 
 
 class TestCompatibility:

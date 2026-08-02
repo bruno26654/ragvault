@@ -141,6 +141,7 @@ def retrieve_multi(
     rerank: Optional[Callable] = None,
     rerank_window: int = 32,
     filters: Optional[dict] = None,
+    subquery_filters: Optional[Sequence[Optional[dict]]] = None,
     boosts: Optional[Sequence[dict]] = None,
     resolve_versions: bool = False,
     version_group_field: str = "doc_group",
@@ -191,6 +192,33 @@ def retrieve_multi(
     if merged_filter is not None:
         _native.validate_filter(json.dumps(merged_filter))
 
+    # Per-query filters: a decisional facet may need only current documents
+    # while a historical facet needs the superseded ones, and a single global
+    # filter cannot express both. An entry *replaces* the global filter for
+    # that query (it does not intersect it) — otherwise "only REVOGADO" could
+    # never be expressed under a global "only VIGENTE".
+    per_query_filters: list[Optional[dict]] = [merged_filter] * len(queries)
+    if subquery_filters is not None:
+        supplied = list(subquery_filters)
+        if len(supplied) != len(queries):
+            raise ConfigurationError(
+                f"subquery_filters has {len(supplied)} entries for "
+                f"{len(queries)} queries (original question first, then "
+                "subqueries); use None to keep the global filter for a query"
+            )
+        for i, entry in enumerate(supplied):
+            if entry is None:
+                continue
+            scoped = kb._merged_filter(entry)
+            if scoped is not None:
+                _native.validate_filter(json.dumps(scoped))
+            per_query_filters[i] = scoped
+        if trace_data is not None:
+            trace_data["subquery_filters"] = [
+                {"query": q, "filter": f}
+                for q, f in zip(queries, per_query_filters)
+            ]
+
     t0 = time.monotonic()
     vectors = None
     if search_mode in ("dense", "hybrid", "auto"):
@@ -205,7 +233,7 @@ def retrieve_multi(
         "k": max(pool, k),
         "mode": search_mode,
         "candidates": pool,
-        "filter": merged_filter,
+        "filter": qfilter,
         "ef_search": kb.config.ef_search,
         "nprobe": kb.config.nprobe,
         "weights": {
@@ -213,7 +241,7 @@ def retrieve_multi(
             "bm25": kb.config.bm25_weight,
             "sparse": kb.config.sparse_weight,
         },
-    } for q in queries]
+    } for q, qfilter in zip(queries, per_query_filters)]
     responses = kb._vault.search_many(json.dumps(requests), vectors)
     stage_ms["search"] = (time.monotonic() - t0) * 1000
 
@@ -461,7 +489,8 @@ def retrieve_multi(
         "fusion": "weighted_rrf",
         "candidate_pool_per_query": pool,
         "mode": search_mode,
-        "filtered": merged_filter is not None,
+        "filtered": any(f is not None for f in per_query_filters),
+        "per_query_filters": subquery_filters is not None,
         "resolve_versions": resolve_versions,
         "reranked": rerank is not None,
     }
@@ -618,6 +647,7 @@ def ask_multi(
         report = verify_answer(
             question=question, answer_text=text, context=result.context,
             citations=result.citations, verify=verify, mode=verification_mode,
+            facets=result.subqueries[1:],
         )
         text = report.repaired_text
         if result.trace is not None:
