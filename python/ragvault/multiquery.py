@@ -574,8 +574,30 @@ def ask_multi(
             "\n\n# Version notes\nConflicting document versions were resolved "
             "by metadata precedence:\n" + "\n".join(lines)
         )
+    # Facet checklist: the decomposition already guarantees coverage in
+    # *retrieval*; without this it does nothing for coverage in the *answer*,
+    # so a model handed both facts can still answer only one facet. Listing
+    # the facets closes that gap — but note the explicit escape hatch: a facet
+    # with no evidence must be declared unanswered, never invented. Without it
+    # "do not omit any" would push the model to fabricate exactly where
+    # retrieval came up empty.
+    facets = [q for q in result.subqueries[1:] if q.strip()]
+    coverage_note = ""
+    if facets:
+        coverage_note = (
+            "\n\n# Required answer facets\n"
+            "The question was decomposed into the facets below. Address each "
+            "one that the context supports, and do not silently omit any. If "
+            "the context has no evidence for a facet, say so explicitly for "
+            "that facet instead of guessing.\n"
+            + "\n".join(f"- {q}" for q in facets)
+        )
+        if result.trace is not None:
+            result.trace["answer_facets"] = list(facets)
+
     prompt = (
-        f"{instructions}\n\n# Context\n{result.context}{conflict_note}\n\n"
+        f"{instructions}\n\n# Context\n{result.context}{conflict_note}"
+        f"{coverage_note}\n\n"
         f"# Question\n{question}\n\n# Answer\n"
     )
     if callable(llm):

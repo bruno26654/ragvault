@@ -95,6 +95,13 @@ resultados de cada subconsulta em um tier prioritário. Medido em
 maior. Os perdedores **nunca** são silenciosos: aparecem em
 `result.conflicts` e no trace, e `ask_multi` os declara no prompt.
 
+**Checklist de facetas na resposta**: as subconsultas não servem só à
+recuperação — `ask_multi` também as lista no prompt como facetas que a
+resposta deve cobrir. Sem isso, o modelo pode receber toda a evidência e
+ainda responder só uma faceta. O prompt inclui uma saída explícita: faceta
+sem evidência no contexto deve ser **declarada como não respondida**, nunca
+inventada (as facetas enviadas ficam em `trace["answer_facets"]`).
+
 **Integridade de citações**: só documentos recuperados podem ser citados;
 marcadores `[n]` inexistentes no contexto são removidos da resposta; o prompt
 declara explicitamente que fatos da pergunta não são evidência documental.
