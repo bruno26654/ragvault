@@ -13,6 +13,15 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
 ## [Unreleased]
 
 ### Added
+- **Answer facet checklist in `ask_multi`.** The decomposition already
+  guaranteed coverage in *retrieval*; it did nothing for coverage in the
+  *answer*, so a model handed every required document could still address only
+  one facet. The subqueries are now listed in the generation prompt as facets
+  the answer must cover. Crucially, the instruction carries an explicit escape
+  hatch — a facet with no evidence in the context must be declared unanswered
+  rather than guessed — because "do not omit any facet" alone would push the
+  model to fabricate exactly where retrieval came up empty. The facets sent are
+  recorded in `trace["answer_facets"]`. API unchanged.
 - **Post-generation semantic validation** — optional `verify=` callback on
   `ask()` and `ask_multi()`, with `verification_mode` in
   `report`/`annotate`/`repair`/`strict`. Citation-marker sanitizing already

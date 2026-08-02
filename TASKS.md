@@ -143,6 +143,7 @@ entrada de distratores, citações inconsistentes e rerank caro em CPU.
 | Proveniência e citações: só documentos recuperados, sem `[n]` inventado | validated | `test_only_retrieved_documents_are_cited`, `test_answer_keeps_only_real_citations`, `test_prompt_forbids_question_facts_as_evidence` |
 | Trace completo (subconsultas, candidatos, contribuições, fusão, eliminados+motivo, scores pré/pós rerank, filtrados, tempo por etapa) | validated | `TestTraceCompleteness` |
 | Compatibilidade com `retrieve()`/`retrieve_many()`/`ask()` | validated | `TestCompatibility` (comportamento single-query inalterado) |
+| Checklist de facetas no prompt de geração (subconsultas cobrem recuperação **e** resposta) | validated | `TestAnswerFacetChecklist` (facetas listadas, pergunta original não repetida, ausentes quando há só uma consulta ou a decomposição falha, `system_prompt` customizado preservado, ordem contexto→facetas→pergunta, `trace["answer_facets"]`). Inclui saída explícita para faceta sem evidência — evita empurrar o modelo a inventar. Efeito na geração não medido aqui (exige LLM real) |
 | Benchmark single vs multi (precisão, recall, latência, tokens) | validated | `benchmarks/bench_multiquery.py` + dataset multi-hop commitado (24 perguntas: 20 two-hop + 4 three-hop) → RESULTS-MULTIQUERY.md |
 | Exemplo funcional com Groq (sem dependência obrigatória) | validated | `examples/multi_query_rag.py` (roda offline por padrão; `--groq` opcional) |
 

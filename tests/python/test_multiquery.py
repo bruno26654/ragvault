@@ -309,6 +309,92 @@ class TestTraceCompleteness:
         assert result.plan["fusion"] == "weighted_rrf"
 
 
+class TestAnswerFacetChecklist:
+    """The decomposition guarantees coverage in retrieval; the facet
+    checklist carries that guarantee into the generated answer."""
+
+    def _prompt_of(self, kb, **kwargs):
+        seen = {}
+
+        def capture(prompt):
+            seen["prompt"] = prompt
+            return "ok"
+
+        kb.ask_multi("refund deadline and payment", llm=capture, **kwargs)
+        return seen["prompt"]
+
+    def test_subqueries_are_listed_as_required_facets(self, policy_kb):
+        prompt = self._prompt_of(
+            policy_kb,
+            subqueries=["refund request deadline", "how refunds are paid"],
+            k=5,
+        )
+        assert "# Required answer facets" in prompt
+        assert "- refund request deadline" in prompt
+        assert "- how refunds are paid" in prompt
+
+    def test_original_question_is_not_repeated_as_a_facet(self, policy_kb):
+        prompt = self._prompt_of(
+            policy_kb, subqueries=["refund request deadline"], k=5
+        )
+        facets_block = prompt.split("# Required answer facets")[1]
+        assert facets_block.count("- ") == 1
+
+    def test_uncovered_facets_must_be_declared_not_invented(self, policy_kb):
+        """The checklist must not push the model to fabricate where retrieval
+        found nothing — the escape hatch is mandatory."""
+        prompt = self._prompt_of(
+            policy_kb, subqueries=["refund request deadline"], k=5
+        )
+        assert "no evidence for a facet" in prompt
+        assert "instead of guessing" in prompt
+
+    def test_single_query_has_no_facet_section(self, policy_kb):
+        prompt = self._prompt_of(policy_kb, k=5)
+        assert "# Required answer facets" not in prompt
+
+    def test_failed_decomposition_has_no_facet_section(self, policy_kb):
+        def exploding(question):
+            raise RuntimeError("llm down")
+
+        prompt = self._prompt_of(policy_kb, decompose=exploding, k=5)
+        assert "# Required answer facets" not in prompt
+
+    def test_custom_system_prompt_still_gets_the_checklist(self, policy_kb):
+        prompt = self._prompt_of(
+            policy_kb, system_prompt="Responda em português.",
+            subqueries=["prazo de reembolso"], k=5,
+        )
+        assert "Responda em português." in prompt
+        assert "- prazo de reembolso" in prompt
+
+    def test_facets_are_traced(self, policy_kb):
+        seen = {}
+
+        def capture(prompt):
+            seen["p"] = prompt
+            return "ok"
+
+        answer = policy_kb.ask_multi(
+            "refund deadline and payment", llm=capture,
+            subqueries=["refund deadline", "refund payment"],
+            trace=True, k=5,
+        )
+        assert answer.result.trace["answer_facets"] == [
+            "refund deadline", "refund payment"
+        ]
+
+    def test_facets_appear_after_context_and_conflicts(self, policy_kb):
+        """Ordering matters for readability: evidence first, then the
+        checklist, then the question."""
+        prompt = self._prompt_of(
+            policy_kb, subqueries=["cancellation refund"],
+            resolve_versions=True, k=6,
+        )
+        assert prompt.index("# Context") < prompt.index("# Required answer facets")
+        assert prompt.index("# Required answer facets") < prompt.index("# Question")
+
+
 class TestAskMulti:
     def test_answer_keeps_only_real_citations(self, policy_kb):
         def hallucinating_llm(prompt):
