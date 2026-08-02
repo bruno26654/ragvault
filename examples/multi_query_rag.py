@@ -98,6 +98,12 @@ def offline_verifier(payload):
     Checks each claim's numbers against the block it cites — enough to show
     the contract without a network call. A real judge (see --groq) reasons
     semantically instead.
+
+    Facet coverage is deliberately *not* faked: deciding whether "how long
+    until I get the money" was answered by "processed within five business
+    days" is a semantic judgement with no lexical overlap to lean on. The
+    stand-in says it cannot judge, so `complete` comes back False — an
+    unevaluated facet is never a covered one.
     """
     blocks = dict(re.findall(r"^\[(\d+)\][^\n]*\n(.*?)(?=\n\n\[|\n\n#|\Z)",
                              payload["context"], re.DOTALL | re.MULTILINE))
@@ -118,7 +124,13 @@ def offline_verifier(payload):
         else:
             out.append({"verdict": "supported",
                         "rationale": "figures match the cited block"})
-    return out
+    return {
+        "claims": out,
+        "facets": [{"facet": facet, "covered": False,
+                    "rationale": "the offline stand-in cannot judge coverage "
+                                 "semantically; run with --groq"}
+                   for facet in payload["facets"]],
+    }
 
 
 def groq_callables():
@@ -139,8 +151,11 @@ def groq_callables():
     def decompose(question: str) -> list[str]:
         prompt = (
             "Split the question into the minimal set of independent search "
-            "queries needed to answer it fully. Reply with a JSON array of "
-            f"strings and nothing else.\n\nQuestion: {question}"
+            "queries needed to answer it fully. Each query must cover exactly "
+            "one thing the answer owes — never combine two into one, since a "
+            "composite query spends a single context slot on two pieces of "
+            "evidence and usually returns only one. Reply with a JSON array "
+            f"of strings and nothing else.\n\nQuestion: {question}"
         )
         raw = complete(prompt).strip()
         match = re.search(r"\[.*\]", raw, re.DOTALL)
@@ -149,36 +164,49 @@ def groq_callables():
         return [str(s) for s in json.loads(match.group(0) if match else raw)]
 
     def verify(payload):
-        """LLM-as-judge: one verdict per claim, grounded in the context."""
-        claims = "\n".join(
-            f"{i}. {c['claim']}  (cites: {c['citations'] or 'none'})"
-            for i, c in enumerate(payload["claims"], start=1)
-        )
+        """LLM-as-judge: it segments and classifies, and never rewrites.
+
+        A verifier that proposes a correction and then approves it is grading
+        its own text, so `replacement` stays out of the contract entirely —
+        a claim that does not hold is removed, not rephrased.
+        """
         prompt = (
-            "You verify whether each claim is supported by the numbered "
-            "context blocks it cites.\n\n"
+            "You verify a RAG answer. Do not rewrite anything: segment and "
+            "classify only.\n\n"
             f"# Context\n{payload['context']}\n\n"
             f"# Question asked by the user\n{payload['question']}\n\n"
-            f"# Claims\n{claims}\n\n"
-            "For each claim reply with one JSON object having 'verdict' "
-            f"(one of {payload['verdicts']}) and 'rationale'.\n"
+            f"# Answer\n{payload['answer']}\n\n"
+            f"# Facets the answer was supposed to cover\n{payload['facets']}\n\n"
+            "1. Segment the answer into EVERY material proposition: verbatim "
+            "spans of the answer, in order, non-overlapping, each carrying a "
+            "single proposition (one sentence stating two facts becomes two "
+            "items).\n"
+            "2. Classify each with 'verdict' (one of "
+            f"{payload['verdicts']}) and 'rationale', judging against the "
+            "explicit facts of the question, the cited blocks and the source "
+            "metadata:\n"
             # The verdict semantics live in the prompt, not in the library:
             # only a model can judge these, and hard-coding rules for them
             # would be domain guesswork.
-            "- 'contradicted' also applies when the claim contradicts a fact "
-            "the user stated in the question, even with no document involved.\n"
-            "- 'question_fact' is ONLY for restating something the question "
-            "asserted. Conclusions, rule applications and deductions are "
-            "'inference', not 'question_fact'.\n"
-            "- A claim about a past, superseded or historical rule is only "
+            "   - 'contradicted' also applies when the claim contradicts a "
+            "fact the user stated in the question, even with no document "
+            "involved.\n"
+            "   - 'question_fact' is ONLY for restating something the "
+            "question asserted; a fact the question supplied is never missing "
+            "or undeterminable. Conclusions, rule applications and deductions "
+            "are 'inference'.\n"
+            "   - A claim about a past, superseded or historical rule is only "
             "'supported' when some cited block's metadata actually shows that "
             "older state. Differing from the current rule does not prove an "
             "older rule existed.\n"
-            "- Judge every material claim; omitting one is not a pass.\n"
-            "Reply with a JSON array only."
+            "3. For each facet, 'covered' is true only when ALL of its "
+            "components were answered correctly.\n"
+            "Omitting a proposition or a facet is not a pass. Reply with JSON "
+            'only: {"claims": [{"claim", "verdict", "rationale"}], '
+            '"facets": [{"facet", "covered", "rationale"}]}.'
         )
         raw = complete(prompt).strip()
-        match = re.search(r"\[.*\]", raw, re.DOTALL)
+        match = re.search(r"[\[{].*[\]}]", raw, re.DOTALL)
         return json.loads(match.group(0) if match else raw)
 
     return decompose, complete, verify
@@ -236,13 +264,20 @@ def main() -> None:
                         print(f"  {conflict['group']}: kept {kept}, dropped "
                               f"{dropped['document_id']} — {dropped['reason']}")
 
+            # Fidelity (ok) and completeness (complete) are separate axes:
+            # every claim can be supported and a facet still go unanswered.
             report = answer.verification
             print(f"\nVerification ({report.mode}): ok={report.ok} "
-                  f"{report.counts()} in {report.elapsed_ms:.1f} ms")
+                  f"complete={report.complete} {report.counts()} in "
+                  f"{report.elapsed_ms:.1f} ms")
             for claim in report.claims:
                 print(f"  [{claim.verdict}/{claim.action}] {claim.claim}")
                 if claim.rationale:
                     print(f"      ↳ {claim.rationale}")
+            for facet in report.uncovered_facets:
+                print(f"  [uncovered] {facet['facet']}")
+                if facet["rationale"]:
+                    print(f"      ↳ {facet['rationale']}")
 
             print("\nStage timings (ms):", result.trace["stage_ms"])
             print("Documents in context:", result.documents)

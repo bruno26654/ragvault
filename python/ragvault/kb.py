@@ -877,6 +877,7 @@ class KnowledgeBase:
         system_prompt: Optional[str] = None,
         verify: Optional[Callable] = None,
         verification_mode: str = "report",
+        allow_replacements: bool = False,
         **retrieve_kwargs: Any,
     ) -> Answer:
         """Retrieve context and call a user-provided LLM. The LLM is a plain
@@ -885,7 +886,10 @@ class KnowledgeBase:
 
         Pass ``verify=`` to run post-generation semantic validation over the
         answer's claims (see :mod:`ragvault.verification`). Without it the
-        behaviour is exactly as before.
+        behaviour is exactly as before. The verifier segments and classifies;
+        it does not write, so a claim that does not hold is removed rather than
+        rewritten — set ``allow_replacements=True`` to let its ``replacement``
+        text into the answer instead.
         """
         trace = bool(retrieve_kwargs.get("trace"))
         result = self.retrieve(question, **retrieve_kwargs)
@@ -913,6 +917,7 @@ class KnowledgeBase:
             report = verify_answer(
                 question=question, answer_text=text, context=result.context,
                 citations=result.citations, verify=verify, mode=verification_mode,
+                allow_replacements=allow_replacements,
             )
             text = report.repaired_text
             if trace and result.trace is not None:

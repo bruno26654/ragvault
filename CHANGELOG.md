@@ -12,6 +12,21 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
 
 ## [Unreleased]
 
+### Changed
+- **The verifier no longer writes: `replacement` is ignored by default.** A
+  verifier that proposes a correction and then re-verifies it is grading its
+  own text — self-endorsement, not verification, and the endorsement carries
+  the same blind spot that produced the correction. `repair`/`strict` now
+  **remove** a claim that does not hold instead of rewriting it. Pass
+  `allow_replacements=True` to `ask()`/`ask_multi()` to restore the previous
+  behaviour, including the re-verification pass.
+- **An unevaluated facet is no longer "unknown".** With facets declared and
+  none reported, `complete` was `None`; a caller writing `if complete is not
+  False` would ship an answer whose completeness nobody had checked. `None`
+  now means only "no facets to cover" — declared-but-unevaluated facets, and a
+  verifier that crashed before reporting, both yield `complete=False`. The
+  distinction survives in `uncovered_facets[i]["rationale"]`.
+
 ### Fixed
 - **Verification failed *open*.** `ok` was `not any(problem for claim in
   claims)`, and a crashed verifier leaves `claims` empty — so `not any([])`

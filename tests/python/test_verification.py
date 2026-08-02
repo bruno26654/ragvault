@@ -74,7 +74,9 @@ class TestWrongButExistingCitation:
         assert not answer.verification.ok
         assert answer.verification.claims[1].action == "removed"
 
-    def test_repair_uses_a_replacement_when_offered(self, kb):
+    def test_replacements_are_ignored_by_default(self, kb):
+        """The verifier segments and classifies; it does not write. Grading
+        its own replacement would be self-endorsement, not verification."""
         answer = kb.ask(
             "refund deadline",
             llm=lambda p: "Refunds are instant [1].",
@@ -84,6 +86,23 @@ class TestWrongButExistingCitation:
                 "replacement": "Refunds must be requested within 30 days [1].",
             }),
             verification_mode="repair",
+            k=3,
+        )
+        assert "Refunds must be requested" not in answer.text
+        assert answer.verification.claims[0].action == "removed"
+        assert not answer.verification.ok
+
+    def test_repair_uses_a_replacement_when_opted_in(self, kb):
+        answer = kb.ask(
+            "refund deadline",
+            llm=lambda p: "Refunds are instant [1].",
+            verify=verdicts({
+                "verdict": "contradicted",
+                "rationale": "source says 30 days",
+                "replacement": "Refunds must be requested within 30 days [1].",
+            }),
+            verification_mode="repair",
+            allow_replacements=True,
             k=3,
         )
         assert answer.text == "Refunds must be requested within 30 days [1]."
@@ -175,6 +194,7 @@ class TestVersionConflict:
                 "replacement": "Refunds must be filed within 30 days [1].",
             }),
             verification_mode="repair",
+            allow_replacements=True,
             resolve_versions=True,
             k=5,
         )
@@ -387,7 +407,8 @@ class TestFormattingPreserved:
 
 class TestReplacementRecheck:
     """A `replacement` is generated text that would otherwise enter the answer
-    unchecked — the repair itself can introduce an inaccuracy."""
+    unchecked — the repair itself can introduce an inaccuracy. Replacements are
+    opt-in (`allow_replacements=True`); these tests exercise that path."""
 
     def test_rejected_replacement_is_dropped(self, kb):
         answer = kb.ask(
@@ -398,7 +419,7 @@ class TestReplacementRecheck:
                  "replacement": "Refunds are also instant, honestly [1]."},
                 recheck="unsupported",   # verificador rejeita a própria correção
             ),
-            verification_mode="repair", k=3,
+            verification_mode="repair", allow_replacements=True, k=3,
         )
         assert "instant" not in answer.text
         claim = answer.verification.claims[0]
@@ -415,7 +436,7 @@ class TestReplacementRecheck:
                  "replacement": "Refunds must be filed within 30 days [1]."},
                 recheck="supported",
             ),
-            verification_mode="repair", k=3,
+            verification_mode="repair", allow_replacements=True, k=3,
         )
         assert answer.text == "Refunds must be filed within 30 days [1]."
         assert answer.verification.claims[0].replacement_verdict == "supported"
@@ -431,7 +452,8 @@ class TestReplacementRecheck:
                     ] * len(payload["claims"])
 
         kb.ask("refund", llm=lambda p: "Bad claim [1].",
-               verify=counting, verification_mode="repair", k=3)
+               verify=counting, verification_mode="repair",
+               allow_replacements=True, k=3)
         assert calls["n"] == 2, "exactly one extra pass, never a loop"
 
     def test_failing_recheck_keeps_the_repair_and_says_so(self, kb):
@@ -445,7 +467,8 @@ class TestReplacementRecheck:
             raise RuntimeError("judge offline")
 
         answer = kb.ask("refund", llm=lambda p: "Bad claim [1].",
-                        verify=flaky, verification_mode="repair", k=3)
+                        verify=flaky, verification_mode="repair",
+                        allow_replacements=True, k=3)
         assert answer.text == "Corrected text [1]."
         assert "judge offline" in answer.verification.recheck_error
 
@@ -730,8 +753,18 @@ class TestFailsClosed:
             subqueries=["refund deadline", "refund payment"],
             llm=lambda p: "30 days [1].", verify=none_reported, k=5,
         )
-        # verifier did not opine at all: unknown, never a silent True
-        assert answer.verification.complete is None
+        report = answer.verification
+        # Facets were declared and none was evaluated. That is not "unknown":
+        # nothing shows the answer is complete, so it fails closed.
+        assert report.complete is False
+        assert [f["facet"] for f in report.uncovered_facets] == [
+            "refund deadline", "refund payment"
+        ]
+        assert all("did not report" in f["rationale"]
+                   for f in report.uncovered_facets)
+        # Fidelity is a separate axis: a verifier that simply does not
+        # implement the facet protocol still judged every claim.
+        assert report.ok
 
     def test_no_facets_means_unknown_not_complete(self, kb):
         answer = kb.ask("refund", llm=lambda p: "30 days [1].",
@@ -765,6 +798,188 @@ class TestFailsClosed:
         assert answer.verification.valid is True
         assert answer.verification.ok is True
         assert answer.verification.complete is True
+
+
+class TestSemanticHardening:
+    """The verifier segments and classifies; the library decides nothing about
+    meaning. What it must guarantee is that the judgement has everything it
+    needs, that every verdict lands, and that a partial result never passes.
+
+    Acceptance criterion: `ok` and `complete` are True only when every claim is
+    supported and every facet is fully covered.
+    """
+
+    def test_claim_contradicting_the_question_fails_closed(self, kb):
+        """The question is a source of facts too. A claim can be false with no
+        document involved at all — so the question must reach the verifier."""
+        seen = {}
+
+        def judge(payload):
+            seen["question"] = payload["question"]
+            return [{"verdict": "contradicted",
+                     "rationale": "the user said March 1st, the answer says May"}]
+
+        answer = kb.ask(
+            "I bought this on March 1st — what is the refund deadline?",
+            llm=lambda p: "You bought it on May 1st.",
+            verify=judge, verification_mode="repair", k=3,
+        )
+        assert "March 1st" in seen["question"]
+        assert answer.verification.ok is False
+        assert answer.verification.claims[0].action == "removed"
+        assert "May 1st" not in answer.text
+
+    def test_question_facts_are_not_treated_as_missing(self, kb):
+        """A fact the user supplied has no citation and never will. `strict`
+        drops uncited claims, but a `question_fact` is not uncited — it is
+        sourced from the question, and dropping it would delete a true
+        statement for lacking a document that cannot exist."""
+        answer = kb.ask(
+            "I bought this on March 1st — what is the refund deadline?",
+            llm=lambda p: ("You bought it on March 1st. "
+                           "Refunds must be filed within 30 days [1]."),
+            verify=verdicts(
+                {"verdict": "question_fact", "rationale": "stated in the question"},
+                {"verdict": "supported", "rationale": "matches [1]"},
+            ),
+            verification_mode="strict", k=3,
+        )
+        assert "March 1st" in answer.text
+        assert answer.verification.claims[0].action == "kept"
+        assert answer.verification.ok is True
+
+    def test_historical_claim_needs_historically_marked_evidence(self, kb):
+        """A claim about a superseded rule cited against a current document is
+        not supported: differing from today's rule does not prove yesterday's.
+        The library's job is to put the deciding metadata in front of the
+        judge — status, version and effective_date travel with the evidence."""
+        seen = {}
+
+        def judge(payload):
+            seen["evidence"] = payload["claims"][0]["evidence"]
+            status = seen["evidence"][0]["metadata"].get("status")
+            if status != "REVOGADO":
+                return [{"verdict": "unsupported",
+                         "rationale": f"cited source is {status}, not a "
+                                      "historical record of the old rule"}]
+            return [{"verdict": "supported", "rationale": "historical source"}]
+
+        answer = kb.ask(
+            "what was the old refund deadline?",
+            llm=lambda p: "The deadline used to be 90 days [1].",
+            verify=judge, verification_mode="repair",
+            filters={"status": "VIGENTE"}, k=3,
+        )
+        assert seen["evidence"][0]["metadata"]["status"] == "VIGENTE"
+        assert seen["evidence"][0]["metadata"]["version"] == 2
+        assert answer.verification.ok is False
+        assert answer.verification.claims[0].verdict == "unsupported"
+        assert "90 days" not in answer.text
+
+    def test_composite_facet_needs_every_component(self, kb):
+        """A facet covering two things is covered only when both are answered.
+        Fidelity does not rescue it: every claim can be supported and the
+        answer still be incomplete."""
+        def judge(payload):
+            return {
+                "claims": ["supported"] * len(payload["claims"]),
+                "facets": [{"facet": f,
+                            "covered": "payment" not in f,
+                            "rationale": "the payment half is unanswered"}
+                           for f in payload["facets"]],
+            }
+
+        answer = kb.ask_multi(
+            "how long to request a refund and how am I paid back?",
+            subqueries=["refund deadline", "refund deadline and payment method"],
+            llm=lambda p: "Refunds must be filed within 30 days [1].",
+            verify=judge, k=5,
+        )
+        report = answer.verification
+        assert report.ok is True, "every claim was supported"
+        assert report.complete is False, "one facet only half answered"
+        assert [f["facet"] for f in report.uncovered_facets] == [
+            "refund deadline and payment method"
+        ]
+
+    def test_composite_proposition_is_judged_atomically(self, kb):
+        """Two propositions inside one sentence are two claims. The verifier
+        re-segments; each half gets its own verdict, and repair removes only
+        the failing half."""
+        def resegmenting(payload):
+            assert len(payload["claims"]) == 1, "heuristics see one sentence"
+            return [
+                {"claim": "Refunds must be filed within 30 days [1]",
+                 "verdict": "supported", "rationale": "matches [1]"},
+                {"claim": "refunds are paid as store credit [1].",
+                 "verdict": "contradicted",
+                 "rationale": "[1] says nothing about store credit"},
+            ]
+
+        answer = kb.ask(
+            "refund deadline and payment",
+            llm=lambda p: ("Refunds must be filed within 30 days [1] and "
+                           "refunds are paid as store credit [1]."),
+            verify=resegmenting, verification_mode="repair", k=3,
+        )
+        report = answer.verification
+        assert report.segmentation == "verifier"
+        assert len(report.claims) == 2
+        assert report.ok is False
+        assert "30 days" in answer.text
+        assert "store credit" not in answer.text
+
+    def test_incomplete_return_fails_closed(self, kb):
+        """Judging two claims and returning one verdict is not a pass on the
+        claim that went unjudged."""
+        def half(payload):
+            return ["supported"]
+
+        answer = kb.ask_multi(
+            "refund deadline and payment",
+            subqueries=["refund deadline", "refund payment"],
+            llm=lambda p: "Refunds take 30 days [1]. They are instant [1].",
+            verify=half, verification_mode="repair", k=5,
+        )
+        report = answer.verification
+        assert "2 claims" in report.error
+        assert report.valid is False
+        assert report.ok is False
+        assert report.complete is False, (
+            "the facets were declared and never evaluated"
+        )
+        assert answer.text == ("Refunds take 30 days [1]. They are instant [1]."), (
+            "a broken verifier must not mutate the answer"
+        )
+
+    @pytest.mark.parametrize(
+        "verdict,covered,expect_ok,expect_complete",
+        [
+            ("supported", True, True, True),
+            ("supported", False, True, False),
+            ("unsupported", True, False, True),
+            ("unsupported", False, False, False),
+        ],
+    )
+    def test_acceptance_criterion(self, kb, verdict, covered, expect_ok,
+                                  expect_complete):
+        """`ok` and `complete` are independent axes, and both must hold before
+        an answer can be called verified and whole."""
+        def judge(payload):
+            return {
+                "claims": [verdict] * len(payload["claims"]),
+                "facets": [{"facet": f, "covered": covered}
+                           for f in payload["facets"]],
+            }
+
+        answer = kb.ask_multi(
+            "refund deadline and payment",
+            subqueries=["refund deadline", "refund payment"],
+            llm=lambda p: "Refunds take 30 days [1].",
+            verify=judge, k=5,
+        )
+        assert answer.verification.ok is expect_ok
+        assert answer.verification.complete is expect_complete
 
 
 class TestSegmentationStructure:
@@ -833,7 +1048,7 @@ class TestReplacementMustBeSupported:
                  "replacement": "Some rewritten text [1]."},
                 recheck=verdict,
             ),
-            verification_mode="repair", k=3,
+            verification_mode="repair", allow_replacements=True, k=3,
         )
         assert "Some rewritten text" not in answer.text
         assert answer.verification.claims[0].action == "removed"
@@ -848,7 +1063,7 @@ class TestReplacementMustBeSupported:
                  "replacement": "Refunds take 30 days [1]."},
                 recheck="supported",
             ),
-            verification_mode="repair", k=3,
+            verification_mode="repair", allow_replacements=True, k=3,
         )
         assert answer.text == "Refunds take 30 days [1]."
 

@@ -158,7 +158,7 @@ a citação que **existe mas não sustenta** a afirmação.
 | Extração de afirmações + citações `[n]` associadas + resolução para chunks reais | validated | `test_evidence_resolves_to_real_chunks`, `TestClaimSplitting` |
 | Vereditos `supported/unsupported/contradicted/uncited/question_fact/inference` | validated | `TestWrongButExistingCitation`, `TestQuestionFactVsDocumentEvidence` |
 | Distinção fato-da-pergunta × evidência documental × inferência | validated | `test_question_fact_is_distinguished_from_evidence`, `test_inference_is_its_own_verdict` |
-| Modos `report` / `annotate` / `repair` / `strict` | validated | um teste por modo; `repair` usa `replacement` quando oferecido |
+| Modos `report` / `annotate` / `repair` / `strict` | validated | um teste por modo; `repair` **remove** o que não se sustenta |
 | Conflito vigente × revogado detectado na resposta | validated | `TestVersionConflict` (afirmação com regra revogada é reparada) |
 | Afirmação sem citação | validated | `TestUncitedClaims` (`strict` remove, `repair` mantém) |
 | Falha do verificador preserva a resposta válida | validated | `TestVerifierFailure` (exceção, `None`, contagem errada de vereditos → resposta intacta + erro registrado) |
@@ -170,7 +170,9 @@ a citação que **existe mas não sustenta** a afirmação.
 | Segmentação: CJK/árabe/hebraico + guarda de abreviações + segmentação opcional pelo verificador | validated | `TestClaimBoundaries` (8 scripts/casos, split lossless), `TestVerifierSegmentation` (divide duas afirmações numa frase; paráfrase recusada). Bug real: o lookahead exigia maiúscula, então idiomas sem caixa **nunca** eram divididos |
 | Formatação preservada no reparo (listas/parágrafos) + bullets como fronteira de claim | validated | `TestFormattingPreserved` (bug real: o regex exigia maiúscula após o separador, então uma lista inteira era uma única claim) |
 | Segunda verificação sobre os `replacement` (uma passagem, sem laço) | validated | `TestReplacementRecheck` (rejeitado → descartado; falha → reparo mantido + `recheck_error`) |
-| Cobertura de facetas (completude ≠ fidelidade), sem preenchimento automático | validated | `TestFacetCoverage` (`complete` é `None` quando não reportado — ausência de relatório não é prova de cobertura) |
+| Cobertura de facetas (completude ≠ fidelidade), sem preenchimento automático | validated | `TestFacetCoverage`; `complete` só é `None` quando não havia facetas — faceta declarada e não avaliada falha fechada (`test_unreported_facet_counts_as_uncovered`) |
+| O verificador segmenta e classifica, não escreve (`replacement` ignorado por padrão) | validated | `test_replacements_are_ignored_by_default`; revalidar o próprio `replacement` é autoendosso. `allow_replacements=True` restaura o comportamento anterior (`test_repair_uses_a_replacement_when_opted_in`) |
+| Critério de aceite: `ok`/`complete` só `True` com todas as claims sustentadas e todas as facetas cobertas | validated | `TestSemanticHardening` — contradição com a pergunta, claim histórica sem fonte histórica, faceta composta parcial, proposição composta resegmentada, retorno incompleto, e a matriz `ok × complete` |
 | Metadados de precedência na evidência e em `Citation.metadata` | validated | `TestEvidenceMetadata` |
 | Filtros por subconsulta (`subquery_filters`) | validated | `TestPerSubqueryFilters` (faceta decisória em `VIGENTE` + histórica em `REVOGADO` na mesma chamada) |
 | Sem dependência obrigatória de provedor | validated | verificador é callable; exemplo roda offline, `--groq` opcional |

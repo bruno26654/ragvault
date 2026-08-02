@@ -131,15 +131,20 @@ answer = kb.ask_multi(
     verification_mode="repair",   # report | annotate | repair | strict
 )
 
-print(answer.text)                # afirmações sem suporte já removidas
-print(answer.verification.ok)     # False se algo não se sustenta
+print(answer.text)                    # afirmações sem suporte já removidas
+print(answer.verification.ok)         # fidelidade: tudo se sustenta?
+print(answer.verification.complete)   # completude: todas as facetas cobertas?
 for c in answer.unverified_claims:
     print(c.verdict, c.claim, "→", c.rationale)
 ```
 
 Vereditos: `supported`, `unsupported`, `contradicted`, `uncited`,
-`question_fact`, `inference`. Verificador que falhar **preserva a resposta
-original** e registra o erro — nunca destrói uma resposta válida.
+`question_fact`, `inference`. O verificador **segmenta e classifica; não
+escreve** — afirmação que não se sustenta é removida, não reescrita, porque
+revalidar a própria correção é autoendosso. Verificador que falhar **preserva a
+resposta original** e registra o erro; `ok` e `complete` falham fechado, e só
+são `True` quando todas as afirmações se sustentam e todas as facetas foram
+integralmente cobertas.
 
 ## Embeddings plugáveis
 
