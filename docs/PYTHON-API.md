@@ -169,9 +169,23 @@ falhar, o reparo é mantido e `recheck_error` declara que os replacements não
 foram checados.
 
 **Formatação preservada**: `repair` reconstrói a resposta com os separadores
-originais — listas e parágrafos sobrevivem à remoção de um item. Marcadores de
-lista contam como fronteira de afirmação, senão uma lista inteira seria uma
-única claim.
+originais — listas e parágrafos sobrevivem à remoção de um item.
+
+**Segmentação das afirmações**: a divisão embutida é heurística — terminadores
+de sentença, marcadores de lista, pontuação **CJK/árabe/hebraica** e guarda de
+abreviações (`Art.`, `Inc.`, `Dr.`…). Antes o lookahead exigia maiúscula, então
+respostas em chinês, japonês, árabe ou hebraico **nunca eram divididas** e a
+verificação por afirmação era inócua nesses idiomas.
+
+O heurístico não enxerga *duas* afirmações dentro de uma frase
+(`"X leva 30 dias [1] e Y leva 5 dias [2]"`) — e nesse caso reprovar `[2]`
+apagaria também a parte correta. Para isso o verificador pode devolver a
+**própria segmentação**: itens com a chave `claim`, que precisam ser
+substrings **verbatim** da resposta. Custa zero chamadas extras (o verificador
+já é um LLM lendo a resposta inteira) e mantém o reparo cirúrgico — remove-se
+o trecho do original em vez de reescrever a partir de texto do modelo. Uma
+segmentação que parafraseie é recusada, e `report.segmentation` diz qual foi
+usada (`"heuristic"` ou `"verifier"`).
 
 **Metadados na evidência**: cada `evidence` traz o `metadata` efetivo do
 documento citado (incluindo `status`, data de vigência e versão), também

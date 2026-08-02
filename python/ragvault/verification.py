@@ -9,8 +9,12 @@ the source it cites.
 
 This module adds an optional verification pass over the generated answer:
 
-1. **Split** the answer into claims (sentence-level by default; a verifier may
-   supply its own segmentation).
+1. **Split** the answer into claims. The built-in segmentation is heuristic
+   (sentence terminators, list markers, CJK/Arabic/Hebrew punctuation, an
+   abbreviation guard). It cannot see two claims inside one sentence — for
+   that a verifier may return its **own** segmentation, which costs no extra
+   call since it is already an LLM reading the whole answer. Its claims must
+   be verbatim substrings of the answer, so repair stays surgical.
 2. **Attach** the `[n]` markers found in each claim to the citations they
    refer to, resolved back to the real chunks that produced them.
 3. **Judge** each claim with a caller-supplied verifier — typically an LLM, but
@@ -58,12 +62,36 @@ _PROBLEM_VERDICTS = frozenset({UNSUPPORTED, CONTRADICTED})
 VERIFICATION_MODES = ("report", "annotate", "repair", "strict")
 
 _CITATION_RE = re.compile(r"\[(\d+)\]")
-#: Sentence-ish split that keeps the terminator with the sentence and does not
-#: break on decimals or common abbreviations followed by a lowercase word.
-#: List markers count as a boundary too — without them a bulleted answer is a
-#: single claim, so one bad bullet would condemn (or spare) the whole list.
+
+#: Abbreviations whose trailing period must not end a claim. Legal and
+#: Portuguese text is dense with these ("Art. 5º", "Inc. II"), and splitting
+#: there hands the verifier fragments instead of claims.
+_ABBREVIATIONS = (
+    "Art", "Arts", "Inc", "Ltda", "Ltd", "Cia", "Cf", "Ref", "Fig", "Eq",
+    "Sr", "Sra", "Srta", "Dr", "Dra", "Prof", "Profa", "Mr", "Mrs", "Ms",
+    "No", "Nº", "n", "p", "pp", "vs", "etc", "ed", "al", "par",
+)
+#: The split point sits *after* the period, so each guard must include it.
+_ABBREV_GUARD = "".join(f"(?<!\\b{a}\\.)" for a in _ABBREVIATIONS)
+
+#: What may start a new claim: a capital, a citation marker, a list bullet, or
+#: any letter that has no lowercase form (Arabic, Hebrew, Devanagari, CJK…).
+#: Requiring `[A-Z]` silently disabled per-claim verification for every script
+#: without letter case.
+_CLAIM_START = r"[A-Z\[]|[-*•+]\s|\d+[.)]\s|(?![a-zà-öø-ÿ])[^\W\d_]"
+
+#: Claim boundaries. Three alternatives, in order:
+#:  1. Latin terminator + whitespace + something that starts a new unit
+#:     (capital, citation marker, or a list bullet — without bullets a whole
+#:     list would be one claim, so one bad item condemned all of them);
+#:  2. CJK/full-width terminators, where the space is optional and there is
+#:     no case to look for — Chinese, Japanese and Korean answers were never
+#:     split at all before, making per-claim verification a no-op for them;
+#:  3. Arabic full stop / question mark, same reason.
 _SENTENCE_RE = re.compile(
-    r"(?<=[.!?])\s+(?=[A-Z\[]|[-*•+]\s|\d+[.)]\s)"
+    rf"(?<=[.!?]){_ABBREV_GUARD}\s+(?={_CLAIM_START})"
+    r"|(?<=[。．！？])\s*"
+    r"|(?<=[؟۔])\s+"
 )
 
 
@@ -114,6 +142,9 @@ class VerificationReport:
     #: Set when the second pass over replacements raised. The repaired answer
     #: stands, but its replacements went unchecked — surfaced, not hidden.
     recheck_error: Optional[str] = None
+    #: Which segmentation produced the claims: the built-in heuristic, or the
+    #: verifier's own (which can split two claims inside one sentence).
+    segmentation: str = "heuristic"
     #: Per-facet coverage, when the caller decomposed the question and the
     #: verifier reported it. Fidelity (claims) and completeness (facets) are
     #: separate axes: an answer can be fully supported and still incomplete.
@@ -147,6 +178,7 @@ class VerificationReport:
         return {
             "mode": self.mode,
             "ok": self.ok,
+            "segmentation": self.segmentation,
             "claims": [c.to_dict() for c in self.claims],
             "facet_coverage": list(self.facet_coverage),
             "complete": self.complete,
@@ -309,8 +341,18 @@ def verify_answer(
             "verdicts": sorted(VERDICTS),
         }
 
-    def run(items: Sequence[str]) -> tuple[list, Optional[list]]:
-        """Call the verifier and normalize its shape."""
+    def run(
+        items: Sequence[str], allow_resegmentation: bool = False
+    ) -> tuple[list, Optional[list], Optional[list[str]]]:
+        """Call the verifier and normalize its shape.
+
+        The verifier may re-segment: heuristic boundaries cannot see two
+        claims inside one sentence ("X takes 30 days [1] and Y takes 5 [2]"),
+        and the verifier is already an LLM reading the whole answer, so its
+        segmentation costs no extra call. Returned claim texts must appear
+        verbatim in the answer — that keeps repair surgical (spans removed
+        from the original) instead of rewriting the answer from model output.
+        """
         raw = verify(build_payload(items))
         facet_report = None
         if isinstance(raw, dict):
@@ -319,14 +361,34 @@ def verify_answer(
         if raw is None:
             raise ValueError("verifier returned no claim verdicts")
         results = list(raw)
-        if len(results) != len(items):
+
+        resegmented: Optional[list[str]] = None
+        if allow_resegmentation:
+            texts = [
+                str(r["claim"]) for r in results
+                if isinstance(r, dict) and str(r.get("claim", "")).strip()
+            ]
+            if len(texts) == len(results) and texts != list(items):
+                missing = [t for t in texts if t not in answer_text]
+                if missing:
+                    raise ValueError(
+                        "verifier re-segmented the answer but "
+                        f"{len(missing)} claim(s) are not verbatim substrings "
+                        f"of it, e.g. {missing[0][:60]!r}"
+                    )
+                resegmented = texts
+
+        if resegmented is None and len(results) != len(items):
             raise ValueError(
                 f"verifier returned {len(results)} verdicts for {len(items)} claims"
             )
-        return results, facet_report
+        return results, facet_report, resegmented
 
     try:
-        results, facet_report = run(claims)
+        results, facet_report, resegmented = run(claims, allow_resegmentation=True)
+        if resegmented is not None:
+            claims, separators = _locate_spans(resegmented, answer_text)
+            report.segmentation = "verifier"
         for claim, item in zip(claims, results):
             verdict, rationale, replacement = _coerce_verdict(item, claim)
             indices = citations_in(claim)
@@ -362,7 +424,7 @@ def verify_answer(
     rewritten = [c for c in report.claims if c.action == "rewritten" and c.replacement]
     if rewritten and mode in ("repair", "strict"):
         try:
-            recheck, _ = run([c.replacement for c in rewritten])  # type: ignore[misc]
+            recheck, _, _ = run([c.replacement for c in rewritten])  # type: ignore[misc]
             for claim, item in zip(rewritten, recheck):
                 verdict, rationale, _ = _coerce_verdict(item, claim.replacement or "")
                 claim.replacement_verdict = verdict
@@ -385,6 +447,38 @@ def verify_answer(
 
     report.elapsed_ms = (time.monotonic() - started) * 1000
     return report
+
+
+def _locate_spans(
+    texts: Sequence[str], answer: str
+) -> tuple[list[str], list[str]]:
+    """Map verifier-supplied claims back onto the answer, returning the claims
+    and the exact text between them.
+
+    Working with spans of the original (rather than the verifier's copy) is
+    what lets ``repair`` stay surgical: removing a claim removes that span and
+    keeps every character around it, so formatting and the un-flagged half of
+    a sentence both survive.
+    """
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for text in texts:
+        start = answer.find(text, cursor)
+        if start < 0:  # out of order: fall back to a global search
+            start = answer.find(text)
+        if start < 0:  # pragma: no cover - guarded by the caller
+            raise ValueError(f"claim not found in the answer: {text[:60]!r}")
+        spans.append((start, start + len(text)))
+        cursor = start + len(text)
+    order = sorted(range(len(spans)), key=lambda i: spans[i][0])
+    if order != list(range(len(spans))):
+        # Keep the verifier's order for verdict alignment, but separators are
+        # only meaningful for spans in document order.
+        return list(texts), [" "] * max(0, len(texts) - 1)
+    seps = [
+        answer[spans[i][1]:spans[i + 1][0]] for i in range(len(spans) - 1)
+    ]
+    return list(texts), seps
 
 
 def _coerce_facets(

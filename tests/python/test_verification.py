@@ -556,6 +556,139 @@ class TestEvidenceMetadata:
         assert "status" in result.citations[0].to_dict()["metadata"]
 
 
+class TestClaimBoundaries:
+    """Heuristic boundaries, including the scripts and abbreviations the
+    original rule silently ignored."""
+
+    def _split(self, text):
+        from ragvault.verification import _split_with_separators
+        return _split_with_separators(text)
+
+    @pytest.mark.parametrize("text,expected", [
+        ("Um [1]. Dois [2]. Tres [3].", 3),
+        ("- A um [1].\n- B dois [2].", 2),
+        ("O valor é 3.14 reais [1]. Outro ponto [2].", 2),      # decimal
+        ("O Art. 5º define o prazo [1]. Ja o Inc. II trata [2].", 2),  # abbrev
+        ("退款需要30天[1]。运输需要5天[2]。", 2),                    # chinês
+        ("返金には30日かかります[1]。配送には5日かかります[2]。", 2),   # japonês
+        ("يستغرق الاسترداد 30 يومًا [1]. يستغرق الشحن 5 أيام [2].", 2),  # árabe
+        ("ההחזר אורך 30 יום [1]. המשלוח אורך 5 ימים [2].", 2),      # hebraico
+    ])
+    def test_boundaries(self, text, expected):
+        assert len(self._split(text)[0]) == expected
+
+    @pytest.mark.parametrize("text", [
+        "Um [1]. Dois [2].",
+        "- A [1].\n- B [2].",
+        "退款需要30天[1]。运输需要5天[2]。",
+        "O Art. 5º vale [1]. Fim [2].",
+    ])
+    def test_split_is_lossless(self, text):
+        claims, seps = self._split(text)
+        rebuilt = claims[0] + "".join(s + c for s, c in zip(seps, claims[1:]))
+        assert rebuilt == text.strip()
+
+    def test_cjk_answer_can_be_repaired_per_claim(self, kb):
+        """Before, a CJK answer was one claim: verification was a no-op."""
+        answer = kb.ask(
+            "refund",
+            llm=lambda p: "退款需要30天[1]。运输需要5天[1]。",
+            verify=verdicts("supported", "contradicted"),
+            verification_mode="repair", k=3,
+        )
+        assert "退款需要30天" in answer.text
+        assert "运输需要5天" not in answer.text
+
+
+class TestVerifierSegmentation:
+    """The heuristic cannot see two claims inside one sentence; the verifier
+    is already an LLM reading the answer, so its segmentation is free."""
+
+    def test_verifier_can_split_one_sentence_into_two_claims(self, kb):
+        sentence = "Refunds take 30 days [1] and shipping takes 5 days [1]."
+
+        def segmenting(payload):
+            # ignores the heuristic single claim and returns two
+            return [
+                {"claim": "Refunds take 30 days [1]", "verdict": "supported",
+                 "rationale": "matches"},
+                {"claim": "shipping takes 5 days [1]", "verdict": "contradicted",
+                 "rationale": "the source says nothing about shipping"},
+            ]
+
+        answer = kb.ask("refund", llm=lambda p: sentence, verify=segmenting,
+                        verification_mode="repair", k=3)
+        assert answer.verification.segmentation == "verifier"
+        assert len(answer.verification.claims) == 2
+        # only the offending half is gone — the correct half survives
+        assert "Refunds take 30 days [1]" in answer.text
+        assert "shipping takes 5 days" not in answer.text
+
+    def test_heuristic_alone_would_drop_the_whole_sentence(self, kb):
+        """Contrast: without re-segmentation the sentence is one claim, so a
+        single bad half condemns the correct half too."""
+        sentence = "Refunds take 30 days [1] and shipping takes 5 days [1]."
+        answer = kb.ask("refund", llm=lambda p: sentence,
+                        verify=verdicts("contradicted"),
+                        verification_mode="repair", k=3)
+        assert answer.verification.segmentation == "heuristic"
+        assert "Refunds take 30 days" not in answer.text
+
+    def test_non_verbatim_claims_are_rejected(self, kb):
+        """A re-segmentation that paraphrases would make repair rewrite the
+        answer from model output instead of cutting the original."""
+        def paraphrasing(payload):
+            return [{"claim": "Something the answer never said",
+                     "verdict": "supported"}]
+
+        answer = kb.ask("refund", llm=lambda p: "Refunds take 30 days [1].",
+                        verify=paraphrasing, verification_mode="repair", k=3)
+        assert answer.text == "Refunds take 30 days [1]."
+        assert "not verbatim substrings" in answer.verification.error
+
+    def test_segmentation_defaults_to_heuristic(self, kb):
+        answer = kb.ask("refund", llm=lambda p: "Refunds take 30 days [1].",
+                        verify=verdicts("supported"), k=3)
+        assert answer.verification.segmentation == "heuristic"
+
+    def test_resegmentation_preserves_layout(self, kb):
+        """A re-segmentation that groups two bullets into one claim must keep
+        the newline between them when that claim is kept."""
+        def segmenting(payload):
+            return [
+                {"claim": "- A one [1].\n- B two [1].", "verdict": "supported"},
+                {"claim": "- C three [1].", "verdict": "contradicted"},
+            ]
+
+        answer = kb.ask(
+            "refund", llm=lambda p: "- A one [1].\n- B two [1].\n- C three [1].",
+            verify=segmenting, verification_mode="repair", k=3,
+        )
+        assert answer.verification.segmentation == "verifier"
+        assert answer.text == "- A one [1].\n- B two [1]."
+
+    def test_identical_segmentation_stays_heuristic(self, kb):
+        """Returning the same claims is not a re-segmentation — no false
+        signal in the report."""
+        def echoing(payload):
+            return [{"claim": c["claim"], "verdict": "supported"}
+                    for c in payload["claims"]]
+
+        answer = kb.ask("refund", llm=lambda p: "One [1]. Two [1].",
+                        verify=echoing, k=3)
+        assert answer.verification.segmentation == "heuristic"
+        assert len(answer.verification.claims) == 2
+
+    def test_segmentation_appears_in_the_trace(self, kb):
+        def segmenting(payload):
+            return [{"claim": "Refunds take 30 days [1].", "verdict": "supported"}]
+
+        answer = kb.ask("refund", llm=lambda p: "Refunds take 30 days [1].",
+                        verify=segmenting, trace=True, k=3)
+        seg = answer.result.trace["verification"]["segmentation"]
+        assert seg in ("heuristic", "verifier")
+
+
 class TestCompatibility:
     def test_ask_without_verify_is_unchanged(self, kb):
         answer = kb.ask("refund deadline", llm=lambda p: "30 days [1]", k=3)
