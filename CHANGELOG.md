@@ -13,6 +13,18 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
 ## [Unreleased]
 
 ### Added
+- **Claim segmentation: scripts without letter case, abbreviations, and
+  optional verifier-supplied boundaries.** The split required an uppercase
+  letter after the terminator, so answers in Chinese, Japanese, Korean, Arabic
+  or Hebrew were **never split at all** — per-claim verification was a no-op
+  for every script without case, in a library that ships a multilingual preset.
+  CJK/Arabic terminators and case-less scripts are handled now, and an
+  abbreviation guard stops `Art. 5º` / `Inc. II` from becoming fragments.
+  Heuristics still cannot see two claims inside one sentence, so a verifier may
+  now return its own segmentation (claims must be verbatim substrings of the
+  answer, keeping repair surgical); `report.segmentation` records which was
+  used. This also makes the module docstring true — it already claimed the
+  verifier could supply segmentation, but the code rejected any count mismatch.
 - **Per-subquery filters** (`subquery_filters=`). A single global filter cannot
   express "the decisional facet needs only current documents, the historical
   facet needs the superseded ones". Each entry replaces the global filter for

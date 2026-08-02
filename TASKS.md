@@ -164,6 +164,7 @@ a citação que **existe mas não sustenta** a afirmação.
 | Falha do verificador preserva a resposta válida | validated | `TestVerifierFailure` (exceção, `None`, contagem errada de vereditos → resposta intacta + erro registrado) |
 | Veredito/modo inválido são erro acionável (não "ok" silencioso) | validated | `test_unknown_verdict_is_an_actionable_error`, `test_unknown_mode_is_rejected` |
 | Trace: afirmação, citações, status, justificativa, correções e tempo | validated | `TestTraceAndReport` |
+| Segmentação: CJK/árabe/hebraico + guarda de abreviações + segmentação opcional pelo verificador | validated | `TestClaimBoundaries` (8 scripts/casos, split lossless), `TestVerifierSegmentation` (divide duas afirmações numa frase; paráfrase recusada). Bug real: o lookahead exigia maiúscula, então idiomas sem caixa **nunca** eram divididos |
 | Formatação preservada no reparo (listas/parágrafos) + bullets como fronteira de claim | validated | `TestFormattingPreserved` (bug real: o regex exigia maiúscula após o separador, então uma lista inteira era uma única claim) |
 | Segunda verificação sobre os `replacement` (uma passagem, sem laço) | validated | `TestReplacementRecheck` (rejeitado → descartado; falha → reparo mantido + `recheck_error`) |
 | Cobertura de facetas (completude ≠ fidelidade), sem preenchimento automático | validated | `TestFacetCoverage` (`complete` é `None` quando não reportado — ausência de relatório não é prova de cobertura) |
