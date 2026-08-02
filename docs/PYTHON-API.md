@@ -19,8 +19,8 @@ Presets: `quality, balanced, fast, offline, multilingual, code, long_documents, 
 | `remove(document_id)` | exclusão (invisível em todos os índices) |
 | `retrieve(query, k=8, token_budget=None, filters=None, mode=None, candidates=None, ef_search=None, rerank=None, context_window=None, max_chunks_per_document=None, explain=False, trace=False)` | → `RetrievalResult` |
 | `retrieve_many(queries, **kw)` / `aretrieve` / `aretrieve_many` | lote e async |
-| `retrieve_multi(question, subqueries=None, decompose=None, max_subqueries=6, fusion="weighted_rrf", coverage_per_subquery=1, rerank=None, filters=None, boosts=None, resolve_versions=False, **retrieve_kw)` | pipeline multi-query → `MultiRetrievalResult` |
-| `ask_multi(question, llm=..., citations=True, **retrieve_multi_kw)` / `aretrieve_multi` / `aask_multi` | multi-query + LLM com integridade de citações |
+| `retrieve_multi(question, subqueries=None, decompose=None, max_subqueries=6, fusion="weighted_rrf", coverage_per_subquery=1, rerank=None, filters=None, subquery_filters=None, boosts=None, resolve_versions=False, **retrieve_kw)` | pipeline multi-query → `MultiRetrievalResult` |
+| `ask_multi(question, llm=..., citations=True, verify=None, verification_mode="report", **retrieve_multi_kw)` / `aretrieve_multi` / `aask_multi` | multi-query + LLM com integridade de citações |
 | `ask(question, llm=..., citations=True, system_prompt=None, verify=None, verification_mode="report", **retrieve_kw)` | → `Answer` (LLM é seu) |
 | `evaluate(dataset, k=10)` | → `EvaluationReport` |
 | `compare(dataset, presets=[...], k=10)` | avalia presets (parâmetros de retrieval) → `ComparisonReport` |
@@ -87,6 +87,7 @@ resultados de cada subconsulta em um tier prioritário. Medido em
 | `filters={...}` | filtro **obrigatório**, aplicado como prefilter nativo antes da busca |
 | `boosts=[{"filter": {...}, "weight": 2.0}]` | boost multiplicativo **depois** da fusão |
 | `resolve_versions=True` | precedência por metadados dentro de `doc_group` |
+| `subquery_filters=[...]` | filtro **por consulta** (pergunta original primeiro); `None` mantém o global. Uma entrada **substitui** o filtro global daquela consulta — é o que permite "faceta decisória só em `VIGENTE`, faceta histórica só em `REVOGADO`", impossível com um filtro único |
 | `rerank=fn` | rerank global; **nunca destrói recall** (descartados voltam) e falha tolerada |
 
 **Precedência de versões** (`resolve_versions=True`): dentro de cada
@@ -148,6 +149,34 @@ reais**). Devolve um veredito por afirmação — string ou dict com `verdict`,
 | `annotate` | marca inline `[unsupported]`/`[contradicted]` |
 | `repair` | remove afirmações problemáticas, ou usa `replacement` |
 | `strict` | como `repair` e também remove as `uncited` |
+
+**Fidelidade × completude** são eixos separados: toda afirmação pode estar
+sustentada e a resposta ainda deixar uma faceta de fora. Quando a pergunta foi
+decomposta, as facetas vão no payload (`payload["facets"]`) e o verificador
+pode devolver `{"claims": [...], "facets": [{"facet": ..., "covered": bool,
+"rationale": ...}]}`. O relatório expõe `facet_coverage`, `uncovered_facets` e
+`complete` — que é `None` quando o verificador **não** reportou cobertura,
+porque ausência de relatório não é prova de cobertura. Faceta descoberta é
+**reportada, nunca preenchida automaticamente**: regenerar exigiria uma
+chamada extra ao LLM que o chamador não pediu, com custo e risco de laço —
+a decisão fica com quem chama.
+
+**Segunda passagem sobre os `replacement`**: em `repair`/`strict`, o texto
+proposto pelo verificador é ele próprio verificado uma vez (nunca em laço).
+Replacement reprovado é descartado em vez de substituído de novo, e
+`claim.replacement_verdict` registra o veredito. Se essa segunda passagem
+falhar, o reparo é mantido e `recheck_error` declara que os replacements não
+foram checados.
+
+**Formatação preservada**: `repair` reconstrói a resposta com os separadores
+originais — listas e parágrafos sobrevivem à remoção de um item. Marcadores de
+lista contam como fronteira de afirmação, senão uma lista inteira seria uma
+única claim.
+
+**Metadados na evidência**: cada `evidence` traz o `metadata` efetivo do
+documento citado (incluindo `status`, data de vigência e versão), também
+disponível em `Citation.metadata` — sem isso o verificador não consegue
+distinguir uma regra vigente de uma revogada.
 
 **Garantias:** verificador que levanta exceção, devolve `None` ou um número
 errado de vereditos **preserva a resposta original** e registra o erro

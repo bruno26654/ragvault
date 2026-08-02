@@ -182,6 +182,68 @@ class TestVersionPrecedence:
         assert top_meta == "policy", (top_meta, plain.documents, boosted.documents)
 
 
+class TestPerSubqueryFilters:
+    """A decisional facet may need only current documents while a historical
+    facet needs the superseded ones — a single global filter cannot say both."""
+
+    def test_historical_facet_can_target_revoked_documents(self, policy_kb):
+        result = policy_kb.retrieve_multi(
+            "what does cancellation say, and what did it used to say?",
+            subqueries=["current cancellation rule", "previous cancellation rule"],
+            subquery_filters=[
+                {"status": "VIGENTE"},   # pergunta original: só vigente
+                {"status": "VIGENTE"},   # faceta decisória
+                {"status": "REVOGADO"},  # faceta histórica
+            ],
+            k=8,
+        )
+        docs = set(result.documents)
+        assert "cancel_v2" in docs, "current rule must be retrievable"
+        assert "cancel_v1" in docs, "historical facet must reach the revoked doc"
+
+    def test_global_filter_alone_cannot_reach_revoked(self, policy_kb):
+        result = policy_kb.retrieve_multi(
+            "cancellation rules", subqueries=["previous cancellation rule"],
+            filters={"status": "VIGENTE"}, k=8,
+        )
+        assert "cancel_v1" not in result.documents
+
+    def test_none_entry_keeps_the_global_filter(self, policy_kb):
+        result = policy_kb.retrieve_multi(
+            "cancellation rules", subqueries=["previous cancellation rule"],
+            filters={"status": "VIGENTE"},
+            subquery_filters=[None, None], k=8,
+        )
+        assert "cancel_v1" not in result.documents
+        assert result.plan["filtered"] is True
+
+    def test_length_mismatch_is_actionable(self, policy_kb):
+        with pytest.raises(ragvault.ConfigurationError) as err:
+            policy_kb.retrieve_multi(
+                "refund", subqueries=["a", "b"],
+                subquery_filters=[{"status": "VIGENTE"}], k=3,
+            )
+        assert "3 queries" in str(err.value)
+
+    def test_per_query_filters_are_traced(self, policy_kb):
+        result = policy_kb.retrieve_multi(
+            "cancellation", subqueries=["previous rule"],
+            subquery_filters=[None, {"status": "REVOGADO"}],
+            trace=True, k=6,
+        )
+        traced = result.trace["subquery_filters"]
+        assert traced[1]["query"] == "previous rule"
+        assert traced[1]["filter"] == {"status": "REVOGADO"}
+        assert result.plan["per_query_filters"] is True
+
+    def test_invalid_filter_is_rejected(self, policy_kb):
+        with pytest.raises(Exception):
+            policy_kb.retrieve_multi(
+                "refund", subqueries=["a"],
+                subquery_filters=[None, {"status": {"bogus_op": 1}}], k=3,
+            )
+
+
 class TestDistractorsAndExpansion:
     def test_distractors_do_not_get_neighbor_expansion(self, tmp_path):
         """Neighbor expansion must only touch chunks that survived the final
