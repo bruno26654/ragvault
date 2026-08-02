@@ -161,10 +161,21 @@ def groq_callables():
             f"# Question asked by the user\n{payload['question']}\n\n"
             f"# Claims\n{claims}\n\n"
             "For each claim reply with one JSON object having 'verdict' "
-            f"(one of {payload['verdicts']}) and 'rationale'. Use "
-            "'question_fact' when the claim merely restates something the "
-            "user asserted in the question, and 'contradicted' when the cited "
-            "block says otherwise. Reply with a JSON array only."
+            f"(one of {payload['verdicts']}) and 'rationale'.\n"
+            # The verdict semantics live in the prompt, not in the library:
+            # only a model can judge these, and hard-coding rules for them
+            # would be domain guesswork.
+            "- 'contradicted' also applies when the claim contradicts a fact "
+            "the user stated in the question, even with no document involved.\n"
+            "- 'question_fact' is ONLY for restating something the question "
+            "asserted. Conclusions, rule applications and deductions are "
+            "'inference', not 'question_fact'.\n"
+            "- A claim about a past, superseded or historical rule is only "
+            "'supported' when some cited block's metadata actually shows that "
+            "older state. Differing from the current rule does not prove an "
+            "older rule existed.\n"
+            "- Judge every material claim; omitting one is not a pass.\n"
+            "Reply with a JSON array only."
         )
         raw = complete(prompt).strip()
         match = re.search(r"\[.*\]", raw, re.DOTALL)

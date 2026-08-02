@@ -404,7 +404,7 @@ class TestReplacementRecheck:
         claim = answer.verification.claims[0]
         assert claim.replacement_verdict == "unsupported"
         assert claim.action == "removed"
-        assert "replacement also rejected" in claim.rationale
+        assert "replacement not accepted" in claim.rationale
 
     def test_accepted_replacement_is_kept(self, kb):
         answer = kb.ask(
@@ -687,6 +687,170 @@ class TestVerifierSegmentation:
                         verify=segmenting, trace=True, k=3)
         seg = answer.result.trace["verification"]["segmentation"]
         assert seg in ("heuristic", "verifier")
+
+
+class TestFailsClosed:
+    """A safety feature that fails *open* is worse than none: anything gating
+    on `ok`/`complete` would ship unverified text believing it was checked."""
+
+    def test_crashed_verifier_is_not_ok(self, kb):
+        def exploding(payload):
+            raise RuntimeError("judge offline")
+
+        answer = kb.ask("refund", llm=lambda p: "Refunds are instant [1].",
+                        verify=exploding, k=3)
+        assert answer.verification.ok is False, (
+            "no claims were judged, so nothing may be reported as faithful"
+        )
+        assert answer.verification.valid is False
+        assert answer.text == "Refunds are instant [1].", "answer preserved"
+
+    def test_partial_facet_report_is_not_complete(self, kb):
+        def partial(payload):
+            return {"claims": ["supported"] * len(payload["claims"]),
+                    "facets": [{"facet": payload["facets"][0], "covered": True}]}
+
+        answer = kb.ask_multi(
+            "refund deadline and payment method",
+            subqueries=["refund deadline", "refund payment method"],
+            llm=lambda p: "30 days [1].", verify=partial, k=5,
+        )
+        assert answer.verification.complete is False
+        assert [f["facet"] for f in answer.verification.uncovered_facets] == [
+            "refund payment method"
+        ]
+        assert answer.verification.structural_issues
+
+    def test_unreported_facet_counts_as_uncovered(self, kb):
+        def none_reported(payload):
+            return ["supported"] * len(payload["claims"])
+
+        answer = kb.ask_multi(
+            "refund deadline and payment",
+            subqueries=["refund deadline", "refund payment"],
+            llm=lambda p: "30 days [1].", verify=none_reported, k=5,
+        )
+        # verifier did not opine at all: unknown, never a silent True
+        assert answer.verification.complete is None
+
+    def test_no_facets_means_unknown_not_complete(self, kb):
+        answer = kb.ask("refund", llm=lambda p: "30 days [1].",
+                        verify=verdicts("supported"), k=3)
+        assert answer.verification.complete is None
+
+    def test_structural_issue_forces_ok_false(self, kb):
+        """Even with every verdict 'supported', a structurally invalid result
+        cannot be called faithful."""
+        def leaving_text_unverified(payload):
+            # segments only the first sentence; the second goes unjudged
+            return [{"claim": "One [1].", "verdict": "supported"}]
+
+        answer = kb.ask("refund", llm=lambda p: "One [1]. Two [1].",
+                        verify=leaving_text_unverified, k=3)
+        assert answer.verification.structural_issues
+        assert answer.verification.ok is False
+        assert "unverified" in answer.verification.structural_issues[0]
+
+    def test_valid_and_ok_when_everything_is_reported(self, kb):
+        def complete_verifier(payload):
+            return {"claims": ["supported"] * len(payload["claims"]),
+                    "facets": [{"facet": f, "covered": True}
+                               for f in payload["facets"]]}
+
+        answer = kb.ask_multi(
+            "refund deadline and payment",
+            subqueries=["refund deadline", "refund payment"],
+            llm=lambda p: "30 days [1].", verify=complete_verifier, k=5,
+        )
+        assert answer.verification.valid is True
+        assert answer.verification.ok is True
+        assert answer.verification.complete is True
+
+
+class TestSegmentationStructure:
+    """Order, non-overlap and full coverage are structural properties the
+    library can check without judging meaning."""
+
+    def test_overlapping_spans_are_rejected(self, kb):
+        def overlapping(payload):
+            return [
+                {"claim": "Refunds take 30 days", "verdict": "supported"},
+                {"claim": "30 days [1].", "verdict": "supported"},  # overlaps
+            ]
+
+        answer = kb.ask("refund", llm=lambda p: "Refunds take 30 days [1].",
+                        verify=overlapping, verification_mode="repair", k=3)
+        assert "overlaps or is out of order" in answer.verification.error
+        assert answer.text == "Refunds take 30 days [1].", "answer preserved"
+        assert answer.verification.ok is False
+
+    def test_out_of_order_spans_are_rejected(self, kb):
+        def reversed_order(payload):
+            return [
+                {"claim": "Two [1].", "verdict": "supported"},
+                {"claim": "One [1].", "verdict": "supported"},
+            ]
+
+        answer = kb.ask("refund", llm=lambda p: "One [1]. Two [1].",
+                        verify=reversed_order, k=3)
+        assert answer.verification.error
+        assert answer.verification.ok is False
+
+    def test_uncovered_answer_text_is_flagged(self, kb):
+        def partial_segmentation(payload):
+            return [{"claim": "One [1].", "verdict": "supported"}]
+
+        answer = kb.ask("refund", llm=lambda p: "One [1]. Two [1]. Three [1].",
+                        verify=partial_segmentation, k=3)
+        issue = answer.verification.structural_issues[0]
+        assert "not covered by any claim" in issue
+        assert "unverified" in issue
+
+    def test_full_coverage_has_no_structural_issue(self, kb):
+        def full(payload):
+            return [
+                {"claim": "One [1].", "verdict": "supported"},
+                {"claim": "Two [1].", "verdict": "supported"},
+            ]
+
+        answer = kb.ask("refund", llm=lambda p: "One [1]. Two [1].",
+                        verify=full, k=3)
+        assert answer.verification.structural_issues == []
+        assert answer.verification.valid is True
+
+
+class TestReplacementMustBeSupported:
+    """A replacement is text the verifier wrote, not text the user's model
+    produced — it enters the answer only on an explicit endorsement."""
+
+    @pytest.mark.parametrize("verdict", ["uncited", "inference", "question_fact"])
+    def test_non_supported_replacement_is_not_accepted(self, kb, verdict):
+        answer = kb.ask(
+            "refund",
+            llm=lambda p: "Refunds are instant [1].",
+            verify=verdicts(
+                {"verdict": "contradicted", "rationale": "wrong",
+                 "replacement": "Some rewritten text [1]."},
+                recheck=verdict,
+            ),
+            verification_mode="repair", k=3,
+        )
+        assert "Some rewritten text" not in answer.text
+        assert answer.verification.claims[0].action == "removed"
+        assert answer.verification.claims[0].replacement_verdict == verdict
+
+    def test_supported_replacement_is_accepted(self, kb):
+        answer = kb.ask(
+            "refund",
+            llm=lambda p: "Refunds are instant [1].",
+            verify=verdicts(
+                {"verdict": "contradicted", "rationale": "wrong",
+                 "replacement": "Refunds take 30 days [1]."},
+                recheck="supported",
+            ),
+            verification_mode="repair", k=3,
+        )
+        assert answer.text == "Refunds take 30 days [1]."
 
 
 class TestCompatibility:

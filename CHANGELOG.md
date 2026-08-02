@@ -12,7 +12,29 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
 
 ## [Unreleased]
 
+### Fixed
+- **Verification failed *open*.** `ok` was `not any(problem for claim in
+  claims)`, and a crashed verifier leaves `claims` empty — so `not any([])`
+  reported the answer as faithful precisely when nothing had been checked.
+  Anything gating on `ok` would ship unverified text. Likewise a verifier that
+  reported coverage for 1 of 2 facets yielded `complete=True`, silently
+  counting the unreported facet as covered. Both now fail closed.
+
 ### Added
+- **Structural validity as a fourth axis.** `valid` and `structural_issues`
+  join fidelity (`ok`), coverage (`complete`) and `segmentation`. A result can
+  be structurally unsound regardless of the verdicts, and `ok`/`complete`
+  require validity. Issues recorded: facets the verifier never reported on,
+  and answer text no claim covered (counted in characters — the library
+  reports what went unjudged without guessing whether it was "material").
+- **Segmentation structural requirements.** Verifier-supplied spans must be
+  verbatim, ordered and **non-overlapping**; overlaps would judge the same
+  text twice and make repair produce garbage. Violations are rejected and the
+  original answer preserved.
+- **Replacements require an explicit `supported`.** Re-verification previously
+  accepted anything that was not `unsupported`/`contradicted`, so an `uncited`
+  or `inference` verdict let verifier-written text into the answer. Only an
+  endorsement counts now.
 - **Claim segmentation: scripts without letter case, abbreviations, and
   optional verifier-supplied boundaries.** The split required an uppercase
   letter after the terminator, so answers in Chinese, Japanese, Korean, Arabic
