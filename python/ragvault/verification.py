@@ -145,6 +145,15 @@ class VerificationReport:
     #: Which segmentation produced the claims: the built-in heuristic, or the
     #: verifier's own (which can split two claims inside one sentence).
     segmentation: str = "heuristic"
+    #: Facets the answer was expected to cover (empty when the question was
+    #: not decomposed). Kept so a *partial* coverage report can be detected:
+    #: a facet the verifier never mentioned is not a covered facet.
+    expected_facets: list[str] = field(default_factory=list)
+    #: Structural defects in the verifier's own output — overlapping or
+    #: out-of-order spans, unreported facets, answer text no claim covered.
+    #: Separate from fidelity and coverage: the result can be structurally
+    #: invalid regardless of what the verdicts say.
+    structural_issues: list[str] = field(default_factory=list)
     #: Per-facet coverage, when the caller decomposed the question and the
     #: verifier reported it. Fidelity (claims) and completeness (facets) are
     #: separate axes: an answer can be fully supported and still incomplete.
@@ -152,8 +161,23 @@ class VerificationReport:
     elapsed_ms: float = 0.0
 
     @property
+    def valid(self) -> bool:
+        """True when the verification ran to completion and its output was
+        structurally sound. Fidelity and coverage are only meaningful when
+        this holds."""
+        return self.error is None and not self.structural_issues
+
+    @property
     def ok(self) -> bool:
-        """True when no claim was judged unsupported or contradicted."""
+        """True only when verification completed, the result is structurally
+        valid, and no claim was judged unsupported or contradicted.
+
+        Deliberately fails closed: a crashed verifier used to leave `claims`
+        empty, and `not any([])` is True — so a failure reported the answer as
+        faithful. Anything that gates on `ok` would then ship unverified text.
+        """
+        if not self.valid:
+            return False
         return not any(c.is_problem for c in self.claims)
 
     @property
@@ -162,22 +186,40 @@ class VerificationReport:
 
     @property
     def uncovered_facets(self) -> list[dict]:
-        """Facets the verifier judged unaddressed. Empty when the verifier
-        did not report coverage — absence of a report is not evidence of
-        coverage, so `complete` distinguishes the two."""
-        return [f for f in self.facet_coverage if not f["covered"]]
+        """Facets judged unaddressed, plus any expected facet the verifier
+        never mentioned — an unreported facet is not a covered facet."""
+        out = [f for f in self.facet_coverage if not f["covered"]]
+        reported = {f["facet"] for f in self.facet_coverage}
+        for facet in self.expected_facets:
+            if facet not in reported:
+                out.append({
+                    "facet": facet, "covered": False,
+                    "rationale": "the verifier did not report on this facet",
+                })
+        return out
 
     @property
     def complete(self) -> Optional[bool]:
-        """True/False when facet coverage was reported, None when it was not."""
-        if not self.facet_coverage:
+        """True only when every expected facet was reported *and* covered.
+
+        `None` means "unknown": either there were no facets, or the verifier
+        reported none at all. A partial report is not unknown — it is
+        incomplete, so it yields False rather than silently passing.
+        """
+        if not self.expected_facets:
             return None
+        if not self.facet_coverage:
+            return None  # verifier did not opine at all
+        if not self.valid:
+            return False
         return not self.uncovered_facets
 
     def to_dict(self) -> dict:
         return {
             "mode": self.mode,
             "ok": self.ok,
+            "valid": self.valid,
+            "structural_issues": list(self.structural_issues),
             "segmentation": self.segmentation,
             "claims": [c.to_dict() for c in self.claims],
             "facet_coverage": list(self.facet_coverage),
@@ -197,6 +239,7 @@ class VerificationReport:
     def __repr__(self) -> str:
         return (
             f"VerificationReport(mode={self.mode!r}, ok={self.ok}, "
+            f"valid={self.valid}, complete={self.complete}, "
             f"claims={len(self.claims)}, counts={self.counts()})"
         )
 
@@ -387,8 +430,9 @@ def verify_answer(
     try:
         results, facet_report, resegmented = run(claims, allow_resegmentation=True)
         if resegmented is not None:
-            claims, separators = _locate_spans(resegmented, answer_text)
+            claims, separators, issues = _locate_spans(resegmented, answer_text)
             report.segmentation = "verifier"
+            report.structural_issues.extend(issues)
         for claim, item in zip(claims, results):
             verdict, rationale, replacement = _coerce_verdict(item, claim)
             indices = citations_in(claim)
@@ -403,7 +447,17 @@ def verify_answer(
                 ],
                 replacement=replacement,
             ))
+        report.expected_facets = list(facets or [])
         report.facet_coverage = _coerce_facets(facet_report, facets)
+        if report.expected_facets and report.facet_coverage:
+            reported = {f["facet"] for f in report.facet_coverage}
+            missing = [f for f in report.expected_facets if f not in reported]
+            if missing:
+                report.structural_issues.append(
+                    f"verifier reported coverage for {len(report.facet_coverage)} "
+                    f"of {len(report.expected_facets)} facets; missing: "
+                    + ", ".join(repr(m) for m in missing)
+                )
     except ConfigurationError:
         raise  # caller error (bad verdict/shape) — surface it, don't swallow
     except Exception as exc:
@@ -428,11 +482,15 @@ def verify_answer(
             for claim, item in zip(rewritten, recheck):
                 verdict, rationale, _ = _coerce_verdict(item, claim.replacement or "")
                 claim.replacement_verdict = verdict
-                if verdict in _PROBLEM_VERDICTS:
+                # Fail closed: only an explicitly `supported` replacement may
+                # enter the answer. `uncited`/`inference`/`question_fact` are
+                # not endorsements, and this text was written by the verifier,
+                # not by the model whose output the user chose to trust.
+                if verdict != SUPPORTED:
                     claim.replacement = None
                     claim.action = "removed"
                     claim.rationale = (
-                        f"{claim.rationale} | replacement also rejected "
+                        f"{claim.rationale} | replacement not accepted "
                         f"({verdict}): {rationale}"
                     ).strip(" |")
             report.repaired_text = _apply_mode(
@@ -451,34 +509,54 @@ def verify_answer(
 
 def _locate_spans(
     texts: Sequence[str], answer: str
-) -> tuple[list[str], list[str]]:
-    """Map verifier-supplied claims back onto the answer, returning the claims
-    and the exact text between them.
+) -> tuple[list[str], list[str], list[str]]:
+    """Map verifier-supplied claims back onto the answer.
 
-    Working with spans of the original (rather than the verifier's copy) is
-    what lets ``repair`` stay surgical: removing a claim removes that span and
-    keeps every character around it, so formatting and the un-flagged half of
-    a sentence both survive.
+    Returns (claims, separators, structural_issues). Working with spans of the
+    original — rather than the verifier's copy — is what lets ``repair`` stay
+    surgical: removing a claim removes that span and keeps every character
+    around it.
+
+    Order and non-overlap are *structural* requirements, checked here: spans
+    that overlap would judge the same text twice and make repair produce
+    garbage, and out-of-order spans make the separators between them
+    meaningless. Both are rejected rather than silently worked around.
     """
     spans: list[tuple[int, int]] = []
     cursor = 0
     for text in texts:
         start = answer.find(text, cursor)
-        if start < 0:  # out of order: fall back to a global search
+        if start < 0:
             start = answer.find(text)
         if start < 0:  # pragma: no cover - guarded by the caller
             raise ValueError(f"claim not found in the answer: {text[:60]!r}")
         spans.append((start, start + len(text)))
         cursor = start + len(text)
-    order = sorted(range(len(spans)), key=lambda i: spans[i][0])
-    if order != list(range(len(spans))):
-        # Keep the verifier's order for verdict alignment, but separators are
-        # only meaningful for spans in document order.
-        return list(texts), [" "] * max(0, len(texts) - 1)
-    seps = [
-        answer[spans[i][1]:spans[i + 1][0]] for i in range(len(spans) - 1)
-    ]
-    return list(texts), seps
+
+    for i in range(1, len(spans)):
+        if spans[i][0] < spans[i - 1][1]:
+            raise ValueError(
+                "verifier segmentation overlaps or is out of order at claim "
+                f"{i + 1}: {texts[i][:40]!r}"
+            )
+
+    issues: list[str] = []
+    # Text no claim covers was never judged. Structural, not semantic: we do
+    # not guess whether it was "material", only report that it went unseen.
+    covered = sum(end - start for start, end in spans)
+    gaps = [answer[:spans[0][0]]] if spans else [answer]
+    gaps += [answer[spans[i][1]:spans[i + 1][0]] for i in range(len(spans) - 1)]
+    if spans:
+        gaps.append(answer[spans[-1][1]:])
+    unseen = sum(len(g.strip()) for g in gaps)
+    if unseen:
+        issues.append(
+            f"{unseen} character(s) of the answer were not covered by any "
+            "claim and therefore went unverified"
+        )
+
+    seps = [answer[spans[i][1]:spans[i + 1][0]] for i in range(len(spans) - 1)]
+    return list(texts), seps, issues
 
 
 def _coerce_facets(

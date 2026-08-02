@@ -138,9 +138,9 @@ reais**). Devolve um veredito por afirmação — string ou dict com `verdict`,
 |---|---|
 | `supported` | a fonte citada sustenta a afirmação |
 | `unsupported` | a citação não sustenta o que foi afirmado |
-| `contradicted` | a fonte citada **contradiz** a afirmação |
+| `contradicted` | a fonte citada **ou um fato explícito da pergunta** contradiz a afirmação — vale mesmo sem fonte documental envolvida |
 | `uncited` | afirmação sem citação |
-| `question_fact` | fato vindo da pergunta, não do documento |
+| `question_fact` | **apenas** repetição de fato dado na pergunta; conclusões, aplicações de regra e deduções são `inference`, não `question_fact` |
 | `inference` | inferência derivada, não afirmação documental |
 
 | Modo | Ação |
@@ -192,10 +192,42 @@ documento citado (incluindo `status`, data de vigência e versão), também
 disponível em `Citation.metadata` — sem isso o verificador não consegue
 distinguir uma regra vigente de uma revogada.
 
+### Quatro eixos independentes
+
+| Eixo | Pergunta que responde |
+|---|---|
+| `ok` | as afirmações se sustentam? (fidelidade) |
+| `complete` | todas as facetas foram cobertas? (completude) |
+| `valid` | a saída do verificador é estruturalmente sã? |
+| `segmentation` | quem dividiu as afirmações? |
+
+**Falha fechada.** `ok` e `complete` só podem ser `True` quando a verificação
+**completou** e o resultado é estruturalmente válido:
+
+- verificador que levantou exceção → `ok=False` (antes `not any([])` dava
+  `True`: um verificador quebrado reportava a resposta como fiel, e quem
+  fizesse `if verification.ok:` embarcava texto não verificado);
+- faceta esperada que o verificador não mencionou → conta como **não coberta**
+  e aparece em `uncovered_facets`;
+- `complete=None` significa *desconhecido* (não havia facetas, ou o
+  verificador não opinou) — nunca é um `True` silencioso;
+- trecho da resposta que nenhuma afirmação cobriu → `structural_issues`
+  registra quantos caracteres ficaram **sem verificação**, e `ok` cai.
+
+**Requisitos estruturais da segmentação do verificador** (checáveis sem
+julgar significado): substrings literais, ordem preservada e **sem
+sobreposição** — spans sobrepostos julgariam o mesmo texto duas vezes e fariam
+o reparo produzir lixo. Violação é recusada e a resposta original preservada.
+
+**Replacement só entra se `supported`.** O texto do `replacement` foi escrito
+pelo verificador, não pelo modelo que o usuário escolheu: `uncited`,
+`inference` ou `question_fact` na revalidação **não são endosso** e o trecho é
+removido em vez de substituído.
+
 **Garantias:** verificador que levanta exceção, devolve `None` ou um número
 errado de vereditos **preserva a resposta original** e registra o erro
 (`answer.verification.error`) — um verificador quebrado nunca destrói uma
-resposta válida. Veredito ou modo desconhecido são `ConfigurationError`
+resposta válida, e também nunca a declara fiel. Veredito ou modo desconhecido são `ConfigurationError`
 acionável, nunca tratados como "ok" em silêncio. Se tudo for removido, a
 resposta declara isso em vez de ficar vazia. Nenhum provedor é obrigatório.
 
