@@ -41,6 +41,7 @@ from .embeddings import (
 )
 from .errors import ConfigurationError, IngestionError
 from .parsers import parse_file, supported_extensions
+from .verification import VerificationReport, verify_answer
 
 CONFIG_FILE = "ragvault.json"
 
@@ -70,10 +71,22 @@ class Answer:
     context: str
     citations: list[Citation]
     result: RetrievalResult
+    #: Post-generation semantic validation, when ``verify=`` was supplied.
+    #: ``None`` means no verification ran (default behaviour, unchanged).
+    verification: Optional["VerificationReport"] = None
+
+    @property
+    def unverified_claims(self) -> list:
+        """Claims judged unsupported or contradicted (empty when not verified)."""
+        return self.verification.unsupported if self.verification else []
 
     def __repr__(self) -> str:
         preview = self.text[:80] + ("…" if len(self.text) > 80 else "")
-        return f"Answer(text={preview!r}, citations={len(self.citations)})"
+        verified = ""
+        if self.verification is not None:
+            verified = f", verified={'ok' if self.verification.ok else 'issues'}"
+        return (f"Answer(text={preview!r}, "
+                f"citations={len(self.citations)}{verified})")
 
 
 class _EmbeddingCache:
@@ -862,11 +875,19 @@ class KnowledgeBase:
         llm: Callable[[str], str],
         citations: bool = True,
         system_prompt: Optional[str] = None,
+        verify: Optional[Callable] = None,
+        verification_mode: str = "report",
         **retrieve_kwargs: Any,
     ) -> Answer:
         """Retrieve context and call a user-provided LLM. The LLM is a plain
         callable ``prompt -> answer text``; RagVault never calls external
-        services on its own."""
+        services on its own.
+
+        Pass ``verify=`` to run post-generation semantic validation over the
+        answer's claims (see :mod:`ragvault.verification`). Without it the
+        behaviour is exactly as before.
+        """
+        trace = bool(retrieve_kwargs.get("trace"))
         result = self.retrieve(question, **retrieve_kwargs)
         instructions = system_prompt or (
             "Answer the question using only the context below. "
@@ -886,11 +907,22 @@ class KnowledgeBase:
             raise ConfigurationError(
                 "llm must be a callable(prompt)->text or expose .complete(prompt)"
             )
+        text = str(text)
+        report = None
+        if verify is not None:
+            report = verify_answer(
+                question=question, answer_text=text, context=result.context,
+                citations=result.citations, verify=verify, mode=verification_mode,
+            )
+            text = report.repaired_text
+            if trace and result.trace is not None:
+                result.trace["verification"] = report.to_dict()
         return Answer(
-            text=str(text),
+            text=text,
             context=result.context,
             citations=result.citations,
             result=result,
+            verification=report,
         )
 
     # -- evaluation --------------------------------------------------------

@@ -25,7 +25,8 @@ tag:           v1.0.0-rc1 criada localmente em 22e880d, mas o proxy git desta
   LlamaIndex/Haystack/DSPy fixados), wheels Linux x86-64/aarch64 + macOS arm64 +
   Windows x86-64 com smoke de clean-install — **tudo verde em 3d3a62b+**
 - **Não validável neste ambiente:** CUDA/cuVS (runbook em docs/GPU.md);
-  linhas semânticas do eval RAG (rede nega huggingface.co, CONNECT 403).
+  linhas semânticas do eval RAG (rede nega huggingface.co) — **já executadas
+  externamente**, números medidos em benchmarks/RESULTS-RAG.md.
 
 ## Estado do produto (v1.0 CPU single-node)
 
@@ -56,8 +57,9 @@ CI multiplataforma + integrações reais, CHANGELOG + docs/RELEASE.
 2. **PyPI** — autorizado, porém sem credenciais neste ambiente (sem token,
    sem ~/.pypirc). Publicar de uma máquina com token: baixar os artefatos do
    CI e `twine upload dist/*.whl` (ou `maturin publish`).
-3. Eval semântico real — requer ambiente com acesso a huggingface.co
-   (comando documentado em benchmarks/RESULTS-RAG.md; não inventar números).
+3. ~~Eval semântico real~~ — **concluído** (2026-08-02, máquina externa com
+   acesso ao modelo): semantic dense recall@5 1.000 / MRR-paráfrase 0.958;
+   híbrido piora o dense semântico e rerank custa 40× sem ganho. RESULTS-RAG.md.
 4. GPU real (cuVS/CAGRA) — requer hardware; runbook em docs/GPU.md.
 5. Otimizações futuras gated em benchmark: roaring bitmaps, OPQ/binary
    quant, compaction em background agendado, SIMD por arch.

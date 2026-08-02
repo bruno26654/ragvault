@@ -16,7 +16,8 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 > `VisitedSet` geracional comprovado (RESULTS-HNSW.md), correções Windows,
 > **storage v2 completo (ADR 0016)** e compactação read-friendly. Gates A–D
 > `validated`. **Nenhum P0/P1/P2 arquitetural aberto.** Pendências externas:
-> eval semântico (rede nega huggingface.co) e GPU real (sem hardware).
+> GPU real (sem hardware). O eval semântico foi executado externamente e está
+> registrado com números medidos em benchmarks/RESULTS-RAG.md.
 
 ## Gate A — Fundação confiável (VALIDATED)
 
@@ -82,7 +83,7 @@ Rastreabilidade de requisitos → implementação → evidência. Estados:
 |---|---|---|
 | Dataset real reproduzível commitado (30 passagens / 24 queries, 12 paráfrase + 12 keyword) | validated | benchmarks/data/*.jsonl |
 | Harness bm25 / lexical / hybrid / +MMR / +expansion com Recall@k, MRR, nDCG, precision, dup, tokens, p50/p95 e MRR por estilo | validated | benchmarks/bench_rag_quality.py → RESULTS-RAG.md (números executados) |
-| Linhas semânticas (dense/hybrid/rerank com sentence-transformers) | blocked | política de rede nega huggingface.co (CONNECT 403, registrado no proxy); comando exato documentado no harness e em RESULTS-RAG.md |
+| Linhas semânticas (dense/hybrid/rerank com sentence-transformers) | validated | executadas em máquina com acesso ao modelo (2026-08-02): **semantic dense recall@5 1.000, MRR 0.979, MRR-paráfrase 0.958** vs 0.417 do baseline lexical. Dois achados registrados: fusão híbrida *piora* o dense semântico (MRR 0.979 → 0.785) e o rerank custa 40× de latência (10.1 → 411.9 ms p50) sem ganho algum de qualidade neste corpus. RESULTS-RAG.md |
 
 ## Gate D — Performance avançada
 
@@ -144,6 +145,25 @@ entrada de distratores, citações inconsistentes e rerank caro em CPU.
 | Compatibilidade com `retrieve()`/`retrieve_many()`/`ask()` | validated | `TestCompatibility` (comportamento single-query inalterado) |
 | Benchmark single vs multi (precisão, recall, latência, tokens) | validated | `benchmarks/bench_multiquery.py` + dataset multi-hop commitado (24 perguntas: 20 two-hop + 4 three-hop) → RESULTS-MULTIQUERY.md |
 | Exemplo funcional com Groq (sem dependência obrigatória) | validated | `examples/multi_query_rag.py` (roda offline por padrão; `--groq` opcional) |
+
+## Validação semântica pós-geração (`verify=`)
+
+Complementa a integridade de citações: aquela barra `[n]` inventado, esta pega
+a citação que **existe mas não sustenta** a afirmação.
+
+| Tarefa | Status | Evidência |
+|---|---|---|
+| Verificador opcional por callback em `ask()` e `ask_multi()` | validated | `TestCompatibility` (sem `verify=` o comportamento é idêntico ao anterior) |
+| Extração de afirmações + citações `[n]` associadas + resolução para chunks reais | validated | `test_evidence_resolves_to_real_chunks`, `TestClaimSplitting` |
+| Vereditos `supported/unsupported/contradicted/uncited/question_fact/inference` | validated | `TestWrongButExistingCitation`, `TestQuestionFactVsDocumentEvidence` |
+| Distinção fato-da-pergunta × evidência documental × inferência | validated | `test_question_fact_is_distinguished_from_evidence`, `test_inference_is_its_own_verdict` |
+| Modos `report` / `annotate` / `repair` / `strict` | validated | um teste por modo; `repair` usa `replacement` quando oferecido |
+| Conflito vigente × revogado detectado na resposta | validated | `TestVersionConflict` (afirmação com regra revogada é reparada) |
+| Afirmação sem citação | validated | `TestUncitedClaims` (`strict` remove, `repair` mantém) |
+| Falha do verificador preserva a resposta válida | validated | `TestVerifierFailure` (exceção, `None`, contagem errada de vereditos → resposta intacta + erro registrado) |
+| Veredito/modo inválido são erro acionável (não "ok" silencioso) | validated | `test_unknown_verdict_is_an_actionable_error`, `test_unknown_mode_is_rejected` |
+| Trace: afirmação, citações, status, justificativa, correções e tempo | validated | `TestTraceAndReport` |
+| Sem dependência obrigatória de provedor | validated | verificador é callable; exemplo roda offline, `--groq` opcional |
 
 ## Backlog v1.0 restante (apenas performance/formato — nenhum P0/P1 aberto)
 

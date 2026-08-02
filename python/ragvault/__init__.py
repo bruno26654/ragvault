@@ -37,6 +37,7 @@ from .evaluate import EvaluationReport
 from .kb import Answer, KnowledgeBase, SyncReport, open_kb as open  # noqa: A001
 from .multiquery import MultiRetrievalResult
 from .rerankers import maxsim_reranker, maxsim_score
+from .verification import ClaimVerification, VerificationReport
 from .parsers import ParsedDocument, parse_file, register_parser
 
 # Prefer the installed distribution's version (always matches the wheel's
@@ -61,6 +62,8 @@ __all__ = [
     "maxsim_score",
     "RetrievalResult",
     "MultiRetrievalResult",
+    "VerificationReport",
+    "ClaimVerification",
     "RetrievedChunk",
     "Citation",
     "Answer",

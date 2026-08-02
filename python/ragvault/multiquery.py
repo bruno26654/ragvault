@@ -533,13 +533,22 @@ def ask_multi(
     llm: Callable[[str], str],
     citations: bool = True,
     system_prompt: Optional[str] = None,
+    verify: Optional[Callable] = None,
+    verification_mode: str = "report",
     **retrieve_kwargs: Any,
 ) -> "Answer":
     """Multi-query ask: retrieve_multi + user-provided LLM + citation
     integrity. Markers ``[n]`` that do not exist in the context are stripped
     from the answer, and the prompt forbids presenting facts from the
-    question itself as documented evidence."""
+    question itself as documented evidence.
+
+    Pass ``verify=`` to additionally run post-generation semantic validation:
+    citation-marker sanity catches *invented* numbers, while verification
+    catches a marker that exists but does not actually support its claim
+    (see :mod:`ragvault.verification`).
+    """
     from .kb import Answer
+    from .verification import verify_answer
 
     result = retrieve_multi(kb, question, **retrieve_kwargs)
     instructions = system_prompt or (
@@ -582,9 +591,19 @@ def ask_multi(
         text, removed = sanitize_citations(text, len(result.citations))
         if removed and result.trace is not None:
             result.trace["citations_removed_from_answer"] = removed
+    report = None
+    if verify is not None:
+        report = verify_answer(
+            question=question, answer_text=text, context=result.context,
+            citations=result.citations, verify=verify, mode=verification_mode,
+        )
+        text = report.repaired_text
+        if result.trace is not None:
+            result.trace["verification"] = report.to_dict()
     return Answer(
         text=text,
         context=result.context,
         citations=result.citations,
         result=result,
+        verification=report,
     )

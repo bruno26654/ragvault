@@ -21,7 +21,7 @@ Presets: `quality, balanced, fast, offline, multilingual, code, long_documents, 
 | `retrieve_many(queries, **kw)` / `aretrieve` / `aretrieve_many` | lote e async |
 | `retrieve_multi(question, subqueries=None, decompose=None, max_subqueries=6, fusion="weighted_rrf", coverage_per_subquery=1, rerank=None, filters=None, boosts=None, resolve_versions=False, **retrieve_kw)` | pipeline multi-query → `MultiRetrievalResult` |
 | `ask_multi(question, llm=..., citations=True, **retrieve_multi_kw)` / `aretrieve_multi` / `aask_multi` | multi-query + LLM com integridade de citações |
-| `ask(question, llm=..., citations=True, system_prompt=None, **retrieve_kw)` | → `Answer` (LLM é seu) |
+| `ask(question, llm=..., citations=True, system_prompt=None, verify=None, verification_mode="report", **retrieve_kw)` | → `Answer` (LLM é seu) |
 | `evaluate(dataset, k=10)` | → `EvaluationReport` |
 | `compare(dataset, presets=[...], k=10)` | avalia presets (parâmetros de retrieval) → `ComparisonReport` |
 | `tune(dataset, objective="ndcg@10", max_p95_ms=None, grid=None)` | grid-search com evidência → `TuningRecommendation` (nunca aplica sozinho) |
@@ -100,6 +100,58 @@ marcadores `[n]` inexistentes no contexto são removidos da resposta; o prompt
 declara explicitamente que fatos da pergunta não são evidência documental.
 
 `MultiRetrievalResult` = `RetrievalResult` + `.subqueries` + `.conflicts`.
+
+## Validação semântica pós-geração (`verify=`)
+
+A integridade de citações barra marcador `[n]` **inventado**. O que ela não
+pega é a citação que **existe mas não sustenta** a afirmação, o fato da
+pergunta apresentado como evidência documental, ou a afirmação contradita
+pela própria fonte citada. Para isso há um verificador opcional por callback:
+
+```python
+answer = kb.ask_multi(
+    question, llm=answer_llm,
+    verify=semantic_verifier,      # callable(payload) -> [veredito por afirmação]
+    verification_mode="repair",
+    trace=True,
+)
+
+print(answer.text)                  # já reparado
+print(answer.verification.ok)       # False se algo não se sustenta
+print(answer.unverified_claims)     # afirmações problemáticas
+```
+
+O verificador recebe um payload com `question`, `answer`, `context` e, por
+afirmação, `claim` + `citations` + `evidence` (documento, versão e **chunk_ids
+reais**). Devolve um veredito por afirmação — string ou dict com `verdict`,
+`rationale` e `replacement` opcional.
+
+| Veredito | Significado |
+|---|---|
+| `supported` | a fonte citada sustenta a afirmação |
+| `unsupported` | a citação não sustenta o que foi afirmado |
+| `contradicted` | a fonte citada **contradiz** a afirmação |
+| `uncited` | afirmação sem citação |
+| `question_fact` | fato vindo da pergunta, não do documento |
+| `inference` | inferência derivada, não afirmação documental |
+
+| Modo | Ação |
+|---|---|
+| `report` (padrão) | não altera nada; só anexa o relatório |
+| `annotate` | marca inline `[unsupported]`/`[contradicted]` |
+| `repair` | remove afirmações problemáticas, ou usa `replacement` |
+| `strict` | como `repair` e também remove as `uncited` |
+
+**Garantias:** verificador que levanta exceção, devolve `None` ou um número
+errado de vereditos **preserva a resposta original** e registra o erro
+(`answer.verification.error`) — um verificador quebrado nunca destrói uma
+resposta válida. Veredito ou modo desconhecido são `ConfigurationError`
+acionável, nunca tratados como "ok" em silêncio. Se tudo for removido, a
+resposta declara isso em vez de ficar vazia. Nenhum provedor é obrigatório.
+
+**Trace** (`trace=True`) em `trace["verification"]`: `mode`, `ok`, `counts`,
+`elapsed_ms` e, por afirmação, `claim`, `citations`, `chunk_ids`, `verdict`,
+`rationale`, `replacement` e `action` (`kept`/`annotated`/`rewritten`/`removed`).
 
 **Trace** (`trace=True`): `subqueries`, `candidates_per_subquery`, `fusion`
 (método, k0, contribuição de cada ranking por chunk, `fused_score` e
