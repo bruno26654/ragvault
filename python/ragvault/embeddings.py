@@ -122,7 +122,7 @@ class SentenceTransformersEmbedder:
             ) from exc
         self._model = SentenceTransformer(model_name)
         self.model_id = f"sentence-transformers:{model_name}"
-        self.dimension = int(self._model.get_sentence_embedding_dimension())
+        self.dimension = _st_dimension(self._model, self.model_id)
 
     def embed_documents(self, texts: list[str]) -> np.ndarray:  # pragma: no cover
         out = self._model.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
@@ -130,6 +130,33 @@ class SentenceTransformersEmbedder:
 
     def embed_queries(self, texts: list[str]) -> np.ndarray:  # pragma: no cover
         return self.embed_documents(texts)
+
+
+def _st_dimension(model: object, model_id: str) -> int:
+    """Embedding dimension of a SentenceTransformer, across versions.
+
+    sentence-transformers renamed ``get_sentence_embedding_dimension`` to
+    ``get_embedding_dimension``; calling the old name on a new version emits a
+    ``FutureWarning``. Prefer the new name, fall back to the old one, and as a
+    last resort measure the dimension by encoding a probe string — so a future
+    rename cannot break the adapter silently.
+    """
+    for attr in ("get_embedding_dimension", "get_sentence_embedding_dimension"):
+        getter = getattr(model, attr, None)
+        if getter is None:
+            continue
+        dimension = getter()
+        if dimension:
+            return int(dimension)
+    probe = np.asarray(
+        model.encode([""], convert_to_numpy=True),  # type: ignore[attr-defined]
+        dtype=np.float32,
+    )
+    if probe.ndim != 2 or probe.shape[1] == 0:
+        raise EmbeddingError(
+            f"could not determine the embedding dimension of {model_id}"
+        )
+    return int(probe.shape[1])
 
 
 def _validate_output(out: object, n: int, dim: int, model_id: str) -> np.ndarray:

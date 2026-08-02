@@ -116,6 +116,53 @@ class TestEmbeddings:
         assert np.all(v == 0)
 
 
+class TestSentenceTransformersDimension:
+    """sentence-transformers renamed get_sentence_embedding_dimension to
+    get_embedding_dimension; the adapter must work on both without emitting a
+    FutureWarning, and still cope with a future rename."""
+
+    def test_prefers_the_new_api(self, recwarn):
+        from ragvault.embeddings import _st_dimension
+
+        class NewModel:
+            def get_embedding_dimension(self):
+                return 384
+
+            def get_sentence_embedding_dimension(self):  # pragma: no cover
+                raise AssertionError("deprecated API must not be called")
+
+        assert _st_dimension(NewModel(), "m") == 384
+        assert not [w for w in recwarn if issubclass(w.category, FutureWarning)]
+
+    def test_falls_back_to_the_legacy_api(self):
+        from ragvault.embeddings import _st_dimension
+
+        class OldModel:
+            def get_sentence_embedding_dimension(self):
+                return 768
+
+        assert _st_dimension(OldModel(), "m") == 768
+
+    def test_measures_dimension_when_no_getter_exists(self):
+        from ragvault.embeddings import _st_dimension
+
+        class FutureModel:
+            def encode(self, texts, **kwargs):
+                return np.zeros((len(texts), 512), dtype=np.float32)
+
+        assert _st_dimension(FutureModel(), "m") == 512
+
+    def test_undeterminable_dimension_is_actionable(self):
+        from ragvault.embeddings import _st_dimension
+
+        class BrokenModel:
+            def encode(self, texts, **kwargs):
+                return np.zeros((len(texts), 0), dtype=np.float32)
+
+        with pytest.raises(ragvault.EmbeddingError):
+            _st_dimension(BrokenModel(), "broken-model")
+
+
 class TestEmbeddingCache:
     def test_cache_hits_on_resync(self, tmp_path, docs_dir):
         with ragvault.open(tmp_path / "kb") as kb:
