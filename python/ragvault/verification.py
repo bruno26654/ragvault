@@ -24,9 +24,19 @@ This module adds an optional verification pass over the generated answer:
 4. **Act** according to ``verification_mode``:
    - ``"report"`` — change nothing, attach the report (default when verifying);
    - ``"annotate"`` — mark problem claims inline with a visible tag;
-   - ``"repair"`` — drop unsupported/contradicted claims, or use the
-     verifier's ``replacement`` text when it offers one;
+   - ``"repair"`` — drop unsupported/contradicted claims;
    - ``"strict"`` — like repair, but also drops claims that cite nothing.
+
+The verifier segments and classifies; it does not write. A ``replacement`` it
+proposes is ignored unless the caller passes ``allow_replacements=True``,
+because re-verifying one's own correction is self-endorsement — the second
+opinion comes from the judge that produced the text, carrying whatever blind
+spot produced it.
+
+Two independent axes come out of this: ``ok`` (every claim holds) and
+``complete`` (every facet the answer owed was fully covered). Both fail
+closed — a crash, a partial return, an unevaluated facet, or structurally
+unsound segmentation yields False, never a silent pass.
 
 RagVault never calls a provider itself: ``verify`` is a plain callable. If the
 verifier raises, the original answer is preserved unchanged and the failure is
@@ -202,14 +212,14 @@ class VerificationReport:
     def complete(self) -> Optional[bool]:
         """True only when every expected facet was reported *and* covered.
 
-        `None` means "unknown": either there were no facets, or the verifier
-        reported none at all. A partial report is not unknown — it is
-        incomplete, so it yields False rather than silently passing.
+        `None` means "unknown", and the only honest unknown is "no facets were
+        expected". Once the caller declared facets, silence about them is not
+        unknown — it is an unevaluated facet, which fails closed like a partial
+        report: a verifier that ignored every facet has not shown the answer is
+        complete, and neither has one that crashed.
         """
         if not self.expected_facets:
             return None
-        if not self.facet_coverage:
-            return None  # verifier did not opine at all
         if not self.valid:
             return False
         return not self.uncovered_facets
@@ -343,6 +353,7 @@ def verify_answer(
     verify: Callable,
     mode: str = "report",
     facets: Optional[Sequence[str]] = None,
+    allow_replacements: bool = False,
 ) -> VerificationReport:
     """Run the verification pass. See the module docstring for the contract.
 
@@ -351,6 +362,12 @@ def verify_answer(
     decomposed the question) the ``facets`` the answer was supposed to cover.
     It must return one verdict per claim: a list, or a dict with a ``claims``
     key and an optional ``facets`` list reporting per-facet coverage.
+
+    ``allow_replacements`` is off by default: the verifier segments and
+    classifies, it does not write. A verifier that proposes a ``replacement``
+    and then re-verifies it is grading its own text — self-endorsement, not
+    verification — so by default a problem claim is removed rather than
+    rewritten. Turn it on only if you accept that trade-off.
     """
     if mode not in VERIFICATION_MODES:
         raise ConfigurationError(
@@ -360,6 +377,10 @@ def verify_answer(
         raise ConfigurationError("verify must be a callable")
 
     report = VerificationReport(mode=mode, repaired_text=answer_text)
+    # Recorded before anything can fail: what the answer was *supposed* to
+    # cover does not depend on the verifier surviving. A crash must leave the
+    # completeness axis failing closed, not reverting to "no facets expected".
+    report.expected_facets = list(facets or [])
     started = time.monotonic()
 
     claims, separators = _split_with_separators(answer_text)
@@ -447,7 +468,6 @@ def verify_answer(
                 ],
                 replacement=replacement,
             ))
-        report.expected_facets = list(facets or [])
         report.facet_coverage = _coerce_facets(facet_report, facets)
         if report.expected_facets and report.facet_coverage:
             reported = {f["facet"] for f in report.facet_coverage}
@@ -468,7 +488,9 @@ def verify_answer(
         report.elapsed_ms = (time.monotonic() - started) * 1000
         return report
 
-    report.repaired_text = _apply_mode(report.claims, mode, answer_text, separators)
+    report.repaired_text = _apply_mode(
+        report.claims, mode, answer_text, separators, allow_replacements
+    )
 
     # Second pass over rewritten claims only. The verifier's `replacement` is
     # generated text that entered the answer without ever being checked — the
@@ -476,7 +498,7 @@ def verify_answer(
     # extra pass (never a loop): a replacement that fails re-verification is
     # dropped rather than replaced again.
     rewritten = [c for c in report.claims if c.action == "rewritten" and c.replacement]
-    if rewritten and mode in ("repair", "strict"):
+    if allow_replacements and rewritten and mode in ("repair", "strict"):
         try:
             recheck, _, _ = run([c.replacement for c in rewritten])  # type: ignore[misc]
             for claim, item in zip(rewritten, recheck):
@@ -494,7 +516,7 @@ def verify_answer(
                         f"({verdict}): {rationale}"
                     ).strip(" |")
             report.repaired_text = _apply_mode(
-                report.claims, mode, answer_text, separators
+                report.claims, mode, answer_text, separators, allow_replacements
             )
         except ConfigurationError:
             raise
@@ -580,7 +602,7 @@ def _coerce_facets(
 
 def _apply_mode(
     claims: list[ClaimVerification], mode: str, original: str,
-    separators: Sequence[str],
+    separators: Sequence[str], allow_replacements: bool = False,
 ) -> str:
     """Rebuild the answer according to the mode, recording each action.
 
@@ -610,7 +632,7 @@ def _apply_mode(
 
         # repair / strict
         if drop:
-            if claim.replacement:
+            if allow_replacements and claim.replacement:
                 kept.append((before, claim.replacement.strip()))
                 claim.action = "rewritten"
             else:

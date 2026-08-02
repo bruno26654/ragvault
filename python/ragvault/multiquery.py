@@ -564,6 +564,7 @@ def ask_multi(
     system_prompt: Optional[str] = None,
     verify: Optional[Callable] = None,
     verification_mode: str = "report",
+    allow_replacements: bool = False,
     **retrieve_kwargs: Any,
 ) -> "Answer":
     """Multi-query ask: retrieve_multi + user-provided LLM + citation
@@ -574,7 +575,10 @@ def ask_multi(
     Pass ``verify=`` to additionally run post-generation semantic validation:
     citation-marker sanity catches *invented* numbers, while verification
     catches a marker that exists but does not actually support its claim
-    (see :mod:`ragvault.verification`).
+    (see :mod:`ragvault.verification`). The subqueries double as the facets the
+    answer owed, so the report carries completeness (`complete`) alongside
+    fidelity (`ok`). The verifier only segments and classifies; pass
+    ``allow_replacements=True`` to let it rewrite instead of remove.
     """
     from .kb import Answer
     from .verification import verify_answer
@@ -647,6 +651,7 @@ def ask_multi(
         report = verify_answer(
             question=question, answer_text=text, context=result.context,
             citations=result.citations, verify=verify, mode=verification_mode,
+            allow_replacements=allow_replacements,
             facets=result.subqueries[1:],
         )
         text = report.repaired_text

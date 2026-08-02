@@ -44,38 +44,62 @@ def complete(prompt: str) -> str:
     return response.choices[0].message.content or ""
 
 
-def _json_list(raw: str) -> list:
-    """Extrai o array JSON da resposta do modelo. Se falhar, levanta — o
-    RagVault trata a exceção e cai para o fallback seguro da etapa."""
-    match = re.search(r"\[.*\]", raw, re.DOTALL)
+def _json(raw: str):
+    """Extrai o JSON (array ou objeto) da resposta do modelo. Se falhar,
+    levanta — o RagVault trata a exceção e cai para o fallback seguro da
+    etapa."""
+    match = re.search(r"[\[{].*[\]}]", raw, re.DOTALL)
     return json.loads(match.group(0) if match else raw)
 
 
 def decompose(question: str) -> list[str]:
-    """Pergunta composta → subconsultas. Falha aqui = consulta única."""
-    return _json_list(complete(
+    """Pergunta composta → subconsultas. Falha aqui = consulta única.
+
+    Cada subconsulta deve tratar uma única obrigação de resposta: subconsultas
+    compostas gastam uma vaga de contexto para duas evidências e costumam
+    trazer só uma delas."""
+    return _json(complete(
         "Divida a pergunta no conjunto mínimo de buscas independentes "
-        "necessárias para respondê-la por completo. Responda apenas com um "
-        f"array JSON de strings.\n\nPergunta: {question}"
+        "necessárias para respondê-la por completo. Cada busca deve cobrir "
+        "exatamente um fato pedido — nunca combine dois numa só. Responda "
+        f"apenas com um array JSON de strings.\n\nPergunta: {question}"
     ))
 
 
-def verify(payload: dict) -> list:
-    """Julga cada afirmação contra a fonte que ela cita. Falha aqui =
-    resposta original preservada."""
-    claims = "\n".join(
-        f"{i}. {c['claim']}   (cita: {c['citations'] or 'nada'})"
-        for i, c in enumerate(payload["claims"], 1)
-    )
-    return _json_list(complete(
-        "Verifique se cada afirmação é sustentada pelos blocos de contexto "
-        f"que ela cita.\n\n# Contexto\n{payload['context']}\n\n"
-        f"# Pergunta do usuário\n{payload['question']}\n\n# Afirmações\n{claims}\n\n"
-        f"Para cada afirmação responda um objeto JSON com 'verdict' (um de "
-        f"{payload['verdicts']}) e 'rationale'. Use 'question_fact' quando a "
-        "afirmação apenas repete algo que o usuário afirmou na pergunta, e "
-        "'contradicted' quando o bloco citado diz o contrário. Responda "
-        "apenas com um array JSON."
+def verify(payload: dict) -> dict:
+    """Segmenta a resposta em proposições e julga cada uma contra a fonte que
+    cita, dizendo também quais facetas da pergunta ficaram cobertas.
+
+    O juiz não reescreve nada: um verificador que propõe a correção e depois a
+    aprova está avaliando o próprio texto. Falha aqui = resposta original
+    preservada e `ok=False` — nunca um passe silencioso.
+    """
+    return _json(complete(
+        "Você verifica uma resposta de RAG. Não reescreva nada: apenas "
+        "segmente e classifique.\n\n"
+        f"# Contexto\n{payload['context']}\n\n"
+        f"# Pergunta do usuário\n{payload['question']}\n\n"
+        f"# Resposta\n{payload['answer']}\n\n"
+        f"# Facetas que a resposta deveria cobrir\n{payload['facets']}\n\n"
+        "1. Segmente a resposta em TODAS as proposições materiais: trechos "
+        "literais da resposta, em ordem, sem sobreposição, cada um com uma "
+        "única proposição (uma frase com dois fatos vira dois itens).\n"
+        f"2. Classifique cada um com 'verdict' (um de {payload['verdicts']}) "
+        "e 'rationale', julgando contra os fatos explícitos da pergunta, os "
+        "blocos citados e os metadados das fontes:\n"
+        "   - 'contradicted' também quando contraria um fato dito na "
+        "pergunta, mesmo sem documento envolvido;\n"
+        "   - 'question_fact' só para repetir algo que a pergunta afirmou; um "
+        "fato dado na pergunta nunca é ausente nem indeterminável. Conclusões "
+        "e deduções são 'inference';\n"
+        "   - afirmação sobre regra passada ou revogada só é 'supported' se "
+        "algum bloco citado tiver metadados que mostrem esse estado antigo — "
+        "divergir da regra atual não prova que a antiga existiu.\n"
+        "3. Para cada faceta, 'covered' só é verdadeiro quando TODOS os seus "
+        "componentes foram respondidos corretamente.\n"
+        "Omitir uma proposição ou uma faceta não é aprovação. Responda apenas "
+        'com JSON: {"claims": [{"claim", "verdict", "rationale"}], '
+        '"facets": [{"facet", "covered", "rationale"}]}.'
     ))
 
 
@@ -120,9 +144,16 @@ for c in answer.citations:
     if c.index in usados:
         print(f"  [{c.index}] {c.title or c.document_id} — {c.uri or c.document_id}")
 
+# Fidelidade e completude são eixos separados: toda afirmação pode estar
+# sustentada e a resposta ainda deixar uma faceta da pergunta sem resposta.
 if not answer.verification.ok:
-    print("\nAfirmações sem suporte documental (removidas/corrigidas):")
+    print("\nAfirmações sem suporte documental (removidas):")
     for claim in answer.unverified_claims:
         print(f"  - {claim.claim}\n    ↳ {claim.rationale}")
+
+if answer.verification.complete is False:
+    print("\nFacetas da pergunta não cobertas:")
+    for facet in answer.verification.uncovered_facets:
+        print(f"  - {facet['facet']}\n    ↳ {facet['rationale']}")
 
 kb.close()

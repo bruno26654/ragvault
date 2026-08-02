@@ -82,6 +82,7 @@ resultados de cada subconsulta em um tier prioritário. Medido em
 |---|---|
 | `subqueries=[...]` | subconsultas manuais (ignora `decompose`) |
 | `decompose=fn` | callback externo; **qualquer falha cai para consulta única** |
+| ↳ *subconsultas atômicas* | cada subconsulta deve cobrir **uma** obrigação de resposta. Uma subconsulta composta reserva 1 vaga de cobertura para 2 evidências e traz só uma; separada em duas, cada evidência ganha a sua vaga |
 | `coverage_per_subquery` | quantos top-hits de cada subconsulta são reservados (0 desliga) |
 | `fusion_weights=[...]` | peso por consulta (pergunta original primeiro) |
 | `filters={...}` | filtro **obrigatório**, aplicado como prefilter nativo antes da busca |
@@ -147,22 +148,34 @@ reais**). Devolve um veredito por afirmação — string ou dict com `verdict`,
 |---|---|
 | `report` (padrão) | não altera nada; só anexa o relatório |
 | `annotate` | marca inline `[unsupported]`/`[contradicted]` |
-| `repair` | remove afirmações problemáticas, ou usa `replacement` |
+| `repair` | remove afirmações problemáticas |
 | `strict` | como `repair` e também remove as `uncited` |
+
+**O verificador segmenta e classifica; ele não escreve.** Um verificador que
+propõe um `replacement` e depois o revalida está avaliando o próprio texto —
+autoendosso, não verificação. Por isso `replacement` é **ignorado por padrão**
+(`allow_replacements=False`): a afirmação que não se sustenta é **removida**,
+não reescrita. Quem aceita essa troca liga `allow_replacements=True` em
+`ask()`/`ask_multi()`; aí vale a segunda passagem descrita abaixo.
 
 **Fidelidade × completude** são eixos separados: toda afirmação pode estar
 sustentada e a resposta ainda deixar uma faceta de fora. Quando a pergunta foi
 decomposta, as facetas vão no payload (`payload["facets"]`) e o verificador
 pode devolver `{"claims": [...], "facets": [{"facet": ..., "covered": bool,
 "rationale": ...}]}`. O relatório expõe `facet_coverage`, `uncovered_facets` e
-`complete` — que é `None` quando o verificador **não** reportou cobertura,
-porque ausência de relatório não é prova de cobertura. Faceta descoberta é
+`complete` — que só é `None` quando **não havia facetas a cobrir**. Declarada
+uma faceta, silêncio sobre ela não é desconhecido: é faceta **não avaliada**, e
+falha fechada como um relatório parcial. **Faceta composta** só é `covered=true`
+quando *todos* os seus componentes forem respondidos — julgamento que cabe ao
+verificador (está no prompt dos exemplos), não à biblioteca. Faceta descoberta é
 **reportada, nunca preenchida automaticamente**: regenerar exigiria uma
 chamada extra ao LLM que o chamador não pediu, com custo e risco de laço —
 a decisão fica com quem chama.
 
-**Segunda passagem sobre os `replacement`**: em `repair`/`strict`, o texto
-proposto pelo verificador é ele próprio verificado uma vez (nunca em laço).
+**Segunda passagem sobre os `replacement`** (só com `allow_replacements=True`):
+em `repair`/`strict`, o texto proposto pelo verificador é ele próprio
+verificado uma vez (nunca em laço) — pelo mesmo verificador, o que é
+exatamente a razão de o padrão ser não aceitar reescrita.
 Replacement reprovado é descartado em vez de substituído de novo, e
 `claim.replacement_verdict` registra o veredito. Se essa segunda passagem
 falhar, o reparo é mantido e `recheck_error` declara que os replacements não
@@ -208,9 +221,14 @@ distinguir uma regra vigente de uma revogada.
   `True`: um verificador quebrado reportava a resposta como fiel, e quem
   fizesse `if verification.ok:` embarcava texto não verificado);
 - faceta esperada que o verificador não mencionou → conta como **não coberta**
-  e aparece em `uncovered_facets`;
-- `complete=None` significa *desconhecido* (não havia facetas, ou o
-  verificador não opinou) — nunca é um `True` silencioso;
+  e aparece em `uncovered_facets`; se ele não mencionou **nenhuma**, `complete`
+  é `False`, não `None` — facetas foram declaradas e nada mostrou que foram
+  cobertas;
+- `complete=None` significa *desconhecido*, e o único desconhecido honesto é
+  "não havia facetas a cobrir" — nunca é um `True` silencioso;
+- fato dado na pergunta não é afirmação sem fonte: `question_fact` **não** é
+  `uncited`, e nem mesmo `strict` o remove — apagá-lo seria descartar um
+  enunciado verdadeiro por faltar um documento que não pode existir;
 - trecho da resposta que nenhuma afirmação cobriu → `structural_issues`
   registra quantos caracteres ficaram **sem verificação**, e `ok` cai.
 
@@ -219,10 +237,15 @@ julgar significado): substrings literais, ordem preservada e **sem
 sobreposição** — spans sobrepostos julgariam o mesmo texto duas vezes e fariam
 o reparo produzir lixo. Violação é recusada e a resposta original preservada.
 
-**Replacement só entra se `supported`.** O texto do `replacement` foi escrito
-pelo verificador, não pelo modelo que o usuário escolheu: `uncited`,
-`inference` ou `question_fact` na revalidação **não são endosso** e o trecho é
-removido em vez de substituído.
+**Replacement só entra se `supported`** — e só com `allow_replacements=True`.
+O texto do `replacement` foi escrito pelo verificador, não pelo modelo que o
+usuário escolheu: `uncited`, `inference` ou `question_fact` na revalidação
+**não são endosso** e o trecho é removido em vez de substituído.
+
+**Critério de aceite:** `ok=True` e `complete=True` só quando *todas* as
+afirmações se sustentam e *todas* as facetas foram integralmente cobertas.
+São eixos independentes — uma resposta fiel pode ser incompleta e vice-versa —
+e ambos falham fechado.
 
 **Garantias:** verificador que levanta exceção, devolve `None` ou um número
 errado de vereditos **preserva a resposta original** e registra o erro
