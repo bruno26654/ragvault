@@ -12,7 +12,42 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+- **Multi-query pipeline for composed questions** — `kb.retrieve_multi()` and
+  `kb.ask_multi()` (plus async variants). Optional question decomposition via
+  an external LLM callback or manual `subqueries=`, batched execution through
+  the native `search_many`, global Weighted RRF fusion with `chunk_id` dedup,
+  optional global reranking, then MMR + context assembly under a single global
+  token budget. Neighbor expansion runs only on the final selection, so
+  distractors are never expanded.
+- **Per-subquery coverage guarantee** (`coverage_per_subquery`, default 1).
+  RRF alone loses multi-hop recall: with k0=60 the rank-1 vs rank-10 gap is
+  only ~16%, so a document ranking mid-pack for *every* subquery outweighs the
+  specialist document that is the top hit for one facet. A benchmark showed the
+  fused pool contained every required document for 24/24 composed questions
+  while the final context kept them for only 5/24. Reserving each subquery's
+  top hits fixes it: **full-recall 0.167 → 0.875**, recall 0.493 → 0.951, at
+  1.02x the context tokens (`benchmarks/RESULTS-MULTIQUERY.md`).
+- **Document precedence by metadata** (`resolve_versions=True`): status
+  (VIGENTE/REVOGADO and English equivalents), effective date, numeric version
+  and document type, resolved within a `doc_group`. Superseded versions are
+  never dropped silently — they appear in `result.conflicts`, in the trace, and
+  are stated in the `ask_multi` prompt. Mandatory `filters=` run as native
+  prefilters before search; `boosts=` apply multiplicatively after fusion.
+- **Citation integrity**: only retrieved documents can be cited, `[n]` markers
+  the context does not contain are stripped from the answer, and the prompt
+  states that facts from the question are not documented evidence.
+- **Recall-safe reranking**: a reranker may reorder but never drop candidates
+  (anything it discards is restored in fused order), and a failing reranker
+  falls back to the fused order instead of emptying the result. Likewise a
+  failing decomposer falls back to the single original question.
+- **Full trace**: subqueries, candidates per subquery, each ranking's
+  contribution, fusion results (with `fused_score` and `coverage_reserved`),
+  eliminated items with reasons, rerank scores before/after, metadata-filtered
+  documents, and per-stage timings.
+- Committed multi-hop dataset (24 composed questions: 20 two-hop + 4 three-hop)
+  and `benchmarks/bench_multiquery.py`; runnable example
+  `examples/multi_query_rag.py` (offline by default, optional `--groq`).
 
 ## [1.0.0-rc1] — 2026-07-27
 

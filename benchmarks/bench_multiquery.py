@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""Single-query vs multi-query retrieval on composed (multi-hop) questions.
+
+Dataset: benchmarks/data/rag_eval_corpus.jsonl (30 factual passages) +
+rag_multihop_queries.jsonl (24 composed questions, 20 two-hop + 4 three-hop),
+each labelled with EVERY document required to answer it and with committed
+subqueries — fully reproducible, no network.
+
+Configurations (same corpus, same questions, same k, same token budget):
+  single            kb.retrieve(question)                       — baseline
+  multi-manual      kb.retrieve_multi(question, subqueries=...) — committed subqueries
+  multi-decomposed  kb.retrieve_multi(question, decompose=...)  — offline rule-based
+                    splitter (no LLM, so the row is reproducible here); a real
+                    LLM decomposer plugs into the same argument.
+
+Metrics: full-recall rate (fraction of questions where EVERY required document
+was retrieved — the metric composed questions actually care about), recall,
+precision, MRR, context tokens sent to the LLM, and p50/p95 latency.
+
+Every number written to RESULTS-MULTIQUERY.md comes from an actual run.
+Usage:  python benchmarks/bench_multiquery.py
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import platform
+import re
+import statistics
+import tempfile
+import time
+from pathlib import Path
+
+DATA = Path(__file__).parent / "data"
+OUT = Path(__file__).parent / "RESULTS-MULTIQUERY.md"
+
+#: Conjunction markers used by the offline decomposer. Deliberately dumb: it
+#: exists so this row is reproducible without a network call, not to imitate
+#: an LLM. A real decomposer is passed via `decompose=`.
+_SPLIT_RE = re.compile(r"\s+and\s+|\s*,\s*|\s*;\s*|\s*:\s*", re.IGNORECASE)
+
+
+def rule_based_decompose(question: str) -> list[str]:
+    parts = [p.strip(" ?.") for p in _SPLIT_RE.split(question)]
+    return [p for p in parts if len(p.split()) >= 3]
+
+
+def load_jsonl(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def measure(kb, queries: list[dict], k: int, mode: str, token_budget: int) -> dict:
+    full_hits = 0
+    recalls: list[float] = []
+    precisions: list[float] = []
+    rrs: list[float] = []
+    tokens: list[int] = []
+    latencies: list[float] = []
+
+    for q in queries:
+        needed = set(q["relevant_ids"])
+        t0 = time.perf_counter()
+        if mode == "single":
+            result = kb.retrieve(q["question"], k=k, token_budget=token_budget)
+        elif mode == "multi-manual":
+            result = kb.retrieve_multi(q["question"], subqueries=q["subqueries"],
+                                       k=k, token_budget=token_budget)
+        elif mode == "multi-decomposed":
+            result = kb.retrieve_multi(q["question"], decompose=rule_based_decompose,
+                                       k=k, token_budget=token_budget)
+        else:  # pragma: no cover - guarded by the caller
+            raise ValueError(mode)
+        latencies.append((time.perf_counter() - t0) * 1000)
+
+        got = list(dict.fromkeys(result.documents))
+        got_set = set(got)
+        found = needed & got_set
+        recalls.append(len(found) / len(needed))
+        precisions.append(len(found) / len(got) if got else 0.0)
+        if found == needed:
+            full_hits += 1
+        rr = 0.0
+        for rank, doc in enumerate(got, start=1):
+            if doc in needed:
+                rr = 1.0 / rank
+                break
+        rrs.append(rr)
+        tokens.append(result.token_count)
+
+    latencies.sort()
+    return {
+        "full_recall": full_hits / len(queries),
+        "recall": statistics.fmean(recalls),
+        "precision": statistics.fmean(precisions),
+        "mrr": statistics.fmean(rrs),
+        "tokens": statistics.fmean(tokens),
+        "p50": latencies[len(latencies) // 2],
+        "p95": latencies[int(len(latencies) * 0.95)],
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-k", type=int, default=6)
+    parser.add_argument("--token-budget", type=int, default=1200)
+    args = parser.parse_args()
+
+    import ragvault
+
+    docs = load_jsonl(DATA / "rag_eval_corpus.jsonl")
+    queries = load_jsonl(DATA / "rag_multihop_queries.jsonl")
+    tmp = Path(tempfile.mkdtemp(prefix="ragvault-multiquery-"))
+
+    rows = {}
+    with ragvault.open(tmp / "kb", preset="offline-lite") as kb:
+        kb.add([{"id": d["id"], "text": d["text"]} for d in docs])
+        kb.flush()
+        for _ in range(3):  # warm up
+            kb.retrieve(queries[0]["question"], k=args.k)
+        for mode in ("single", "multi-manual", "multi-decomposed"):
+            rows[mode] = measure(kb, queries, args.k, mode, args.token_budget)
+
+    two_hop = [q for q in queries if q["hops"] == 2]
+    three_hop = [q for q in queries if q["hops"] == 3]
+
+    lines = [
+        "# Multi-query vs single-query retrieval — composed questions",
+        "",
+        "Generated by `python benchmarks/bench_multiquery.py`. Every number is",
+        "from an actual run on this machine; nothing here is estimated.",
+        "",
+        f"- machine: {platform.platform()} / python {platform.python_version()}",
+        f"- corpus: {len(docs)} passages, questions: {len(queries)} "
+        f"({len(two_hop)} two-hop + {len(three_hop)} three-hop)",
+        f"- embedding: `builtin:hashed-ngram` (preset `offline-lite`) — no network",
+        f"- k={args.k}, token_budget={args.token_budget}",
+        "",
+        "**full-recall** = fraction of questions where *every* required document",
+        "was retrieved. This is the metric composed questions care about: a",
+        "partial answer to a two-hop question is a wrong answer.",
+        "",
+        "| config | full-recall | recall | precision | MRR | ctx tokens | p50 ms | p95 ms |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for mode, r in rows.items():
+        lines.append(
+            f"| {mode} | {r['full_recall']:.3f} | {r['recall']:.3f} | "
+            f"{r['precision']:.3f} | {r['mrr']:.3f} | {r['tokens']:.0f} | "
+            f"{r['p50']:.2f} | {r['p95']:.2f} |"
+        )
+
+    base, best = rows["single"], rows["multi-manual"]
+    delta_full = best["full_recall"] - base["full_recall"]
+    delta_recall = best["recall"] - base["recall"]
+    cost = best["p50"] / base["p50"] if base["p50"] else float("nan")
+    token_ratio = best["tokens"] / base["tokens"] if base["tokens"] else float("nan")
+    lines += [
+        "",
+        "## Reading",
+        "",
+        f"- multi-query (committed subqueries) changes full-recall by "
+        f"**{delta_full:+.3f}** and recall by **{delta_recall:+.3f}** vs a single query.",
+        f"- latency cost: **{cost:.2f}x** the single-query p50 for "
+        f"{1 + len(queries[0]['subqueries'])} queries — the subqueries run in one "
+        "batched native call (`search_many`, GIL released), not sequentially.",
+        f"- context tokens sent to the LLM: **{token_ratio:.2f}x** the baseline "
+        "(the same global token budget applies; more of it is spent on evidence "
+        "that is actually needed).",
+        "",
+        "The `multi-decomposed` row uses a deliberately simple offline splitter so",
+        "the row is reproducible without a network call; it is a floor, not a",
+        "ceiling — a real LLM decomposer plugs into the same `decompose=` argument",
+        "and is expected to do better on questions whose facets are not separated",
+        "by conjunctions.",
+        "",
+    ]
+    OUT.write_text("\n".join(lines))
+    print("\n".join(lines))
+
+
+if __name__ == "__main__":
+    main()

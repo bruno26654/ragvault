@@ -90,6 +90,33 @@ print(kb.config.explain())
 kb.config.export("ragvault-config.json")
 ```
 
+## Perguntas compostas (multi-query)
+
+Uma pergunta com várias facetas perde recall numa consulta única: as facetas
+competem pelo mesmo espaço de candidatos e a evidência de uma delas some.
+`retrieve_multi`/`ask_multi` decompõem, buscam em lote, fundem com Weighted RRF
+e **garantem cobertura por subconsulta**:
+
+```python
+answer = kb.ask_multi(
+    "Qual o prazo para pedir reembolso e em quanto tempo o dinheiro volta?",
+    llm=answer_llm,              # seu provedor (callable)
+    decompose=query_decomposer,  # opcional; falha → cai para consulta única
+    filters={"status": "VIGENTE"},
+    resolve_versions=True,       # revogados nunca são citados
+    trace=True,
+)
+
+print(answer.text)                     # [n] inexistentes são removidos
+print(answer.result.subqueries)        # o que foi realmente buscado
+print(answer.result.conflicts)         # versões superadas, explicitamente
+```
+
+Medido em `benchmarks/RESULTS-MULTIQUERY.md` (24 perguntas multi-hop):
+full-recall **0,167 → 0,875**, recall 0,493 → 0,951, a 1,02× dos tokens
+enviados ao LLM. Exemplo completo (com Groq opcional):
+[`examples/multi_query_rag.py`](examples/multi_query_rag.py).
+
 ## Embeddings plugáveis
 
 ```python
@@ -153,6 +180,7 @@ tenant_kb.retrieve(...)   # filtro de tenant aplicado a toda query
 | Storage v2: base binária segmentada + flush O(delta) + compactação read-friendly (ADR 0016) | implemented — CRC por registro/stream, migração v1→v2 transparente, leitores não bloqueiam durante a compactação |
 | Filtros tipados de metadados (posting lists + ranges) | implemented — até 484× em seletividade 0.1% (benchmarks/RESULTS-FILTERS.md) |
 | Batch nativo (`kb.retrieve_many`, GIL liberado, paralelo por query) | implemented |
+| Multi-query (`kb.retrieve_multi` / `kb.ask_multi`): decomposição, Weighted RRF global, cobertura por subconsulta, precedência de versões, citações verificadas | implemented — full-recall 0.167 → 0.875 em perguntas compostas (benchmarks/RESULTS-MULTIQUERY.md) |
 | Wheels multiplataforma no PyPI | planned (CI configurado para Linux) |
 
 Detalhes de arquitetura interna (segmentos, HNSW, WAL): [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Limitações conhecidas: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
