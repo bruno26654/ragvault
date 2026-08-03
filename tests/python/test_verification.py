@@ -158,7 +158,8 @@ class TestQuestionFactVsDocumentEvidence:
             verify=verdicts(
                 {"verdict": "question_fact",
                  "rationale": "the purchase date comes from the question, "
-                              "not from [1]"},
+                              "not from [1]",
+                 "quote": "I bought this on March 1st"},
                 {"verdict": "supported", "rationale": "matches [1]"},
             ),
             verification_mode="report",
@@ -842,7 +843,7 @@ class TestQuotedEvidence:
         )
         claim = answer.verification.claims[0]
         assert claim.verdict == "unsupported"
-        assert "does not appear in the cited source" in claim.rationale
+        assert "is not in the sources" in claim.rationale
         assert answer.verification.ok is False
         assert answer.verification.structural_issues
         assert "instant" not in answer.text
@@ -911,6 +912,129 @@ class TestQuotedEvidence:
             require_quotes=True, k=3,
         )
         assert answer.verification.ok is True
+
+
+class TestEveryVerdictNamesItsGround:
+    """A verdict is a claim *about* a source. `supported` says the cited
+    document says it; `question_fact` says the question did. Unchecked, those
+    are the easiest way to pass a fabrication: label it and move on."""
+
+    FABRICATION = "Refunds are instant and free forever."
+
+    @pytest.mark.parametrize("verdict", ["supported", "inference", "question_fact"])
+    def test_a_groundless_verdict_does_not_pass(self, kb, verdict):
+        answer = kb.ask(
+            "refund deadline", llm=lambda p: self.FABRICATION,
+            verify=verdicts(verdict), verification_mode="strict", k=3,
+        )
+        assert answer.verification.ok is False, (
+            f"{verdict!r} with no citation and no quoted span is unfalsifiable"
+        )
+        assert answer.verification.structural_issues
+        assert self.FABRICATION not in answer.text
+
+    def test_the_downgrade_says_what_the_claim_actually_is(self, kb):
+        """`supported` with nothing cited becomes `uncited`, not `unsupported`:
+        the claim may well be true, it simply named no source. `repair` keeps
+        uncited claims and `strict` drops them, unchanged."""
+        answer = kb.ask(
+            "refund deadline", llm=lambda p: self.FABRICATION,
+            verify=verdicts("supported"), verification_mode="repair", k=3,
+        )
+        assert answer.verification.claims[0].verdict == "uncited"
+        assert answer.text == self.FABRICATION
+        assert answer.verification.ok is False, "the report is still not clean"
+
+    def test_supported_without_a_citation_is_uncited(self, kb):
+        """Supported by what? The verdict describes the claim wrongly, and
+        `uncited` is the verdict that describes it correctly."""
+        answer = kb.ask(
+            "refund deadline", llm=lambda p: self.FABRICATION,
+            verify=verdicts("supported"), k=3,
+        )
+        claim = answer.verification.claims[0]
+        assert claim.verdict == "uncited"
+        assert "cites nothing" in claim.rationale
+
+    def test_a_cited_claim_still_passes_without_a_quote(self, kb):
+        answer = kb.ask(
+            "refund deadline", llm=lambda p: "Refunds take 30 days [1].",
+            verify=verdicts("supported"), k=3,
+        )
+        assert answer.verification.ok is True
+
+    def test_question_fact_is_checked_against_the_question(self, kb):
+        """The ground of a `question_fact` is the question, so that is what
+        its quote is compared against — it used to be compared against the
+        cited documents and rejected for not being in them."""
+        answer = kb.ask(
+            "I bought this on March 1st — what is the refund deadline?",
+            llm=lambda p: "You bought it on March 1st.",
+            verify=verdicts({"verdict": "question_fact",
+                             "quote": "I bought this on March 1st"}),
+            k=3,
+        )
+        assert answer.verification.claims[0].verdict == "question_fact"
+        assert answer.verification.ok is True
+        assert "March 1st" in answer.text
+
+    def test_a_question_fact_the_question_never_stated_is_rejected(self, kb):
+        answer = kb.ask(
+            "what is the refund deadline?",
+            llm=lambda p: "You told us you bought it in 1998.",
+            verify=verdicts({"verdict": "question_fact",
+                             "quote": "I bought it in 1998"}),
+            k=3,
+        )
+        claim = answer.verification.claims[0]
+        assert claim.verdict == "unsupported"
+        assert "is not in the question" in claim.rationale
+
+    def test_an_inference_may_rest_on_the_question(self, kb):
+        answer = kb.ask(
+            "I bought this on March 1st — am I still in time?",
+            llm=lambda p: "You are eleven days past the purchase date.",
+            verify=verdicts({"verdict": "inference",
+                             "quote": "bought this on March 1st"}),
+            k=3,
+        )
+        assert answer.verification.ok is True
+
+    def test_a_rejection_needs_no_ground(self, kb):
+        """`unsupported` and `uncited` assert an absence. Requiring evidence
+        for them would mean demanding proof that nothing was proved."""
+        for verdict in ("unsupported", "uncited"):
+            answer = kb.ask(
+                "refund deadline", llm=lambda p: self.FABRICATION,
+                verify=verdicts(verdict), k=3,
+            )
+            assert not answer.verification.structural_issues
+
+    def test_require_evidence_off_restores_the_old_behaviour(self, kb):
+        answer = kb.ask(
+            "refund deadline", llm=lambda p: self.FABRICATION,
+            verify=verdicts("supported"), require_evidence=False, k=3,
+        )
+        assert answer.verification.claims[0].verdict == "supported"
+        assert answer.verification.ok is True
+
+    def test_an_answer_never_asked_to_cite_is_not_held_to_citations(self, kb):
+        """`citations=False` tells the model not to cite; holding its claims to
+        citations afterwards would fail every one of them."""
+        answer = kb.ask(
+            "refund deadline", llm=lambda p: "Refunds must be filed in 30 days.",
+            citations=False, verify=verdicts("supported"), k=3,
+        )
+        assert answer.verification.claims[0].verdict == "supported"
+        assert answer.verification.ok is True
+
+    def test_require_quotes_demands_a_span_for_every_grounded_verdict(self, kb):
+        answer = kb.ask(
+            "refund deadline", llm=lambda p: "Refunds take 30 days [1].",
+            verify=verdicts("supported"), require_quotes=True, k=3,
+        )
+        assert answer.verification.claims[0].verdict == "unsupported"
+        assert "quotes are required" in answer.verification.claims[0].rationale
 
 
 class TestTrailingCitationMarkers:
@@ -1078,7 +1202,8 @@ class TestSemanticHardening:
             llm=lambda p: ("You bought it on March 1st. "
                            "Refunds must be filed within 30 days [1]."),
             verify=verdicts(
-                {"verdict": "question_fact", "rationale": "stated in the question"},
+                {"verdict": "question_fact", "rationale": "stated in the question",
+                 "quote": "I bought this on March 1st"},
                 {"verdict": "supported", "rationale": "matches [1]"},
             ),
             verification_mode="strict", k=3,

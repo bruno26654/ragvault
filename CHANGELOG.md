@@ -13,6 +13,21 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
 ## [Unreleased]
 
 ### Fixed
+- **Three verdicts were unfalsifiable.** `supported`, `inference` and
+  `question_fact` passed with `ok=True` while citing nothing and quoting
+  nothing — so the cheapest way to get a fabricated sentence through
+  verification was to label it one of them. Every verdict now names a ground
+  and the ground is checked: cited sources for `supported`, the question for
+  `question_fact`, either for `inference` and `contradicted`; `unsupported`
+  and `uncited` assert an absence and need none. A `supported` claim citing
+  nothing becomes `uncited`, which is what it is. Controlled by
+  `require_evidence` (on by default); `ask()`/`ask_multi()` derive it from
+  their own `citations` argument, so answers never asked to cite are not held
+  to citations.
+- **A `question_fact` quoting the question was rejected for not being in the
+  documents.** The quote check introduced alongside `quote` compared every
+  span against the cited sources, but the ground of a `question_fact` is the
+  question. Quotes are now checked against what the verdict actually rests on.
 - **A revoked document reached the context looking current.** Revocation was
   judged only *relatively* — a document lost to a better sibling in its
   `doc_group`. When the superseding version was not among the retrieved

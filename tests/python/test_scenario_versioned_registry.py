@@ -231,7 +231,9 @@ def judge(payload: dict) -> dict:
         cited_entities = {e["metadata"].get("entity") for e in item["evidence"]}
 
         if "do not determine" in claim:
-            claims.append({"verdict": "supported",
+            # It asserts an absence, so it cites nothing — and `supported`
+            # would be a claim about a source that was never named.
+            claims.append({"verdict": "uncited",
                            "rationale": "declared non-answer, asserts nothing"})
             continue
         if not item["evidence"]:
@@ -634,7 +636,7 @@ class TestQuestionFactRuleAndInference:
                 "You received the ALPHA notice on 2025-03-02. "
                 f"The registration deadline for ALPHA is 45 calendar days "
                 f"from the notice of eligibility [{index}]. "
-                "Your deadline therefore falls on 2025-04-16."
+                f"Your deadline therefore falls on 2025-04-16 [{index}]."
             )
 
         def three_way(payload):
@@ -643,7 +645,8 @@ class TestQuestionFactRuleAndInference:
                 claim = item["claim"]
                 if "2025-03-02" in claim:
                     out.append({"verdict": "question_fact",
-                                "rationale": "stated in the question"})
+                                "rationale": "stated in the question",
+                                "quote": "on 2025-03-02"})
                 elif "therefore" in claim:
                     out.append({"verdict": "inference",
                                 "rationale": "rule applied to the given date"})
@@ -660,6 +663,10 @@ class TestQuestionFactRuleAndInference:
         )
         verdicts = [c.verdict for c in answer.verification.claims]
         assert verdicts == ["question_fact", "supported", "inference"]
+        # Each names a ground: the question span for the given fact, the cited
+        # rule for the rule, and the rule it applies for the conclusion.
+        assert answer.verification.claims[0].quote == "on 2025-03-02"
+        assert answer.verification.claims[2].citations
         assert answer.verification.ok is True
         # `strict` drops uncited claims, and neither the question fact nor the
         # inference is uncited — they are sourced from the question and from

@@ -361,6 +361,24 @@ def _normalize_span(text: str) -> str:
     return " ".join(text.split()).casefold()
 
 
+#: What each verdict is allowed to rest on. A verdict is a claim *about* a
+#: source: `supported` means the cited document says it, `question_fact` means
+#: the question said it, `inference` and `contradicted` may rest on either.
+#: `unsupported` and `uncited` assert an absence and need no ground.
+#:
+#: Without this table three verdicts were unfalsifiable: labelling a fabricated
+#: sentence `supported`, `inference` or `question_fact` passed with `ok=True`
+#: and no citation, no quote and nothing checked.
+_GROUNDS = {
+    SUPPORTED: ("sources",),
+    QUESTION_FACT: ("question",),
+    INFERENCE: ("sources", "question"),
+    CONTRADICTED: ("sources", "question"),
+    UNSUPPORTED: (),
+    UNCITED: (),
+}
+
+
 def _quote_is_grounded(quote: str, evidence: Sequence[dict]) -> bool:
     """True when the quoted span really appears in one of the cited sources.
 
@@ -373,6 +391,65 @@ def _quote_is_grounded(quote: str, evidence: Sequence[dict]) -> bool:
     if not needle:
         return False
     return any(needle in _normalize_span(ev.get("text") or "") for ev in evidence)
+
+
+def _check_ground(
+    verdict: str, rationale: str, quote: Optional[str], claim: str,
+    evidence: Sequence[dict], question: str, *,
+    require_evidence: bool, require_quotes: bool,
+) -> tuple[str, str, Optional[str]]:
+    """Hold a verdict to the ground it implicitly claims.
+
+    Returns (verdict, rationale, structural issue or None). Every test here is
+    structural — a substring, or the presence of a resolved citation — never a
+    judgement about meaning.
+    """
+    grounds = _GROUNDS.get(verdict, ())
+    if not grounds:
+        return verdict, rationale, None
+
+    def rejected(reason: str, downgrade: str) -> tuple[str, str, str]:
+        return downgrade, f"{rationale} | {reason}".strip(" |"), (
+            f"{reason} for claim {claim[:40]!r}"
+        )
+
+    if quote is not None:
+        # The quote names where the support lives, so it is checked against
+        # exactly that: a `question_fact` quoting the question was being
+        # compared to the cited documents and rejected for not being in them.
+        found = (
+            ("sources" in grounds and _quote_is_grounded(quote, evidence))
+            or ("question" in grounds
+                and _normalize_span(quote) in _normalize_span(question))
+        )
+        if not found:
+            where = " or ".join(grounds)
+            return rejected(
+                f"quoted span {quote.strip()[:60]!r} is not in the {where}",
+                UNSUPPORTED,
+            )
+        return verdict, rationale, None
+
+    if require_quotes:
+        return rejected("no quoted span was given, and quotes are required",
+                        UNSUPPORTED)
+    if not require_evidence:
+        return verdict, rationale, None
+
+    if "sources" in grounds and evidence:
+        return verdict, rationale, None
+    if verdict == SUPPORTED:
+        # Supported by what? With nothing cited, the verdict describes the
+        # claim wrongly: it is uncited, which is a verdict of its own.
+        return rejected("verdict is 'supported' but the claim cites nothing",
+                        UNCITED)
+    # `question_fact` and a citation-less `inference` can only be shown by
+    # pointing at the question, and no span was offered.
+    return rejected(
+        f"verdict is {verdict!r} but names no ground: no citation and no "
+        "quoted span from the question",
+        UNSUPPORTED,
+    )
 
 
 def _coerce_verdict(
@@ -414,6 +491,7 @@ def verify_answer(
     facets: Optional[Sequence[str]] = None,
     allow_replacements: bool = False,
     require_quotes: bool = False,
+    require_evidence: bool = True,
 ) -> VerificationReport:
     """Run the verification pass. See the module docstring for the contract.
 
@@ -429,15 +507,22 @@ def verify_answer(
     verification — so by default a problem claim is removed rather than
     rewritten. Turn it on only if you accept that trade-off.
 
-    A verdict may carry a ``quote``: the span of the cited source that
-    supports the claim. It is always checked against the source text, and a
-    quote found in none of the cited sources drops the claim to
-    ``unsupported`` — the verifier attributed words to a document that does
-    not contain them. ``require_quotes`` extends that to silence: a
-    ``supported`` verdict offering no span is not accepted either. It is off
-    by default because support is not always a contiguous span (a rule spread
-    over two sentences, a table), and demanding one would reject claims that
-    really are supported.
+    Every verdict implies a ground, and the ground is checked (see
+    ``_GROUNDS``). A ``quote`` is compared against exactly what the verdict
+    rests on: the cited sources for ``supported``, the question for
+    ``question_fact``, either for ``inference`` and ``contradicted``. With no
+    quote, ``require_evidence`` (on by default) still demands that the claim
+    cite something wherever a source is an admissible ground — otherwise
+    ``supported``, ``inference`` and ``question_fact`` are unfalsifiable, and
+    a fabricated sentence passes by being labelled one of them.
+
+    Callers whose answers do not use citations at all should pass
+    ``require_evidence=False``; ``ask()`` and ``ask_multi()`` derive it from
+    their own ``citations`` argument. ``require_quotes`` goes further and
+    demands a span for every verdict that has a ground. It is off by default
+    because support is not always a contiguous span (a rule spread over two
+    sentences, a table), and demanding one would reject claims that really are
+    supported.
     """
     if mode not in VERIFICATION_MODES:
         raise ConfigurationError(
@@ -529,28 +614,15 @@ def verify_answer(
             indices = citations_in(claim)
             evidence = _evidence_for(indices, citations)
 
-            # A quote is the one part of a verdict the library can check
+            # The ground a verdict implies is the part the library can check
             # itself, and checking it costs nothing.
-            if quote is not None and not _quote_is_grounded(quote, evidence):
-                report.structural_issues.append(
-                    f"quoted evidence is not in any cited source: "
-                    f"{quote.strip()[:60]!r} for claim {claim[:40]!r}"
-                )
-                verdict = UNSUPPORTED
-                rationale = (
-                    f"{rationale} | quoted span does not appear in the cited "
-                    "source"
-                ).strip(" |")
-            elif require_quotes and verdict == SUPPORTED and not quote:
-                report.structural_issues.append(
-                    f"require_quotes: no supporting span given for claim "
-                    f"{claim[:40]!r}"
-                )
-                verdict = UNSUPPORTED
-                rationale = (
-                    f"{rationale} | no quoted span was given, and quotes are "
-                    "required"
-                ).strip(" |")
+            verdict, rationale, issue = _check_ground(
+                verdict, rationale, quote, claim, evidence, question,
+                require_evidence=require_evidence,
+                require_quotes=require_quotes,
+            )
+            if issue:
+                report.structural_issues.append(issue)
 
             report.claims.append(ClaimVerification(
                 claim=claim,
