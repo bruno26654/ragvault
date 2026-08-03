@@ -51,6 +51,10 @@ class Citation:
     #: status, effective date, version — so callers and verifiers can judge
     #: *which* version they are looking at without a second lookup.
     metadata: dict = field(default_factory=dict)
+    #: The block's own text, exactly as it appears under `[n]` in the context.
+    #: Without it, anything judging a claim against its source has to re-parse
+    #: the assembled context string to find the block a marker points at.
+    text: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -64,6 +68,7 @@ class Citation:
             "page_number": self.page_number,
             "score": self.score,
             "metadata": dict(self.metadata),
+            "text": self.text,
         }
 
 
@@ -262,6 +267,10 @@ def assemble_context(
         if first.page_number is not None:
             header += f" (page {first.page_number})"
         body = "\n".join(chunk.text.strip() for chunk in run)
+        # A document merged from several runs keeps one citation index, so its
+        # text is every run under that index — the same content the block
+        # shows in the context.
+        citation.text = f"{citation.text}\n{body}" if citation.text else body
         if truncated and any("truncated" in c.selection_reason for c in run):
             header += " [truncated to fit token budget]"
         blocks.append(f"{header}\n{body}")

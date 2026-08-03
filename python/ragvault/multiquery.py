@@ -565,6 +565,8 @@ def ask_multi(
     verify: Optional[Callable] = None,
     verification_mode: str = "report",
     allow_replacements: bool = False,
+    require_quotes: bool = False,
+    facets: Optional[Sequence[str]] = None,
     **retrieve_kwargs: Any,
 ) -> "Answer":
     """Multi-query ask: retrieve_multi + user-provided LLM + citation
@@ -575,10 +577,17 @@ def ask_multi(
     Pass ``verify=`` to additionally run post-generation semantic validation:
     citation-marker sanity catches *invented* numbers, while verification
     catches a marker that exists but does not actually support its claim
-    (see :mod:`ragvault.verification`). The subqueries double as the facets the
-    answer owed, so the report carries completeness (`complete`) alongside
-    fidelity (`ok`). The verifier only segments and classifies; pass
-    ``allow_replacements=True`` to let it rewrite instead of remove.
+    (see :mod:`ragvault.verification`). The verifier only segments and
+    classifies; pass ``allow_replacements=True`` to let it rewrite instead of
+    remove.
+
+    Completeness is judged against ``facets`` — what the answer owed. Absent an
+    explicit list, the subqueries stand in for it, which holds exactly as far
+    as they are atomic (one answer obligation each), the shape the decomposer
+    is asked for. They are still retrieval queries: a decomposer that splits
+    for *search* ("policy 2024 revision") produces obligations the user never
+    asked about, and each one then reads as an uncovered facet. Pass ``facets``
+    explicitly whenever the obligations are not the queries.
     """
     from .kb import Answer
     from .verification import verify_answer
@@ -614,19 +623,26 @@ def ask_multi(
     # with no evidence must be declared unanswered, never invented. Without it
     # "do not omit any" would push the model to fabricate exactly where
     # retrieval came up empty.
-    facets = [q for q in result.subqueries[1:] if q.strip()]
+    #
+    # Declared facets win over the subqueries, and drive the checklist and the
+    # verification alike: the answer is judged on the obligations it was told
+    # to cover, never on a different list.
+    answer_facets = [
+        q for q in
+        (facets if facets is not None else result.subqueries[1:])
+        if q.strip()
+    ]
     coverage_note = ""
-    if facets:
+    if answer_facets:
         coverage_note = (
             "\n\n# Required answer facets\n"
-            "The question was decomposed into the facets below. Address each "
-            "one that the context supports, and do not silently omit any. If "
-            "the context has no evidence for a facet, say so explicitly for "
-            "that facet instead of guessing.\n"
-            + "\n".join(f"- {q}" for q in facets)
+            "Address each facet below that the context supports, and do not "
+            "silently omit any. If the context has no evidence for a facet, "
+            "say so explicitly for that facet instead of guessing.\n"
+            + "\n".join(f"- {q}" for q in answer_facets)
         )
         if result.trace is not None:
-            result.trace["answer_facets"] = list(facets)
+            result.trace["answer_facets"] = list(answer_facets)
 
     prompt = (
         f"{instructions}\n\n# Context\n{result.context}{conflict_note}"
@@ -652,7 +668,8 @@ def ask_multi(
             question=question, answer_text=text, context=result.context,
             citations=result.citations, verify=verify, mode=verification_mode,
             allow_replacements=allow_replacements,
-            facets=result.subqueries[1:],
+            require_quotes=require_quotes,
+            facets=answer_facets,
         )
         text = report.repaired_text
         if result.trace is not None:

@@ -74,10 +74,21 @@ def verify(payload: dict) -> dict:
     aprova está avaliando o próprio texto. Falha aqui = resposta original
     preservada e `ok=False` — nunca um passe silencioso.
     """
+    # Cada claim vem com as fontes que *ela* citou: o suporte não pode ser
+    # emprestado de um bloco que a afirmação nunca nomeou.
+    cited = "\n\n".join(
+        f"## Afirmação {i}: {c['claim']}\n" + (
+            "\n".join(f"[{e['index']}] ({e['metadata']}) {e['text']}"
+                      for e in c["evidence"])
+            or "(sem fonte citada)"
+        )
+        for i, c in enumerate(payload["claims"], 1)
+    )
     return _json(complete(
         "Você verifica uma resposta de RAG. Não reescreva nada: apenas "
         "segmente e classifique.\n\n"
-        f"# Contexto\n{payload['context']}\n\n"
+        f"# Contexto completo\n{payload['context']}\n\n"
+        f"# Fontes que cada afirmação citou\n{cited}\n\n"
         f"# Pergunta do usuário\n{payload['question']}\n\n"
         f"# Resposta\n{payload['answer']}\n\n"
         f"# Facetas que a resposta deveria cobrir\n{payload['facets']}\n\n"
@@ -95,10 +106,14 @@ def verify(payload: dict) -> dict:
         "   - afirmação sobre regra passada ou revogada só é 'supported' se "
         "algum bloco citado tiver metadados que mostrem esse estado antigo — "
         "divergir da regra atual não prova que a antiga existiu.\n"
-        "3. Para cada faceta, 'covered' só é verdadeiro quando TODOS os seus "
+        "3. Em 'supported', inclua 'quote': as palavras exatas da fonte citada "
+        "que sustentam a afirmação, copiadas literalmente. O RagVault confere "
+        "a citação contra a fonte — uma citação inventada reprova a "
+        "afirmação.\n"
+        "4. Para cada faceta, 'covered' só é verdadeiro quando TODOS os seus "
         "componentes foram respondidos corretamente.\n"
         "Omitir uma proposição ou uma faceta não é aprovação. Responda apenas "
-        'com JSON: {"claims": [{"claim", "verdict", "rationale"}], '
+        'com JSON: {"claims": [{"claim", "verdict", "rationale", "quote"}], '
         '"facets": [{"facet", "covered", "rationale"}]}.'
     ))
 

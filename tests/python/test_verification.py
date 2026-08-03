@@ -800,6 +800,245 @@ class TestFailsClosed:
         assert answer.verification.complete is True
 
 
+class TestCitedEvidenceIsAtHand:
+    """The judge must be able to read the source a claim actually named,
+    without re-parsing the assembled context to find block `[n]`."""
+
+    def test_evidence_carries_the_cited_block_text(self, kb):
+        seen = {}
+
+        def capture(payload):
+            seen.update(payload)
+            return ["supported"]
+
+        kb.ask("refund deadline", llm=lambda p: "Refunds take 30 days [1].",
+               verify=capture, k=3)
+        evidence = seen["claims"][0]["evidence"][0]
+        assert "30 days" in evidence["text"]
+        assert evidence["text"] in seen["context"], (
+            "the evidence is the block itself, not a paraphrase of it"
+        )
+
+    def test_citation_text_matches_the_context_block(self, kb):
+        result = kb.retrieve("refund deadline", k=3)
+        for citation in result.citations:
+            assert citation.text, "every citation must carry its own text"
+            assert citation.text in result.context, (
+                "the citation's text is the block the model was shown"
+            )
+
+
+class TestQuotedEvidence:
+    """A quote is the one part of a verdict the library can check itself:
+    either the cited source contains those words or it does not."""
+
+    def test_fabricated_quote_cannot_support_a_claim(self, kb):
+        answer = kb.ask(
+            "refund deadline",
+            llm=lambda p: "Refunds are instant [1].",
+            verify=verdicts({"verdict": "supported", "rationale": "see source",
+                             "quote": "refunds are processed instantly"}),
+            verification_mode="repair", k=3,
+        )
+        claim = answer.verification.claims[0]
+        assert claim.verdict == "unsupported"
+        assert "does not appear in the cited source" in claim.rationale
+        assert answer.verification.ok is False
+        assert answer.verification.structural_issues
+        assert "instant" not in answer.text
+
+    def test_real_quote_is_accepted(self, kb):
+        answer = kb.ask(
+            "refund deadline",
+            llm=lambda p: "Refunds take 30 days [1].",
+            verify=verdicts({"verdict": "supported", "rationale": "see source",
+                             "quote": "filed within 30 days"}),
+            verification_mode="repair", k=3,
+        )
+        assert answer.verification.ok is True
+        assert answer.verification.claims[0].quote == "filed within 30 days"
+        assert answer.text == "Refunds take 30 days [1]."
+
+    def test_quote_survives_rewrapping_and_case(self, kb):
+        answer = kb.ask(
+            "refund deadline",
+            llm=lambda p: "Refunds take 30 days [1].",
+            verify=verdicts({"verdict": "supported",
+                             "quote": "Filed   Within\n30 DAYS"}),
+            k=3,
+        )
+        assert answer.verification.ok is True, (
+            "whitespace and case do not change whose words they are"
+        )
+
+    def test_quote_must_come_from_a_cited_source(self, kb):
+        """The text exists in the context — under a block this claim never
+        cited. Support has to come from the source the claim named."""
+        answer = kb.ask(
+            "refund and shipping",
+            llm=lambda p: "Refunds are instant [1].",
+            verify=verdicts({"verdict": "supported",
+                             "quote": "Orders ship within five business days"}),
+            k=3,
+        )
+        assert answer.verification.claims[0].verdict == "unsupported"
+
+    def test_quotes_are_optional_by_default(self, kb):
+        answer = kb.ask(
+            "refund deadline",
+            llm=lambda p: "Refunds take 30 days [1].",
+            verify=verdicts("supported"), k=3,
+        )
+        assert answer.verification.ok is True
+        assert answer.verification.claims[0].quote is None
+
+    def test_require_quotes_rejects_silent_support(self, kb):
+        answer = kb.ask(
+            "refund deadline",
+            llm=lambda p: "Refunds take 30 days [1].",
+            verify=verdicts("supported"), require_quotes=True, k=3,
+        )
+        assert answer.verification.claims[0].verdict == "unsupported"
+        assert answer.verification.ok is False
+        assert "quotes are required" in answer.verification.claims[0].rationale
+
+    def test_require_quotes_accepts_a_grounded_span(self, kb):
+        answer = kb.ask(
+            "refund deadline",
+            llm=lambda p: "Refunds take 30 days [1].",
+            verify=verdicts({"verdict": "supported",
+                             "quote": "within 30 days of purchase"}),
+            require_quotes=True, k=3,
+        )
+        assert answer.verification.ok is True
+
+
+class TestTrailingCitationMarkers:
+    """`... 30 days. [1]` is the same citation as `... 30 days [1].` — the
+    marker sources the claim it follows, not the one after it."""
+
+    def test_marker_after_the_terminator_stays_with_its_claim(self):
+        from ragvault.verification import citations_in, split_claims
+
+        claims = split_claims("Refunds take 30 days. [1] They ship fast. [2]")
+        assert claims == ["Refunds take 30 days. [1]", "They ship fast. [2]"]
+        assert [citations_in(c) for c in claims] == [[1], [2]]
+
+    def test_marker_without_a_space_still_splits(self):
+        from ragvault.verification import citations_in, split_claims
+
+        claims = split_claims("Refunds take 30 days.[1] They ship fast.[2]")
+        assert [citations_in(c) for c in claims] == [[1], [2]]
+
+    def test_a_marker_is_never_a_claim_of_its_own(self):
+        from ragvault.verification import split_claims
+
+        for text in ("One. [1] Two. [2]", "One.[1] Two.[2]",
+                     "First. [1] [2] Second. [3]"):
+            assert all(c.strip("[]0123456789 ") for c in split_claims(text)), (
+                f"a claim that is only a marker came out of {text!r}"
+            )
+
+    def test_marker_on_the_next_line_belongs_to_that_line(self):
+        from ragvault.verification import citations_in, split_claims
+
+        claims = split_claims("A claim.\n[1] Next line claim.")
+        assert citations_in(claims[0]) == []
+        assert citations_in(claims[1]) == [1]
+
+    def test_split_stays_lossless(self):
+        from ragvault.verification import _split_with_separators
+
+        for text in ("One. [1] Two. [2]", "One.[1] Two.[2]",
+                     "- A. [1]\n- B. [2]", "退款需在30天内申请。[1] 发货需五天。[2]"):
+            claims, seps = _split_with_separators(text)
+            rebuilt = "".join(
+                claim + (seps[i] if i < len(seps) else "")
+                for i, claim in enumerate(claims)
+            )
+            assert rebuilt == text.strip()
+
+    def test_the_claim_that_cited_a_source_is_the_one_judged(self, kb):
+        """End to end: written with the marker after the period, the deadline
+        claim used to arrive uncited and `strict` deleted a sourced fact."""
+        answer = kb.ask(
+            "refund deadline",
+            llm=lambda p: "Refunds must be filed within 30 days. [1]",
+            verify=verdicts({"verdict": "supported", "rationale": "matches"}),
+            verification_mode="strict", k=3,
+        )
+        assert answer.verification.claims[0].citations == [1]
+        assert answer.text == "Refunds must be filed within 30 days. [1]"
+
+
+class TestExplicitFacets:
+    """Retrieval subqueries are not the same thing as answer obligations."""
+
+    def test_explicit_facets_replace_the_subqueries(self, kb):
+        seen = {}
+
+        def capture(payload):
+            seen["facets"] = payload["facets"]
+            return {"claims": ["supported"] * len(payload["claims"]),
+                    "facets": [{"facet": f, "covered": True}
+                               for f in payload["facets"]]}
+
+        answer = kb.ask_multi(
+            "refund deadline",
+            subqueries=["refund policy 2024 revision", "refund deadline days"],
+            facets=["how long the customer has to ask for a refund"],
+            llm=lambda p: "Refunds take 30 days [1].", verify=capture, k=5,
+        )
+        assert seen["facets"] == [
+            "how long the customer has to ask for a refund"
+        ], "search-shaped subqueries must not become answer obligations"
+        assert answer.verification.complete is True
+
+    def test_subqueries_are_the_default(self, kb):
+        seen = {}
+
+        def capture(payload):
+            seen["facets"] = payload["facets"]
+            return ["supported"] * len(payload["claims"])
+
+        kb.ask_multi("refund deadline",
+                     subqueries=["refund deadline", "refund payment"],
+                     llm=lambda p: "30 days [1].", verify=capture, k=5)
+        # subqueries[0] is the original question, which is not a facet
+        assert seen["facets"] == ["refund payment"]
+
+    def test_ask_can_declare_facets_too(self, kb):
+        answer = kb.ask(
+            "refund deadline",
+            llm=lambda p: "Refunds take 30 days [1].",
+            facets=["the deadline", "the payment method"],
+            verify=lambda payload: {
+                "claims": ["supported"] * len(payload["claims"]),
+                "facets": [{"facet": payload["facets"][0], "covered": True},
+                           {"facet": payload["facets"][1], "covered": False,
+                            "rationale": "not answered"}],
+            },
+            k=3,
+        )
+        assert answer.verification.ok is True
+        assert answer.verification.complete is False
+        assert [f["facet"] for f in answer.verification.uncovered_facets] == [
+            "the payment method"
+        ]
+
+    def test_empty_facets_disable_the_axis(self, kb):
+        answer = kb.ask_multi(
+            "refund deadline",
+            subqueries=["refund deadline", "refund payment"],
+            facets=[],
+            llm=lambda p: "30 days [1].",
+            verify=verdicts("supported"), k=5,
+        )
+        assert answer.verification.complete is None, (
+            "declaring no obligations is not the same as failing them"
+        )
+
+
 class TestSemanticHardening:
     """The verifier segments and classifies; the library decides nothing about
     meaning. What it must guarantee is that the judgement has everything it

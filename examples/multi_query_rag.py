@@ -105,15 +105,15 @@ def offline_verifier(payload):
     stand-in says it cannot judge, so `complete` comes back False — an
     unevaluated facet is never a covered one.
     """
-    blocks = dict(re.findall(r"^\[(\d+)\][^\n]*\n(.*?)(?=\n\n\[|\n\n#|\Z)",
-                             payload["context"], re.DOTALL | re.MULTILINE))
     out = []
     for item in payload["claims"]:
         claim = item["claim"]
         if not item["citations"]:
             out.append({"verdict": "uncited", "rationale": "no [n] marker"})
             continue
-        cited = " ".join(blocks.get(str(n), "") for n in item["citations"])
+        # The cited blocks come with the claim; no need to re-parse the
+        # context to find them, and no way to drift onto an uncited block.
+        cited = " ".join(e["text"] for e in item["evidence"])
         numbers = set(re.findall(r"\d+", claim))
         if numbers and not numbers & set(re.findall(r"\d+", cited)):
             out.append({
@@ -170,10 +170,23 @@ def groq_callables():
         its own text, so `replacement` stays out of the contract entirely —
         a claim that does not hold is removed, not rephrased.
         """
+        # Each claim is shown with the sources *it* cited, so support cannot be
+        # borrowed from a block the claim never named. The full context still
+        # goes in: judging `uncited`, or noticing that the right evidence was
+        # available under another marker, needs it.
+        cited = "\n\n".join(
+            f"## Claim {i}: {c['claim']}\n" + (
+                "\n".join(f"[{e['index']}] ({e['metadata']}) {e['text']}"
+                          for e in c["evidence"])
+                or "(this claim cites no source)"
+            )
+            for i, c in enumerate(payload["claims"], start=1)
+        )
         prompt = (
             "You verify a RAG answer. Do not rewrite anything: segment and "
             "classify only.\n\n"
-            f"# Context\n{payload['context']}\n\n"
+            f"# Full context\n{payload['context']}\n\n"
+            f"# Sources each claim actually cited\n{cited}\n\n"
             f"# Question asked by the user\n{payload['question']}\n\n"
             f"# Answer\n{payload['answer']}\n\n"
             f"# Facets the answer was supposed to cover\n{payload['facets']}\n\n"
@@ -199,10 +212,13 @@ def groq_callables():
             "'supported' when some cited block's metadata actually shows that "
             "older state. Differing from the current rule does not prove an "
             "older rule existed.\n"
-            "3. For each facet, 'covered' is true only when ALL of its "
+            "3. With 'supported', add 'quote': the exact words from the cited "
+            "source that carry the support, copied verbatim. RagVault checks "
+            "it against that source, so an invented quote fails the claim.\n"
+            "4. For each facet, 'covered' is true only when ALL of its "
             "components were answered correctly.\n"
             "Omitting a proposition or a facet is not a pass. Reply with JSON "
-            'only: {"claims": [{"claim", "verdict", "rationale"}], '
+            'only: {"claims": [{"claim", "verdict", "rationale", "quote"}], '
             '"facets": [{"facet", "covered", "rationale"}]}.'
         )
         raw = complete(prompt).strip()

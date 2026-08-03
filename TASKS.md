@@ -174,6 +174,10 @@ a citação que **existe mas não sustenta** a afirmação.
 | O verificador segmenta e classifica, não escreve (`replacement` ignorado por padrão) | validated | `test_replacements_are_ignored_by_default`; revalidar o próprio `replacement` é autoendosso. `allow_replacements=True` restaura o comportamento anterior (`test_repair_uses_a_replacement_when_opted_in`) |
 | Critério de aceite: `ok`/`complete` só `True` com todas as claims sustentadas e todas as facetas cobertas | validated | `TestSemanticHardening` — contradição com a pergunta, claim histórica sem fonte histórica, faceta composta parcial, proposição composta resegmentada, retorno incompleto, e a matriz `ok × complete` |
 | Metadados de precedência na evidência e em `Citation.metadata` | validated | `TestEvidenceMetadata` |
+| Texto do bloco citado na evidência (`Citation.text`) | validated | `TestCitedEvidenceIsAtHand` — sem ele o juiz reencontra `[n]` no contexto e pode justificar a claim com um bloco que ela não citou |
+| `quote` conferido contra a fonte citada; `require_quotes` | validated | `TestQuotedEvidence` (citação fabricada → `unsupported` + `structural_issues`; reformatação/caixa não reprovam; opcional por padrão porque suporte nem sempre é trecho contíguo) |
+| Marcador de citação depois do terminador fica com a claim que ele fonteia | validated | `TestTrailingCitationMarkers` — bug real: `"30 dias. [1]"` deixava a claim `uncited` (apagada por `strict`), creditava a próxima e criava uma "claim" que era só `[2]`; sem espaço não dividia |
+| `facets=` explícito em `ask()`/`ask_multi()` (obrigação ≠ subconsulta de busca) | validated | `TestExplicitFacets` — subconsulta de recuperação virava obrigação artificial; facetas declaradas valem para o checklist do prompt e para o julgamento |
 | Filtros por subconsulta (`subquery_filters`) | validated | `TestPerSubqueryFilters` (faceta decisória em `VIGENTE` + histórica em `REVOGADO` na mesma chamada) |
 | Sem dependência obrigatória de provedor | validated | verificador é callable; exemplo roda offline, `--groq` opcional |
 

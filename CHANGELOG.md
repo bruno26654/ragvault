@@ -12,6 +12,38 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
 
 ## [Unreleased]
 
+### Fixed
+- **A citation marker after the sentence terminator was attributed to the
+  wrong claim.** Written the ordinary way — `Refunds take 30 days. [1] They
+  ship fast. [2]` — the split happened at the period, so `[1]` landed on the
+  *next* claim: the claim that actually cited it came back `uncited` (and
+  `strict` deleted a sourced fact), the following claim was credited to a
+  source it never cited, and the trailing `[2]` became a "claim" that was only
+  a marker. Without a space (`days.[1] They`) the answer was not split at all.
+  Trailing markers now stay with the claim they source; a marker starting the
+  next line still belongs to that line.
+
+### Added
+- **The cited block's text travels with the evidence** (`Citation.text`, and
+  `evidence[i]["text"]` in the verification payload). A judge handed only the
+  assembled context has to locate `[n]` in it by hand, and can as easily
+  justify a claim from a block the claim never cited.
+- **`quote`: the one part of a verdict the library can check itself.** A
+  verifier may return the span of the cited source that carries the support;
+  it is compared against that source (substring, whitespace- and
+  case-normalized). A quote in none of the cited sources is fabricated
+  attribution — the claim drops to `unsupported` and the discrepancy is
+  recorded in `structural_issues`. `require_quotes=True` extends this to
+  silence: a `supported` verdict offering no span is not accepted either. Off
+  by default because support is not always a contiguous span.
+- **`facets=` on `ask()` and `ask_multi()`.** Completeness is judged against
+  what the answer *owed*, which is not the same list as the queries retrieval
+  ran. A decomposer splitting for search ("policy 2024 revision") was turning
+  search terms into answer obligations, each reported as an uncovered facet.
+  Declared facets drive both the answer's checklist and the verification, so
+  the answer is judged on the obligations it was given; without them
+  `ask_multi` still falls back to the subqueries.
+
 ### Changed
 - **The verifier no longer writes: `replacement` is ignored by default.** A
   verifier that proposes a correction and then re-verifies it is grading its
