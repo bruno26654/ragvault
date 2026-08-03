@@ -90,18 +90,33 @@ _ABBREV_GUARD = "".join(f"(?<!\\b{a}\\.)" for a in _ABBREVIATIONS)
 #: without letter case.
 _CLAIM_START = r"[A-Z\[]|[-*•+]\s|\d+[.)]\s|(?![a-zà-öø-ÿ])[^\W\d_]"
 
+#: Citation markers sitting right after a terminator belong to the claim they
+#: follow, not to the next one. Written as `... 30 days. [1]`, the marker used
+#: to land on the *following* claim: the claim it actually sourced came back
+#: `uncited` (and `strict` dropped it), the next claim was credited to a source
+#: it never cited, and a trailing `[2]` became a "claim" that was only a
+#: marker. `[ \t]*` and not `\s*` on purpose — a marker on the next line
+#: stays with that line.
+#:
+#: Written as an atomic group (lookahead capture + backreference, since
+#: possessive quantifiers need 3.11 and abi3 targets 3.9): allowed to
+#: backtrack, the trail would give the markers back and let a terminal `[2]`
+#: split off as a claim that is only a marker — the very failure this fixes.
+_TRAILING_CITES = r"(?=(?P<trail>(?:[ \t]*\[\d+\])*))(?P=trail)"
+
 #: Claim boundaries. Three alternatives, in order:
-#:  1. Latin terminator + whitespace + something that starts a new unit
-#:     (capital, citation marker, or a list bullet — without bullets a whole
-#:     list would be one claim, so one bad item condemned all of them);
+#:  1. Latin terminator + any trailing citation markers + whitespace +
+#:     something that starts a new unit (capital, citation marker, or a list
+#:     bullet — without bullets a whole list would be one claim, so one bad
+#:     item condemned all of them);
 #:  2. CJK/full-width terminators, where the space is optional and there is
 #:     no case to look for — Chinese, Japanese and Korean answers were never
 #:     split at all before, making per-claim verification a no-op for them;
 #:  3. Arabic full stop / question mark, same reason.
 _SENTENCE_RE = re.compile(
-    rf"(?<=[.!?]){_ABBREV_GUARD}\s+(?={_CLAIM_START})"
-    r"|(?<=[。．！？])\s*"
-    r"|(?<=[؟۔])\s+"
+    rf"(?<=[.!?]){_ABBREV_GUARD}{_TRAILING_CITES}\s+(?={_CLAIM_START})"
+    rf"|(?<=[。．！？]){_TRAILING_CITES.replace('trail', 'trail_cjk')}\s*"
+    rf"|(?<=[؟۔]){_TRAILING_CITES.replace('trail', 'trail_rtl')}\s+"
 )
 
 
@@ -119,6 +134,11 @@ class ClaimVerification:
     replacement: Optional[str] = None
     #: Verdict of the second pass over the replacement itself, when one ran.
     replacement_verdict: Optional[str] = None
+    #: Span of the cited source the verifier says carries the support. Checked
+    #: against the evidence text: a quote that is not in the source is the
+    #: verifier attributing to it something it does not say, which no verdict
+    #: of `supported` can survive.
+    quote: Optional[str] = None
     #: What the pipeline actually did: kept / annotated / rewritten / removed.
     action: str = "kept"
 
@@ -135,6 +155,7 @@ class ClaimVerification:
             "chunk_ids": list(self.chunk_ids),
             "replacement": self.replacement,
             "replacement_verdict": self.replacement_verdict,
+            "quote": self.quote,
             "action": self.action,
         }
 
@@ -274,8 +295,12 @@ def _split_with_separators(text: str) -> tuple[list[str], list[str]]:
     seps: list[str] = []
     pos = 0
     for match in _SENTENCE_RE.finditer(stripped):
-        claims.append(stripped[pos:match.start()])
-        seps.append(match.group(0))
+        # Citation markers trailing the terminator stay with the claim they
+        # source; only what follows them is layout between claims.
+        trail = (match.group("trail") or match.group("trail_cjk")
+                 or match.group("trail_rtl") or "")
+        claims.append(stripped[pos:match.start()] + trail)
+        seps.append(stripped[match.start() + len(trail):match.end()])
         pos = match.end()
     claims.append(stripped[pos:])
     # Drop empties while keeping the separator alignment consistent.
@@ -317,19 +342,53 @@ def _evidence_for(indices: Sequence[int], citations: Sequence[Citation]) -> list
             # Precedence-deciding fields travel with the evidence: without
             # them a verifier cannot tell a current rule from a revoked one.
             "metadata": dict(citation.metadata),
+            # The cited block's own text. A judge handed only the full context
+            # has to find `[n]` in it by hand, and can just as easily justify
+            # a claim from a block the claim never cited — the support has to
+            # come from the source that was actually named.
+            "text": citation.text,
         })
     return evidence
 
 
-def _coerce_verdict(raw: object, claim: str) -> tuple[str, str, Optional[str]]:
-    """Normalize one verifier result into (verdict, rationale, replacement)."""
+def _normalize_span(text: str) -> str:
+    """Collapse whitespace and case for substring comparison.
+
+    A quote is re-wrapped and re-cased on its way through a model; neither
+    changes whose words they are. Nothing else is normalized — the words
+    themselves must match.
+    """
+    return " ".join(text.split()).casefold()
+
+
+def _quote_is_grounded(quote: str, evidence: Sequence[dict]) -> bool:
+    """True when the quoted span really appears in one of the cited sources.
+
+    Purely structural: substring, not meaning. A verifier that answers
+    "supported, the source says X" where no cited source says X has attributed
+    words to a document it did not contain them, and that is checkable without
+    judging anything.
+    """
+    needle = _normalize_span(quote)
+    if not needle:
+        return False
+    return any(needle in _normalize_span(ev.get("text") or "") for ev in evidence)
+
+
+def _coerce_verdict(
+    raw: object, claim: str
+) -> tuple[str, str, Optional[str], Optional[str]]:
+    """Normalize one verifier result into (verdict, rationale, replacement,
+    quote)."""
     if isinstance(raw, str):
-        verdict, rationale, replacement = raw, "", None
+        verdict, rationale, replacement, quote = raw, "", None, None
     elif isinstance(raw, dict):
         verdict = str(raw.get("verdict", "")).strip().lower()
         rationale = str(raw.get("rationale", "") or "")
         replacement = raw.get("replacement")
         replacement = None if replacement is None else str(replacement)
+        quote = raw.get("quote")
+        quote = None if quote is None else str(quote)
     else:
         raise ConfigurationError(
             "verifier must return a verdict string or a dict with a 'verdict' "
@@ -341,7 +400,7 @@ def _coerce_verdict(raw: object, claim: str) -> tuple[str, str, Optional[str]]:
             f"unknown verdict {verdict!r} for claim {claim[:60]!r}; "
             f"expected one of {sorted(VERDICTS)}"
         )
-    return verdict, rationale, replacement
+    return verdict, rationale, replacement, quote
 
 
 def verify_answer(
@@ -354,6 +413,7 @@ def verify_answer(
     mode: str = "report",
     facets: Optional[Sequence[str]] = None,
     allow_replacements: bool = False,
+    require_quotes: bool = False,
 ) -> VerificationReport:
     """Run the verification pass. See the module docstring for the contract.
 
@@ -368,6 +428,16 @@ def verify_answer(
     and then re-verifies it is grading its own text — self-endorsement, not
     verification — so by default a problem claim is removed rather than
     rewritten. Turn it on only if you accept that trade-off.
+
+    A verdict may carry a ``quote``: the span of the cited source that
+    supports the claim. It is always checked against the source text, and a
+    quote found in none of the cited sources drops the claim to
+    ``unsupported`` — the verifier attributed words to a document that does
+    not contain them. ``require_quotes`` extends that to silence: a
+    ``supported`` verdict offering no span is not accepted either. It is off
+    by default because support is not always a contiguous span (a rule spread
+    over two sentences, a table), and demanding one would reject claims that
+    really are supported.
     """
     if mode not in VERIFICATION_MODES:
         raise ConfigurationError(
@@ -455,18 +525,41 @@ def verify_answer(
             report.segmentation = "verifier"
             report.structural_issues.extend(issues)
         for claim, item in zip(claims, results):
-            verdict, rationale, replacement = _coerce_verdict(item, claim)
+            verdict, rationale, replacement, quote = _coerce_verdict(item, claim)
             indices = citations_in(claim)
+            evidence = _evidence_for(indices, citations)
+
+            # A quote is the one part of a verdict the library can check
+            # itself, and checking it costs nothing.
+            if quote is not None and not _quote_is_grounded(quote, evidence):
+                report.structural_issues.append(
+                    f"quoted evidence is not in any cited source: "
+                    f"{quote.strip()[:60]!r} for claim {claim[:40]!r}"
+                )
+                verdict = UNSUPPORTED
+                rationale = (
+                    f"{rationale} | quoted span does not appear in the cited "
+                    "source"
+                ).strip(" |")
+            elif require_quotes and verdict == SUPPORTED and not quote:
+                report.structural_issues.append(
+                    f"require_quotes: no supporting span given for claim "
+                    f"{claim[:40]!r}"
+                )
+                verdict = UNSUPPORTED
+                rationale = (
+                    f"{rationale} | no quoted span was given, and quotes are "
+                    "required"
+                ).strip(" |")
+
             report.claims.append(ClaimVerification(
                 claim=claim,
                 citations=indices,
                 verdict=verdict,
                 rationale=rationale,
-                chunk_ids=[
-                    cid for ev in _evidence_for(indices, citations)
-                    for cid in ev["chunk_ids"]
-                ],
+                chunk_ids=[cid for ev in evidence for cid in ev["chunk_ids"]],
                 replacement=replacement,
+                quote=quote,
             ))
         report.facet_coverage = _coerce_facets(facet_report, facets)
         if report.expected_facets and report.facet_coverage:
@@ -502,7 +595,9 @@ def verify_answer(
         try:
             recheck, _, _ = run([c.replacement for c in rewritten])  # type: ignore[misc]
             for claim, item in zip(rewritten, recheck):
-                verdict, rationale, _ = _coerce_verdict(item, claim.replacement or "")
+                verdict, rationale, _, _ = _coerce_verdict(
+                    item, claim.replacement or ""
+                )
                 claim.replacement_verdict = verdict
                 # Fail closed: only an explicitly `supported` replacement may
                 # enter the answer. `uncited`/`inference`/`question_fact` are

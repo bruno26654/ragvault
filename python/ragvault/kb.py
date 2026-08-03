@@ -878,6 +878,8 @@ class KnowledgeBase:
         verify: Optional[Callable] = None,
         verification_mode: str = "report",
         allow_replacements: bool = False,
+        require_quotes: bool = False,
+        facets: Optional[Sequence[str]] = None,
         **retrieve_kwargs: Any,
     ) -> Answer:
         """Retrieve context and call a user-provided LLM. The LLM is a plain
@@ -889,7 +891,9 @@ class KnowledgeBase:
         behaviour is exactly as before. The verifier segments and classifies;
         it does not write, so a claim that does not hold is removed rather than
         rewritten — set ``allow_replacements=True`` to let its ``replacement``
-        text into the answer instead.
+        text into the answer instead. ``facets=`` declares what the answer owed
+        (see :meth:`ask_multi`), which is what makes ``verification.complete``
+        meaningful for a single-query ask.
         """
         trace = bool(retrieve_kwargs.get("trace"))
         result = self.retrieve(question, **retrieve_kwargs)
@@ -918,6 +922,7 @@ class KnowledgeBase:
                 question=question, answer_text=text, context=result.context,
                 citations=result.citations, verify=verify, mode=verification_mode,
                 allow_replacements=allow_replacements,
+                require_quotes=require_quotes, facets=facets,
             )
             text = report.repaired_text
             if trace and result.trace is not None:

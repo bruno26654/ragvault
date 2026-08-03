@@ -131,9 +131,27 @@ print(answer.unverified_claims)     # afirmações problemáticas
 ```
 
 O verificador recebe um payload com `question`, `answer`, `context` e, por
-afirmação, `claim` + `citations` + `evidence` (documento, versão e **chunk_ids
-reais**). Devolve um veredito por afirmação — string ou dict com `verdict`,
-`rationale` e `replacement` opcional.
+afirmação, `claim` + `citations` + `evidence` (documento, versão, **chunk_ids
+reais**, metadados e o **texto do bloco citado**). Devolve um veredito por
+afirmação — string ou dict com `verdict`, `rationale` e `quote` opcional.
+
+**Texto da fonte junto da afirmação.** Cada `evidence` traz o `text` do bloco
+`[n]` que a afirmação citou. Sem isso o juiz precisa reencontrar o bloco dentro
+do `context` montado — e pode justificar a afirmação com um bloco que ela nunca
+citou. O `context` completo continua no payload (julgar `uncited`, ou notar que
+a evidência certa estava sob outro marcador, precisa dele); é o chamador quem
+decide o que entra no prompt — veja os exemplos, que mostram as fontes citadas
+por afirmação.
+
+**`quote`: a única parte do veredito que a biblioteca confere sozinha.** Se o
+verificador devolver `quote`, ele é comparado ao texto das fontes citadas
+(substring, com espaços e caixa normalizados — reformatar não muda de quem são
+as palavras). Citação que não está em nenhuma fonte citada é atribuição
+fabricada: a afirmação cai para `unsupported` e a discrepância entra em
+`structural_issues`. `require_quotes=True` estende isso ao silêncio — um
+`supported` sem trecho também não é aceito. É opcional por padrão porque nem
+todo suporte é um trecho contíguo (regra espalhada em duas frases, tabela), e
+exigi-lo rejeitaria afirmações realmente sustentadas.
 
 | Veredito | Significado |
 |---|---|
@@ -159,8 +177,8 @@ não reescrita. Quem aceita essa troca liga `allow_replacements=True` em
 `ask()`/`ask_multi()`; aí vale a segunda passagem descrita abaixo.
 
 **Fidelidade × completude** são eixos separados: toda afirmação pode estar
-sustentada e a resposta ainda deixar uma faceta de fora. Quando a pergunta foi
-decomposta, as facetas vão no payload (`payload["facets"]`) e o verificador
+sustentada e a resposta ainda deixar uma faceta de fora. As facetas vão no
+payload (`payload["facets"]`) e o verificador
 pode devolver `{"claims": [...], "facets": [{"facet": ..., "covered": bool,
 "rationale": ...}]}`. O relatório expõe `facet_coverage`, `uncovered_facets` e
 `complete` — que só é `None` quando **não havia facetas a cobrir**. Declarada
@@ -171,6 +189,17 @@ verificador (está no prompt dos exemplos), não à biblioteca. Faceta descobert
 **reportada, nunca preenchida automaticamente**: regenerar exigiria uma
 chamada extra ao LLM que o chamador não pediu, com custo e risco de laço —
 a decisão fica com quem chama.
+
+**Facetas ≠ subconsultas.** `facets=[...]` declara o que a resposta **devia**
+entregar, e vale tanto para o checklist no prompt quanto para o julgamento de
+completude — a resposta é cobrada exatamente da lista que recebeu. Sem
+`facets`, `ask_multi` usa as subconsultas, o que só é correto na medida em que
+elas são atômicas (uma obrigação cada), que é a forma pedida ao decompositor.
+Elas continuam sendo consultas de **recuperação**: um decompositor que divide
+para *busca* (`"política de reembolso revisão 2024"`) cria obrigações que o
+usuário nunca pediu, e cada uma vira uma faceta "não coberta". `facets=[]`
+desliga o eixo (`complete=None`); `ask()` também aceita `facets=`, que é o que
+torna `complete` utilizável fora do multi-query.
 
 **Segunda passagem sobre os `replacement`** (só com `allow_replacements=True`):
 em `repair`/`strict`, o texto proposto pelo verificador é ele próprio
@@ -183,6 +212,15 @@ foram checados.
 
 **Formatação preservada**: `repair` reconstrói a resposta com os separadores
 originais — listas e parágrafos sobrevivem à remoção de um item.
+
+**Marcador depois do ponto final**: `... 30 dias. [1]` cita a mesma coisa que
+`... 30 dias [1].` — o marcador é fonte da afirmação que ele **segue**. Antes o
+corte acontecia no terminador, então o marcador caía na afirmação *seguinte*: a
+afirmação que de fato citava a fonte voltava `uncited` (e `strict` apagava um
+fato com fonte), a próxima recebia crédito de uma fonte que não citou, e um
+`[2]` final virava uma "afirmação" que era só um marcador. Sem espaço
+(`dias.[1] Já`) a resposta **não era dividida**. O marcador agora fica com sua
+afirmação; um marcador no início da linha seguinte pertence àquela linha.
 
 **Segmentação das afirmações**: a divisão embutida é heurística — terminadores
 de sentença, marcadores de lista, pontuação **CJK/árabe/hebraica** e guarda de
@@ -203,7 +241,8 @@ usada (`"heuristic"` ou `"verifier"`).
 **Metadados na evidência**: cada `evidence` traz o `metadata` efetivo do
 documento citado (incluindo `status`, data de vigência e versão), também
 disponível em `Citation.metadata` — sem isso o verificador não consegue
-distinguir uma regra vigente de uma revogada.
+distinguir uma regra vigente de uma revogada. `Citation.text` traz o texto do
+bloco, exatamente como ele aparece sob `[n]` no contexto.
 
 ### Quatro eixos independentes
 
