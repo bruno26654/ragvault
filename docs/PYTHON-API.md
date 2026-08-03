@@ -95,7 +95,31 @@ resultados de cada subconsulta em um tier prioritário. Medido em
 `doc_group`, ordena por status (`VIGENTE`/`active` > desconhecido >
 `REVOGADO`/`revoked`), depois `effective_date` mais recente, depois `version`
 maior. Os perdedores **nunca** são silenciosos: aparecem em
-`result.conflicts` e no trace, e `ask_multi` os declara no prompt.
+`result.conflicts`, em `plan["eliminated"]` (com `explain=True`) e no trace, e
+`ask_multi` os declara no prompt.
+
+Três regras que só valem juntas:
+
+- **Revogação é absoluta.** Documento cujo `status` está na classe revogada
+  está fora de vigor por declaração própria — independentemente de o sucessor
+  ter sido recuperado ou não. Julgada só de forma *relativa*, uma regra
+  revogada que superasse o próprio sucessor entrava no contexto parecendo
+  vigente, sem nada reportado. **Exceção:** se o filtro do chamador menciona o
+  campo de status, ele está gerenciando status explicitamente e a regra
+  absoluta não se aplica — é o que mantém "faceta histórica em `REVOGADO`"
+  funcionando junto de `resolve_versions=True`.
+- **Empate não é decisão.** Documentos que empatam no topo por (status, data,
+  versão) são indistinguíveis *pelos metadados*: todos permanecem, e o
+  conflito sai com `resolved: False` e `tied: [ids]`. Antes o desempate era
+  alfabético por `document_id` — a evidência do perdedor sumia e a resposta
+  parecia resolvida sem que nada a tivesse resolvido. `ask_multi` avisa o
+  modelo: grupo não resolvido → relatar a divergência, não escolher um lado.
+- **Eliminar não encolhe o contexto.** Cada chunk removido libera uma vaga que
+  o próximo candidato ocupa, e a **garantia de cobertura é reservada de novo**
+  sobre o que continua elegível. Sem isso, uma versão revogada que superasse a
+  vigente custava as duas: a vaga da faceta era gasta na revogada, e a vigente
+  ficava logo fora da janela que havia sido cortada para a perdedora. Fusão e
+  resolução rodam até ponto fixo.
 
 **Checklist de facetas na resposta**: as subconsultas não servem só à
 recuperação — `ask_multi` também as lista no prompt como facetas que a

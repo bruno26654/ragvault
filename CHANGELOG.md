@@ -13,6 +13,29 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
 ## [Unreleased]
 
 ### Fixed
+- **A revoked document reached the context looking current.** Revocation was
+  judged only *relatively* — a document lost to a better sibling in its
+  `doc_group`. When the superseding version was not among the retrieved
+  candidates, the group had one member, nothing was compared, and the revoked
+  rule was presented as the rule in force with nothing reported. A status in
+  the revoked class now eliminates the document by itself. Callers whose own
+  filter constrains the status field are exempt: asking for revoked documents
+  and then having them deleted for being revoked would undo an explicit
+  instruction (the documented "historical facet" pattern).
+- **An undecidable precedence conflict was settled by alphabetical order.**
+  Documents tying on status, effective date and version fell through to a
+  `document_id` tie-break, and the loser's evidence was deleted — so two
+  equally current rules that disagreed left a context that looked settled.
+  Documents tied at the top all survive now, the conflict is reported with
+  `resolved: False` and `tied: [...]`, and `ask_multi` tells the model to
+  report the disagreement instead of choosing a side.
+- **Eliminating a candidate shrank the context and forfeited a facet's
+  coverage slot.** The per-subquery reservation was computed before version
+  resolution, so a revoked document that outranked its own replacement took
+  the slot, was deleted, and the replacement — just outside the window that
+  had been cut for the loser — never arrived. Fusion and resolution now run to
+  a fixed point: coverage is re-reserved over what is still eligible and the
+  window refills.
 - **A citation marker after the sentence terminator was attributed to the
   wrong claim.** Written the ordinary way — `Refunds take 30 days. [1] They
   ship fast. [2]` — the split happened at the period, so `[1]` landed on the
@@ -24,6 +47,16 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
   next line still belongs to that line.
 
 ### Added
+- **A high-demand scenario suite** (`tests/python/test_scenario_versioned_registry.py`):
+  ~900 noise documents plus current, revoked, redundant, incomplete and
+  partially conflicting rules across four entities. Multi-faceted questions
+  whose deadlines, procedures and conditions must not be mixed, with
+  deterministic stand-ins that derive everything from the retrieved context.
+  Covers retrieval under noise, version resolution, entity separation, direct
+  citation support, completeness, claim atomicity, and fail-closed behaviour.
+  The three version-resolution bugs above were found by it.
+- **`plan["eliminated"]` under `explain=True`** — what was removed and why was
+  previously visible only in a full trace.
 - **The cited block's text travels with the evidence** (`Citation.text`, and
   `evidence[i]["text"]` in the verification payload). A judge handed only the
   assembled context has to locate `[n]` in it by hand, and can as easily
