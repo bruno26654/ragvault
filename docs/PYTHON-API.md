@@ -167,15 +167,34 @@ a evidência certa estava sob outro marcador, precisa dele); é o chamador quem
 decide o que entra no prompt — veja os exemplos, que mostram as fontes citadas
 por afirmação.
 
-**`quote`: a única parte do veredito que a biblioteca confere sozinha.** Se o
-verificador devolver `quote`, ele é comparado ao texto das fontes citadas
-(substring, com espaços e caixa normalizados — reformatar não muda de quem são
-as palavras). Citação que não está em nenhuma fonte citada é atribuição
-fabricada: a afirmação cai para `unsupported` e a discrepância entra em
-`structural_issues`. `require_quotes=True` estende isso ao silêncio — um
-`supported` sem trecho também não é aceito. É opcional por padrão porque nem
-todo suporte é um trecho contíguo (regra espalhada em duas frases, tabela), e
-exigi-lo rejeitaria afirmações realmente sustentadas.
+**Todo veredito nomeia seu lastro — e o lastro é conferido.** Um veredito é
+uma afirmação *sobre* uma fonte, e cada um tem um lastro admissível:
+
+| Veredito | Lastro |
+|---|---|
+| `supported` | as fontes citadas |
+| `question_fact` | a pergunta |
+| `inference`, `contradicted` | as fontes citadas **ou** a pergunta |
+| `unsupported`, `uncited` | nenhum — afirmam uma *ausência* |
+
+`quote` é comparado exatamente ao que o veredito invoca (substring, com
+espaços e caixa normalizados — reformatar não muda de quem são as palavras):
+fonte citada para `supported`, **a pergunta** para `question_fact`. Trecho que
+não está lá é atribuição fabricada: a afirmação cai para `unsupported` e a
+discrepância entra em `structural_issues`.
+
+Sem `quote`, `require_evidence` (**ligado por padrão**) ainda exige que a
+afirmação cite algo onde a fonte é lastro admissível. Sem isso, `supported`,
+`inference` e `question_fact` eram **infalsificáveis**: rotular uma frase
+inventada com qualquer um dos três passava com `ok=True`, sem citação, sem
+trecho e sem nada conferido. `supported` sem citação vira `uncited` — a
+afirmação pode até ser verdadeira, ela só não nomeou fonte nenhuma.
+
+`ask()`/`ask_multi()` derivam `require_evidence` do próprio `citations`: quem
+desligou as citações não é cobrado por elas. `require_quotes=True` vai além e
+exige trecho para todo veredito com lastro; é opcional porque nem todo suporte
+é um trecho contíguo (regra espalhada em duas frases, tabela), e exigi-lo
+rejeitaria afirmações realmente sustentadas.
 
 | Veredito | Significado |
 |---|---|

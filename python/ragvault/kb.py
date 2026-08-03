@@ -879,6 +879,7 @@ class KnowledgeBase:
         verification_mode: str = "report",
         allow_replacements: bool = False,
         require_quotes: bool = False,
+        require_evidence: Optional[bool] = None,
         facets: Optional[Sequence[str]] = None,
         **retrieve_kwargs: Any,
     ) -> Answer:
@@ -923,6 +924,10 @@ class KnowledgeBase:
                 citations=result.citations, verify=verify, mode=verification_mode,
                 allow_replacements=allow_replacements,
                 require_quotes=require_quotes, facets=facets,
+                # An answer that was never asked to cite cannot be held to
+                # citations; the caller already said which mode this is.
+                require_evidence=citations if require_evidence is None
+                else require_evidence,
             )
             text = report.repaired_text
             if trace and result.trace is not None:
