@@ -268,26 +268,115 @@ def retrieve_multi(
     # Per-subquery coverage guarantee: reserve the top hits of each subquery
     # into a priority tier so a facet's specialist evidence cannot be buried
     # by a mediocre document with broad, shallow consensus (see module doc).
-    reserved: dict[str, str] = {}  # chunk_id -> which subquery reserved it
-    if coverage_per_subquery > 0 and len(queries) > 1:
+    # `excluded` is what version resolution has already thrown out: a slot
+    # spent on a revoked document is a facet left unrepresented, so the
+    # reservation is recomputed over what is still eligible.
+    def reserve(excluded: set) -> dict:
+        reserved: dict[str, str] = {}  # chunk_id -> which subquery reserved it
+        if coverage_per_subquery <= 0 or len(queries) <= 1:
+            return reserved
         for q, resp in zip(queries, responses):
             taken = 0
             for hit in resp["hits"]:
                 if taken >= coverage_per_subquery:
                     break
                 cid = hit["chunk_id"]
-                if cid in reserved:
-                    continue  # already covers another subquery
+                if cid in reserved or cid in excluded:
+                    continue  # already covers another subquery, or eliminated
                 reserved[cid] = q
                 taken += 1
+        return reserved
 
     tier_lift = (max(fused.values()) if fused else 0.0) + 1.0
-    ranked = {
-        cid: score + (tier_lift if cid in reserved else 0.0)
-        for cid, score in fused.items()
-    }
-    ordered = sorted(ranked.items(), key=lambda kv: (-kv[1], kv[0]))
+
+    def order(excluded: set) -> tuple[list, dict, dict]:
+        reserved = reserve(excluded)
+        ranked = {
+            cid: score + (tier_lift if cid in reserved else 0.0)
+            for cid, score in fused.items() if cid not in excluded
+        }
+        return (sorted(ranked.items(), key=lambda kv: (-kv[1], kv[0])),
+                ranked, reserved)
+
+    ordered, ranked, reserved = order(set())
     stage_ms["fusion"] = (time.monotonic() - t0) * 1000
+
+    # -- 4. materialize chunks (provenance from real stored chunks) ---------
+    eliminated: list[dict] = []
+    doc_cache: dict[str, Optional[dict]] = {}
+
+    materialized: dict[str, RetrievedChunk] = {}
+    missing: set = set()
+
+    def materialize(batch: Sequence[tuple[str, float]]) -> list[RetrievedChunk]:
+        wanted = [(cid, s) for cid, s in batch if cid not in materialized]
+        stored = kb._vault.get_chunks([cid for cid, _ in wanted])
+        for (cid, score), raw in zip(wanted, stored):
+            if raw is None:
+                eliminated.append({"chunk_id": cid,
+                                   "reason": "chunk no longer stored"})
+                missing.add(cid)
+                continue
+            hit = dict(best_hit[cid])
+            hit["score"] = score
+            doc_id = hit["document_id"]
+            if doc_id not in doc_cache:
+                doc_cache[doc_id] = kb._vault.get_document(doc_id)
+            materialized[cid] = kb._hit_to_chunk(hit, raw, doc_cache[doc_id])
+        return [materialized[cid] for cid, _ in batch if cid in materialized]
+
+    window = max(k * 4, rerank_window)
+    chunks: list[RetrievedChunk] = materialize(ordered[:window])
+
+    # -- 5. version resolution by metadata precedence -----------------------
+    conflicts: list[dict] = []
+    if resolve_versions:
+        t0 = time.monotonic()
+        # Elimination must not shrink the context, and must not cost a facet
+        # its reserved slot. Both used to happen: a revoked document that
+        # outranked its own replacement took the slot, was deleted, and the
+        # replacement — sitting just outside the window that had been cut for
+        # the loser — never arrived. So fusion and resolution run to a fixed
+        # point: re-reserve coverage over what is still eligible, re-order,
+        # refill the window, resolve again. Each round strictly grows
+        # `excluded`, so it terminates; in practice it settles in one or two.
+        # A caller whose own filter constrains the status field is managing
+        # status explicitly — deleting the documents they asked for would undo
+        # their instruction (the documented "historical facet in REVOGADO"
+        # pattern is exactly that).
+        absolute_status = not any(
+            _filter_mentions(f, status_field) for f in per_query_filters
+        )
+        excluded: set = set(missing)
+        by_group: dict[str, dict] = {}
+        for _ in range(_MAX_RESOLUTION_ROUNDS):
+            chunks, conflicts, dropped_chunks = _resolve_versions(
+                chunks, status_field=status_field,
+                effective_date_field=effective_date_field,
+                version_field=version_field,
+                version_group_field=version_group_field,
+                absolute_status=absolute_status,
+            )
+            # Conflicts are recomputed from the surviving set each round, so
+            # they are merged: without this, a version eliminated in round 1
+            # vanishes from the report the moment round 2 recomputes.
+            for conflict in conflicts:
+                _merge_conflict(by_group, conflict)
+            eliminated.extend(dropped_chunks)
+            if not dropped_chunks:
+                break
+            excluded |= {d["chunk_id"] for d in dropped_chunks}
+            ordered, ranked, reserved = order(excluded)
+            refilled = materialize(ordered[:window])
+            if len(refilled) <= len(chunks):
+                break
+            chunks = refilled
+        conflicts = list(by_group.values())
+
+        stage_ms["resolve_versions"] = (time.monotonic() - t0) * 1000
+        if trace_data is not None:
+            trace_data["version_conflicts"] = conflicts
+
     if trace_data is not None:
         trace_data["fusion"] = {
             "method": "weighted_rrf",
@@ -304,94 +393,6 @@ def retrieve_multi(
                 for cid, _ in ordered[:50]
             ],
         }
-
-    # -- 4. materialize chunks (provenance from real stored chunks) ---------
-    eliminated: list[dict] = []
-    keep = ordered[: max(k * 4, rerank_window)]
-    doc_cache: dict[str, Optional[dict]] = {}
-    stored = kb._vault.get_chunks([cid for cid, _ in keep])
-    chunks: list[RetrievedChunk] = []
-    for (cid, score), raw in zip(keep, stored):
-        if raw is None:
-            eliminated.append({"chunk_id": cid, "reason": "chunk no longer stored"})
-            continue
-        hit = dict(best_hit[cid])
-        hit["score"] = score
-        doc_id = hit["document_id"]
-        if doc_id not in doc_cache:
-            doc_cache[doc_id] = kb._vault.get_document(doc_id)
-        chunks.append(kb._hit_to_chunk(hit, raw, doc_cache[doc_id]))
-
-    # -- 5. version resolution by metadata precedence -----------------------
-    conflicts: list[dict] = []
-    if resolve_versions:
-        t0 = time.monotonic()
-        groups: dict[str, dict[str, dict]] = {}
-        for chunk in chunks:
-            group = chunk.metadata.get(version_group_field)
-            if group is None:
-                continue
-            docs = groups.setdefault(str(group), {})
-            entry = docs.setdefault(chunk.document_id, {
-                "document_id": chunk.document_id,
-                "status": chunk.metadata.get(status_field),
-                "effective_date": chunk.metadata.get(effective_date_field)
-                or chunk.metadata.get("valid_from"),
-                "version": chunk.metadata.get(version_field),
-                "best_score": chunk.score,
-            })
-            entry["best_score"] = max(entry["best_score"], chunk.score)
-
-        losers: dict[str, str] = {}  # document_id -> reason
-        for group, docs in groups.items():
-            if len(docs) < 2:
-                continue
-
-            def precedence(e: dict):
-                version = e["version"]
-                try:
-                    version_num = float(version)
-                except (TypeError, ValueError):
-                    version_num = float("-inf")
-                return (
-                    _status_rank(e["status"]),          # active first
-                    -(_iso_key(e["effective_date"])),   # latest date first
-                    -version_num,                       # highest version first
-                    e["document_id"],                   # deterministic tie-break
-                )
-
-            ranked = sorted(docs.values(), key=precedence)
-            winner, rest = ranked[0], ranked[1:]
-            dropped = []
-            for e in rest:
-                reason = _precedence_reason(winner, e, status_field)
-                losers[e["document_id"]] = reason
-                dropped.append({"document_id": e["document_id"],
-                                "status": e["status"], "reason": reason})
-            conflicts.append({
-                "group": group,
-                "kept": {"document_id": winner["document_id"],
-                         "status": winner["status"],
-                         "effective_date": winner["effective_date"],
-                         "version": winner["version"]},
-                "dropped": dropped,
-            })
-
-        if losers:
-            surviving = []
-            for chunk in chunks:
-                if chunk.document_id in losers:
-                    eliminated.append({
-                        "chunk_id": chunk.chunk_id,
-                        "document_id": chunk.document_id,
-                        "reason": f"version resolution: {losers[chunk.document_id]}",
-                    })
-                else:
-                    surviving.append(chunk)
-            chunks = surviving
-        stage_ms["resolve_versions"] = (time.monotonic() - t0) * 1000
-        if trace_data is not None:
-            trace_data["version_conflicts"] = conflicts
 
     # -- 6. metadata boosts (post-fusion, multiplicative) --------------------
     if boosts:
@@ -498,6 +499,9 @@ def retrieve_multi(
         plan["dense_backend"] = responses[0].get("plan", {}).get("dense_backend")
     if explain or trace:
         plan["token_budget"] = token_budget
+        # What was removed, and why. This is the answer to "where did that
+        # document go" — it belongs in `explain`, not only in a full trace.
+        plan["eliminated"] = eliminated
     if trace_data is not None:
         trace_data["stage_ms"] = {s: round(ms, 3) for s, ms in stage_ms.items()}
 
@@ -522,6 +526,157 @@ def _iso_key(date: Optional[str]) -> float:
     if not digits:
         return float("-inf")
     return float(digits.ljust(14, "0"))
+
+
+#: Safety bound on the resolve/refill fixed point. Each round eliminates at
+#: least one chunk, so the loop cannot spin; this only caps pathological input.
+_MAX_RESOLUTION_ROUNDS = 8
+
+
+def _merge_conflict(by_group: dict, conflict: dict) -> None:
+    """Accumulate a group's conflict across resolution rounds.
+
+    Later rounds see fewer documents, so their view of who won is current but
+    their `dropped` list is short a version — the one eliminated last round.
+    Keep the latest verdict, union the eliminations.
+    """
+    previous = by_group.get(conflict["group"])
+    if previous is None:
+        by_group[conflict["group"]] = dict(conflict)
+        return
+    seen = {d["document_id"] for d in conflict["dropped"]}
+    merged = list(conflict["dropped"]) + [
+        d for d in previous["dropped"] if d["document_id"] not in seen
+    ]
+    by_group[conflict["group"]] = {**conflict, "dropped": merged}
+
+
+def _filter_mentions(node: object, field: str) -> bool:
+    """True when a filter constrains `field` anywhere inside it.
+
+    Structural walk of the DSL (`$and`/`$or`/`$not` and plain field maps), not
+    an interpretation of what the constraint means.
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ("$and", "and", "$or", "or", "$not", "not"):
+                if _filter_mentions(value, field):
+                    return True
+            elif key == field:
+                return True
+        return False
+    if isinstance(node, (list, tuple)):
+        return any(_filter_mentions(item, field) for item in node)
+    return False
+
+
+def _resolve_versions(
+    chunks: Sequence[RetrievedChunk], *, status_field: str,
+    effective_date_field: str, version_field: str, version_group_field: str,
+    absolute_status: bool = True,
+) -> tuple[list[RetrievedChunk], list[dict], list[dict]]:
+    """Keep the documents in force. Pure: same chunk set, same outcome.
+
+    Returns (surviving chunks, conflicts, eliminations). Two rules, both
+    reading only metadata the caller supplied:
+
+    1. A document whose status is in the revoked class is out of force by its
+       own declaration. That is true whether or not its replacement happens to
+       have been retrieved — judging revocation only *relatively* meant a
+       revoked rule that outranked its own successor sailed into the context
+       looking current, with nothing reported. ``absolute_status`` turns this
+       off when the caller's own filters constrain the status field: asking
+       for revoked documents and then having them deleted for being revoked
+       would undo an explicit instruction.
+    2. Within a ``doc_group``, documents strictly worse by (status, date,
+       version) lose to the best. Documents that tie at the top are
+       indistinguishable *by metadata*: they all stay, and the conflict is
+       reported unresolved rather than settled by sorting on document id.
+    """
+    losers: dict[str, str] = {}
+    if absolute_status:
+        for chunk in chunks:
+            status = chunk.metadata.get(status_field)
+            if _status_rank(status) == 2:
+                losers[chunk.document_id] = (
+                    f"{status_field}={status!r} declares the document superseded"
+                )
+
+    groups: dict[str, dict[str, dict]] = {}
+    for chunk in chunks:
+        group = chunk.metadata.get(version_group_field)
+        if group is None:
+            continue
+        docs = groups.setdefault(str(group), {})
+        entry = docs.setdefault(chunk.document_id, {
+            "document_id": chunk.document_id,
+            "status": chunk.metadata.get(status_field),
+            "effective_date": chunk.metadata.get(effective_date_field)
+            or chunk.metadata.get("valid_from"),
+            "version": chunk.metadata.get(version_field),
+            "best_score": chunk.score,
+        })
+        entry["best_score"] = max(entry["best_score"], chunk.score)
+
+    conflicts: list[dict] = []
+    for group, docs in groups.items():
+        if len(docs) < 2:
+            continue
+
+        def precedence(e: dict):
+            """Rank by metadata only. No `document_id` tie-break: sorting by
+            id would let alphabetical order decide which rule applies, and the
+            loser's evidence would leave the context looking settled when
+            nothing settled it."""
+            version = e["version"]
+            try:
+                version_num = float(version)
+            except (TypeError, ValueError):
+                version_num = float("-inf")
+            return (
+                _status_rank(e["status"]),          # active first
+                -(_iso_key(e["effective_date"])),   # latest date first
+                -version_num,                       # highest version first
+            )
+
+        ranked = sorted(docs.values(),
+                        key=lambda e: (precedence(e), e["document_id"]))
+        best = precedence(ranked[0])
+        tied = [e for e in ranked if precedence(e) == best]
+        winner = ranked[0]
+        dropped = []
+        for e in ranked[len(tied):]:
+            reason = _precedence_reason(winner, e, status_field)
+            losers[e["document_id"]] = reason
+            dropped.append({"document_id": e["document_id"],
+                            "status": e["status"], "reason": reason})
+        conflicts.append({
+            "group": group,
+            "resolved": len(tied) == 1,
+            "kept": {"document_id": winner["document_id"],
+                     "status": winner["status"],
+                     "effective_date": winner["effective_date"],
+                     "version": winner["version"]},
+            #: Documents metadata could not rank against each other. Empty
+            #: when precedence produced a single winner.
+            "tied": [e["document_id"] for e in tied] if len(tied) > 1 else [],
+            "dropped": dropped,
+        })
+
+    if not losers:
+        return list(chunks), conflicts, []
+    surviving, eliminated = [], []
+    for chunk in chunks:
+        reason = losers.get(chunk.document_id)
+        if reason is None:
+            surviving.append(chunk)
+        else:
+            eliminated.append({
+                "chunk_id": chunk.chunk_id,
+                "document_id": chunk.document_id,
+                "reason": f"version resolution: {reason}",
+            })
+    return surviving, conflicts, eliminated
 
 
 def _precedence_reason(winner: dict, loser: dict, status_field: str) -> str:
@@ -607,14 +762,26 @@ def ask_multi(
         for c in result.conflicts:
             dropped = ", ".join(
                 f"{d['document_id']} ({d.get('status')})" for d in c["dropped"]
-            )
-            lines.append(
-                f"- group {c['group']!r}: using {c['kept']['document_id']} "
-                f"({c['kept'].get('status')}); superseded: {dropped}"
-            )
+            ) or "none"
+            if c.get("tied"):
+                # Saying "using X" here would invent a decision the metadata
+                # did not make, and the answer would sound settled.
+                lines.append(
+                    f"- group {c['group']!r}: could not be resolved — "
+                    f"{', '.join(c['tied'])} rank equally by status, date and "
+                    f"version and all remain in the context; superseded: "
+                    f"{dropped}"
+                )
+            else:
+                lines.append(
+                    f"- group {c['group']!r}: using {c['kept']['document_id']} "
+                    f"({c['kept'].get('status')}); superseded: {dropped}"
+                )
         conflict_note = (
-            "\n\n# Version notes\nConflicting document versions were resolved "
-            "by metadata precedence:\n" + "\n".join(lines)
+            "\n\n# Version notes\nSome documents belong to the same versioned "
+            "group:\n" + "\n".join(lines)
+            + "\nWhere a group could not be resolved, the sources disagree and "
+            "no version wins: report the disagreement instead of choosing one."
         )
     # Facet checklist: the decomposition already guarantees coverage in
     # *retrieval*; without this it does nothing for coverage in the *answer*,

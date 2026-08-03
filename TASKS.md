@@ -179,6 +179,10 @@ a citação que **existe mas não sustenta** a afirmação.
 | Marcador de citação depois do terminador fica com a claim que ele fonteia | validated | `TestTrailingCitationMarkers` — bug real: `"30 dias. [1]"` deixava a claim `uncited` (apagada por `strict`), creditava a próxima e criava uma "claim" que era só `[2]`; sem espaço não dividia |
 | `facets=` explícito em `ask()`/`ask_multi()` (obrigação ≠ subconsulta de busca) | validated | `TestExplicitFacets` — subconsulta de recuperação virava obrigação artificial; facetas declaradas valem para o checklist do prompt e para o julgamento |
 | Filtros por subconsulta (`subquery_filters`) | validated | `TestPerSubqueryFilters` (faceta decisória em `VIGENTE` + histórica em `REVOGADO` na mesma chamada) |
+| Cenário de alta exigência: base grande, ruidosa e versionada | validated | `test_scenario_versioned_registry.py` — ~900 docs de ruído + regras vigentes/revogadas/redundantes/incompletas/conflitantes em 4 entidades; achou os três bugs de resolução de versão abaixo |
+| Revogação é absoluta (não só relativa ao sucessor recuperado) | validated | `TestRevocationIsAbsolute` — bug real: com o sucessor fora do pool, a regra revogada entrava no contexto parecendo vigente. Filtro explícito de status do chamador tem precedência |
+| Empate de precedência não é decidido por ordem alfabética | validated | `TestUndecidableConflict` — bug real: `document_id` desempatava e a evidência do perdedor sumia; agora ambos ficam, `resolved=False`/`tied`, e o prompt manda relatar a divergência |
+| Eliminação não encolhe o contexto nem gasta a vaga de cobertura | validated | `TestRevocationIsAbsolute::test_the_replacement_takes_the_freed_slot` — bug real: a vaga da faceta era gasta na versão revogada e a vigente ficava fora da janela; fusão e resolução rodam até ponto fixo |
 | Sem dependência obrigatória de provedor | validated | verificador é callable; exemplo roda offline, `--groq` opcional |
 
 ## Backlog v1.0 restante (apenas performance/formato — nenhum P0/P1 aberto)
