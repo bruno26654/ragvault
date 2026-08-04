@@ -19,9 +19,12 @@ Built for composed questions where a single query loses recall. Stages:
    tier. This is what makes multi-hop recall actually improve; measured in
    benchmarks/RESULTS-MULTIQUERY.md.
 4. **Version resolution** — optional metadata precedence (status such as
-   VIGENTE/REVOGADO, effective date, numeric version) within groups sharing a
-   ``doc_group`` metadata key. Losing versions are eliminated *explicitly*:
-   they appear in ``result.conflicts`` and in the trace, never silently.
+   current/superseded, effective date, numeric version) within groups sharing
+   a ``doc_group`` metadata key. The status vocabulary is selectable
+   (``status_vocabulary=``, or your own lists) because a hardcoded one only
+   describes whoever wrote it. Losing versions are eliminated *explicitly*:
+   they appear in ``result.conflicts`` and in the trace, never silently, and
+   statuses the vocabulary does not describe are reported too.
 5. **Metadata boosts** — post-fusion multiplicative boosts via native filter
    evaluation. (Mandatory filters run *before* search as native prefilters.)
 6. **Global rerank** — optional, recall-safe: the reranker reorders a bounded
@@ -53,10 +56,59 @@ if TYPE_CHECKING:  # pragma: no cover
 
 RRF_K0 = 60.0
 
-#: Default status precedence for version resolution (case-insensitive).
-#: Earlier = higher precedence. Statuses not listed rank between the two ends.
-ACTIVE_STATUSES = ("vigente", "active", "current", "in_force")
-REVOKED_STATUSES = ("revogado", "revoked", "superseded", "obsolete", "expired")
+#: Status vocabularies for version resolution (case-insensitive). A status in
+#: the `current` class outranks an unrecognized one, which outranks `superseded`.
+#:
+#: The vocabulary is *data*, not a constant, because a hardcoded one only works
+#: for whoever wrote it. A corpus labelled the MLflow way (`Production` /
+#: `Archived`) or the CMS way (`published` / `deprecated`) matched neither
+#: class, so both sides ranked equal and `resolve_versions=True` silently did
+#: nothing — the worst failure mode available, since the caller asked for
+#: precedence and got none with no signal.
+#:
+#: `generic` is the default and is deliberately domain-neutral: it is the
+#: slowly-changing-dimension / document-control vocabulary (`is_current`,
+#: superseded/obsolete), which is what data and ML tooling converges on.
+STATUS_VOCABULARIES: dict[str, dict[str, tuple[str, ...]]] = {
+    "generic": {
+        "current": ("current", "active", "published", "live", "valid",
+                    "in_force", "effective", "latest"),
+        "superseded": ("superseded", "obsolete", "deprecated", "expired",
+                       "archived", "retired", "inactive", "withdrawn",
+                       "revoked"),
+    },
+    #: MLflow model-registry stages. `Staging` and `None` are left unranked on
+    #: purpose: a staging model is not current, but it is not superseded either.
+    "mlflow": {
+        "current": ("production",),
+        "superseded": ("archived",),
+    },
+    #: Brazilian legal document control. Kept as a *named* vocabulary rather
+    #: than baked into the default, which is where it used to live.
+    "legal-ptbr": {
+        "current": ("vigente", "em vigor", "em_vigor"),
+        "superseded": ("revogado", "revogada", "caduco", "caduca"),
+    },
+}
+
+DEFAULT_STATUS_VOCABULARY = "generic"
+
+#: Recognized in addition to the selected vocabulary so corpora written against
+#: the previous hardcoded list keep resolving. They are aliases, not part of
+#: `generic`; select `status_vocabulary="legal-ptbr"` to use them on purpose.
+_LEGACY_STATUS_ALIASES = {
+    "current": ("vigente",),
+    "superseded": ("revogado",),
+}
+
+#: Backwards-compatible names for the constants this replaced.
+ACTIVE_STATUSES = (
+    STATUS_VOCABULARIES["generic"]["current"] + _LEGACY_STATUS_ALIASES["current"]
+)
+REVOKED_STATUSES = (
+    STATUS_VOCABULARIES["generic"]["superseded"]
+    + _LEGACY_STATUS_ALIASES["superseded"]
+)
 
 
 @dataclass
@@ -68,22 +120,77 @@ class MultiRetrievalResult(RetrievalResult):
     #: Version conflicts resolved by metadata precedence: for each group,
     #: which document won and which were eliminated (and why).
     conflicts: list[dict] = field(default_factory=list)
+    #: Status values the active vocabulary does not describe. Populated only
+    #: when ``resolve_versions=True``. Non-empty means status contributed
+    #: nothing to precedence for those documents — the caller asked for
+    #: precedence and, for them, got none. Reported instead of assumed away.
+    unrecognized_statuses: list[str] = field(default_factory=list)
 
 
 def _normalize(text: str) -> str:
     return " ".join(text.lower().split())
 
 
-def _status_rank(status: Optional[str]) -> int:
-    """Lower is better. Active < unknown < revoked."""
+def resolve_status_vocabulary(
+    vocabulary: Optional[str] = None,
+    current_statuses: Optional[Sequence[str]] = None,
+    superseded_statuses: Optional[Sequence[str]] = None,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Build the (current, superseded) status sets actually used.
+
+    A named vocabulary picks a starting point; explicit sequences replace that
+    class outright, so a caller with their own labels never has to fight a
+    default. Unknown names fail with the list of available ones rather than
+    falling back to a vocabulary the caller did not ask for.
+    """
+    name = vocabulary or DEFAULT_STATUS_VOCABULARY
+    if name not in STATUS_VOCABULARIES:
+        raise ConfigurationError(
+            f"unknown status_vocabulary {name!r}; available: "
+            f"{sorted(STATUS_VOCABULARIES)}. Pass `current_statuses=` and "
+            "`superseded_statuses=` to define your own."
+        )
+    chosen = STATUS_VOCABULARIES[name]
+    current = tuple(current_statuses) if current_statuses is not None else (
+        chosen["current"] + _LEGACY_STATUS_ALIASES["current"]
+    )
+    superseded = tuple(superseded_statuses) if superseded_statuses is not None else (
+        chosen["superseded"] + _LEGACY_STATUS_ALIASES["superseded"]
+    )
+    overlap = {_norm(s) for s in current} & {_norm(s) for s in superseded}
+    if overlap:
+        raise ConfigurationError(
+            f"status(es) {sorted(overlap)} are in both the current and the "
+            "superseded class; a document cannot be both"
+        )
+    return (frozenset(_norm(s) for s in current),
+            frozenset(_norm(s) for s in superseded))
+
+
+def _status_rank(
+    status: Optional[str],
+    current: frozenset[str] = frozenset(),
+    superseded: frozenset[str] = frozenset(),
+) -> int:
+    """Lower is better. Current < unrecognized < superseded.
+
+    An unrecognized status ranks *between* the two rather than being treated as
+    either: the caller labelled the document something this vocabulary does not
+    describe, and guessing which end it belongs to would be inventing a fact
+    about their corpus.
+    """
     if status is None:
         return 1
-    s = str(status).strip().lower()
-    if s in ACTIVE_STATUSES:
+    s = _norm(status)
+    if s in (current or ACTIVE_STATUSES):
         return 0
-    if s in REVOKED_STATUSES:
+    if s in (superseded or REVOKED_STATUSES):
         return 2
     return 1
+
+
+def _norm(status: str) -> str:
+    return str(status).strip().lower()
 
 
 def _build_queries(
@@ -148,6 +255,9 @@ def retrieve_multi(
     status_field: str = "status",
     effective_date_field: str = "effective_date",
     version_field: str = "version",
+    status_vocabulary: Optional[str] = None,
+    current_statuses: Optional[Sequence[str]] = None,
+    superseded_statuses: Optional[Sequence[str]] = None,
     token_budget: Optional[int] = None,
     candidates: Optional[int] = None,
     mode: Optional[str] = None,
@@ -195,8 +305,8 @@ def retrieve_multi(
     # Per-query filters: a decisional facet may need only current documents
     # while a historical facet needs the superseded ones, and a single global
     # filter cannot express both. An entry *replaces* the global filter for
-    # that query (it does not intersect it) — otherwise "only REVOGADO" could
-    # never be expressed under a global "only VIGENTE".
+    # that query (it does not intersect it) — otherwise "only superseded"
+    # could never be expressed under a global "only current".
     per_query_filters: list[Optional[dict]] = [merged_filter] * len(queries)
     if subquery_filters is not None:
         supplied = list(subquery_filters)
@@ -330,6 +440,7 @@ def retrieve_multi(
 
     # -- 5. version resolution by metadata precedence -----------------------
     conflicts: list[dict] = []
+    unrecognized_statuses: list[str] = []
     if resolve_versions:
         t0 = time.monotonic()
         # Elimination must not shrink the context, and must not cost a facet
@@ -342,24 +453,34 @@ def retrieve_multi(
         # `excluded`, so it terminates; in practice it settles in one or two.
         # A caller whose own filter constrains the status field is managing
         # status explicitly — deleting the documents they asked for would undo
-        # their instruction (the documented "historical facet in REVOGADO"
+        # their instruction (the documented "historical facet in superseded"
         # pattern is exactly that).
         absolute_status = not any(
             _filter_mentions(f, status_field) for f in per_query_filters
         )
+        _current_set, _superseded_set = resolve_status_vocabulary(
+            status_vocabulary, current_statuses, superseded_statuses
+        )
         excluded: set = set(missing)
         by_group: dict[str, dict] = {}
+        # Accumulated across rounds: resolution refills the window, so a
+        # status seen only in round 1 would vanish from the report if the
+        # last round's view were the one kept.
+        seen_unrecognized: set = set()
         for _ in range(_MAX_RESOLUTION_ROUNDS):
-            chunks, conflicts, dropped_chunks = _resolve_versions(
+            chunks, conflicts, dropped_chunks, unrecognized = _resolve_versions(
                 chunks, status_field=status_field,
                 effective_date_field=effective_date_field,
                 version_field=version_field,
                 version_group_field=version_group_field,
+                current_statuses=_current_set,
+                superseded_statuses=_superseded_set,
                 absolute_status=absolute_status,
             )
             # Conflicts are recomputed from the surviving set each round, so
             # they are merged: without this, a version eliminated in round 1
             # vanishes from the report the moment round 2 recomputes.
+            seen_unrecognized |= set(unrecognized)
             for conflict in conflicts:
                 _merge_conflict(by_group, conflict)
             eliminated.extend(dropped_chunks)
@@ -372,10 +493,15 @@ def retrieve_multi(
                 break
             chunks = refilled
         conflicts = list(by_group.values())
+        unrecognized_statuses = sorted(seen_unrecognized)
 
         stage_ms["resolve_versions"] = (time.monotonic() - t0) * 1000
         if trace_data is not None:
             trace_data["version_conflicts"] = conflicts
+            trace_data["status_vocabulary"] = {
+                "name": status_vocabulary or DEFAULT_STATUS_VOCABULARY,
+                "unrecognized": unrecognized_statuses,
+            }
 
     if trace_data is not None:
         trace_data["fusion"] = {
@@ -515,6 +641,7 @@ def retrieve_multi(
         truncated=base.truncated,
         subqueries=queries,
         conflicts=conflicts,
+        unrecognized_statuses=unrecognized_statuses,
     )
 
 
@@ -574,7 +701,9 @@ def _resolve_versions(
     chunks: Sequence[RetrievedChunk], *, status_field: str,
     effective_date_field: str, version_field: str, version_group_field: str,
     absolute_status: bool = True,
-) -> tuple[list[RetrievedChunk], list[dict], list[dict]]:
+    current_statuses: frozenset[str] = frozenset(),
+    superseded_statuses: frozenset[str] = frozenset(),
+) -> tuple[list[RetrievedChunk], list[dict], list[dict], list[str]]:
     """Keep the documents in force. Pure: same chunk set, same outcome.
 
     Returns (surviving chunks, conflicts, eliminations). Two rules, both
@@ -593,11 +722,24 @@ def _resolve_versions(
        indistinguishable *by metadata*: they all stay, and the conflict is
        reported unresolved rather than settled by sorting on document id.
     """
+    def rank(status):
+        return _status_rank(status, current_statuses, superseded_statuses)
+
+    # Statuses the vocabulary does not describe. Reported rather than ignored:
+    # the caller asked for status precedence and, for these documents, got
+    # none. Silently returning "no conflicts" would look like agreement.
+    unrecognized = sorted({
+        str(chunk.metadata.get(status_field))
+        for chunk in chunks
+        if chunk.metadata.get(status_field) is not None
+        and rank(chunk.metadata.get(status_field)) == 1
+    })
+
     losers: dict[str, str] = {}
     if absolute_status:
         for chunk in chunks:
             status = chunk.metadata.get(status_field)
-            if _status_rank(status) == 2:
+            if rank(status) == 2:
                 losers[chunk.document_id] = (
                     f"{status_field}={status!r} declares the document superseded"
                 )
@@ -634,7 +776,7 @@ def _resolve_versions(
             except (TypeError, ValueError):
                 version_num = float("-inf")
             return (
-                _status_rank(e["status"]),          # active first
+                rank(e["status"]),                 # current first
                 -(_iso_key(e["effective_date"])),   # latest date first
                 -version_num,                       # highest version first
             )
@@ -646,7 +788,7 @@ def _resolve_versions(
         winner = ranked[0]
         dropped = []
         for e in ranked[len(tied):]:
-            reason = _precedence_reason(winner, e, status_field)
+            reason = _precedence_reason(winner, e, status_field, rank)
             losers[e["document_id"]] = reason
             dropped.append({"document_id": e["document_id"],
                             "status": e["status"], "reason": reason})
@@ -664,7 +806,7 @@ def _resolve_versions(
         })
 
     if not losers:
-        return list(chunks), conflicts, []
+        return list(chunks), conflicts, [], unrecognized
     surviving, eliminated = [], []
     for chunk in chunks:
         reason = losers.get(chunk.document_id)
@@ -676,11 +818,12 @@ def _resolve_versions(
                 "document_id": chunk.document_id,
                 "reason": f"version resolution: {reason}",
             })
-    return surviving, conflicts, eliminated
+    return surviving, conflicts, eliminated, unrecognized
 
 
-def _precedence_reason(winner: dict, loser: dict, status_field: str) -> str:
-    if _status_rank(loser["status"]) > _status_rank(winner["status"]):
+def _precedence_reason(winner: dict, loser: dict, status_field: str,
+                       rank: Callable[[Optional[str]], int]) -> str:
+    if rank(loser["status"]) > rank(winner["status"]):
         return (f"{status_field}={loser['status']!r} superseded by "
                 f"{status_field}={winner['status']!r} ({winner['document_id']})")
     if _iso_key(loser["effective_date"]) < _iso_key(winner["effective_date"]):

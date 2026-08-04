@@ -18,11 +18,11 @@ def kb(tmp_path):
     base.add([
         {"id": "refund", "text":
          "Refund requests must be filed within 30 days of purchase.",
-         "metadata": {"status": "VIGENTE", "doc_group": "refund",
+         "metadata": {"status": "current", "doc_group": "refund",
                       "effective_date": "2024-01-01", "version": 2}},
         {"id": "refund_old", "text":
          "Refund requests must be filed within 90 days of purchase.",
-         "metadata": {"status": "REVOGADO", "doc_group": "refund",
+         "metadata": {"status": "superseded", "doc_group": "refund",
                       "effective_date": "2019-01-01", "version": 1}},
         {"id": "shipping", "text":
          "Orders ship within five business days nationwide."},
@@ -570,7 +570,7 @@ class TestEvidenceMetadata:
         kb.ask("refund deadline", llm=lambda p: "30 days [1].",
                verify=capture, k=3)
         meta = seen["p"]["claims"][0]["evidence"][0]["metadata"]
-        assert meta["status"] == "VIGENTE"
+        assert meta["status"] == "current"
         assert meta["doc_group"] == "refund"
         assert meta["version"] == 2
 
@@ -1272,7 +1272,7 @@ class TestSemanticHardening:
         def judge(payload):
             seen["evidence"] = payload["claims"][0]["evidence"]
             status = seen["evidence"][0]["metadata"].get("status")
-            if status != "REVOGADO":
+            if status != "superseded":
                 return [{"verdict": "unsupported",
                          "rationale": f"cited source is {status}, not a "
                                       "historical record of the old rule"}]
@@ -1282,9 +1282,9 @@ class TestSemanticHardening:
             "what was the old refund deadline?",
             llm=lambda p: "The deadline used to be 90 days [1].",
             verify=judge, verification_mode="repair",
-            filters={"status": "VIGENTE"}, k=3,
+            filters={"status": "current"}, k=3,
         )
-        assert seen["evidence"][0]["metadata"]["status"] == "VIGENTE"
+        assert seen["evidence"][0]["metadata"]["status"] == "current"
         assert seen["evidence"][0]["metadata"]["version"] == 2
         assert answer.verification.ok is False
         assert answer.verification.claims[0].verdict == "unsupported"

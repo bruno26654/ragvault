@@ -27,28 +27,28 @@ CORPUS = [
     {"id": "refund-2024", "text":
      "Refund requests must be filed within 30 days of purchase. Approved "
      "refunds are returned to the original payment method.",
-     "metadata": {"status": "VIGENTE", "doc_group": "refund",
+     "metadata": {"status": "current", "doc_group": "refund",
                   "effective_date": "2024-01-01", "version": 2,
                   "doc_type": "policy"}},
     {"id": "refund-2019", "text":
      "Refund requests must be filed within 90 days of purchase. Approved "
      "refunds are issued as store credit.",
-     "metadata": {"status": "REVOGADO", "doc_group": "refund",
+     "metadata": {"status": "superseded", "doc_group": "refund",
                   "effective_date": "2019-01-01", "version": 1,
                   "doc_type": "policy"}},
     # Evidence for the second facet of the question.
     {"id": "processing-time", "text":
      "Approved reimbursements are processed within five business days and "
      "appear on the statement in the next billing cycle.",
-     "metadata": {"status": "VIGENTE", "doc_type": "policy"}},
+     "metadata": {"status": "current", "doc_type": "policy"}},
     # Semantically similar distractors.
     {"id": "tax-refunds", "text":
      "Government tax refunds follow a separate federal schedule and are not "
      "handled by our support team.",
-     "metadata": {"status": "VIGENTE", "doc_type": "faq"}},
+     "metadata": {"status": "current", "doc_type": "faq"}},
     {"id": "gift-cards", "text":
      "Gift cards are non-refundable and cannot be cancelled once issued.",
-     "metadata": {"status": "VIGENTE", "doc_type": "faq"}},
+     "metadata": {"status": "current", "doc_type": "faq"}},
 ]
 
 QUESTION = "How long do I have to request a refund, and how long until I get the money?"
@@ -251,7 +251,7 @@ def main() -> None:
                 decompose=decompose,
                 max_subqueries=6,
                 fusion="weighted_rrf",
-                filters={"status": "VIGENTE"},   # revoked docs never searched
+                filters={"status": "current"},   # revoked docs never searched
                 resolve_versions=True,           # precedence among versions
                 citations=True,
                 verify=verify,                   # post-generation validation

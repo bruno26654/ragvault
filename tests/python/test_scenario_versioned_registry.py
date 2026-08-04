@@ -43,36 +43,36 @@ CORE_DOCS = [
      "calendar days from the notice of eligibility. Late registrations are "
      "rejected without review.",
      {"entity": "ALPHA", "topic": "registration", "doc_group": "alpha-reg",
-      "status": "VIGENTE", "effective_date": "2025-01-01", "version": 3}),
+      "status": "current", "effective_date": "2025-01-01", "version": 3}),
     ("alpha-reg-v2",
      "Program ALPHA registration. The registration deadline for ALPHA is 60 "
      "calendar days from the notice of eligibility.",
      {"entity": "ALPHA", "topic": "registration", "doc_group": "alpha-reg",
-      "status": "REVOGADO", "effective_date": "2023-01-01", "version": 2}),
+      "status": "superseded", "effective_date": "2023-01-01", "version": 2}),
     ("alpha-reg-v1",
      "Program ALPHA registration. The registration deadline for ALPHA is 90 "
      "calendar days from the notice of eligibility.",
      {"entity": "ALPHA", "topic": "registration", "doc_group": "alpha-reg",
-      "status": "REVOGADO", "effective_date": "2021-01-01", "version": 1}),
+      "status": "superseded", "effective_date": "2021-01-01", "version": 1}),
     # Redundant restatement of the current ALPHA rule under another id.
     ("alpha-reg-handbook",
      "Program ALPHA registration. The registration deadline for ALPHA is 45 "
      "calendar days from the notice of eligibility. See the handbook for "
      "worked examples.",
      {"entity": "ALPHA", "topic": "registration", "doc_group": "alpha-reg",
-      "status": "VIGENTE", "effective_date": "2025-01-01", "version": 3}),
+      "status": "current", "effective_date": "2025-01-01", "version": 3}),
 
     # BETA appeal: current rule plus a revoked one with a different figure.
     ("beta-appeal-v2",
      "Program BETA appeals. An appeal against a BETA decision must be filed "
      "within 15 business days of notification, addressed to the review board.",
      {"entity": "BETA", "topic": "appeal", "doc_group": "beta-appeal",
-      "status": "VIGENTE", "effective_date": "2024-06-01", "version": 2}),
+      "status": "current", "effective_date": "2024-06-01", "version": 2}),
     ("beta-appeal-v1",
      "Program BETA appeals. An appeal against a BETA decision must be filed "
      "within 30 business days of notification.",
      {"entity": "BETA", "topic": "appeal", "doc_group": "beta-appeal",
-      "status": "REVOGADO", "effective_date": "2020-06-01", "version": 1}),
+      "status": "superseded", "effective_date": "2020-06-01", "version": 1}),
 
     # GAMMA fee: stated. GAMMA appeal procedure: named but never stated, so the
     # only correct answer about it is that the sources do not determine it.
@@ -80,12 +80,12 @@ CORE_DOCS = [
      "Program GAMMA charges. The GAMMA application fee is 250 credits, "
      "payable at submission.",
      {"entity": "GAMMA", "topic": "fee", "doc_group": "gamma-fee",
-      "status": "VIGENTE", "effective_date": "2024-02-01", "version": 1}),
+      "status": "current", "effective_date": "2024-02-01", "version": 1}),
     ("gamma-appeal-stub",
      "Program GAMMA appeals. The GAMMA appeal procedure is described in "
      "Annex IV of the operating manual.",
      {"entity": "GAMMA", "topic": "appeal", "doc_group": "gamma-appeal",
-      "status": "VIGENTE", "effective_date": "2024-02-01", "version": 1}),
+      "status": "current", "effective_date": "2024-02-01", "version": 1}),
 
     # DELTA eligibility: two documents, equally current, equally versioned,
     # same effective date — and they disagree. Metadata cannot decide.
@@ -93,12 +93,12 @@ CORE_DOCS = [
      "Program DELTA eligibility. An applicant qualifies for DELTA after 24 "
      "months of continuous participation.",
      {"entity": "DELTA", "topic": "eligibility", "doc_group": "delta-elig",
-      "status": "VIGENTE", "effective_date": "2025-03-01", "version": 2}),
+      "status": "current", "effective_date": "2025-03-01", "version": 2}),
     ("delta-elig-b",
      "Program DELTA eligibility. An applicant qualifies for DELTA after 36 "
      "months of continuous participation.",
      {"entity": "DELTA", "topic": "eligibility", "doc_group": "delta-elig",
-      "status": "VIGENTE", "effective_date": "2025-03-01", "version": 2}),
+      "status": "current", "effective_date": "2025-03-01", "version": 2}),
 ]
 
 #: Documents that mention the entities in contexts that answer nothing —
@@ -107,23 +107,23 @@ DISTRACTORS = [
     ("alpha-newsletter",
      "Program ALPHA newsletter. The ALPHA community call happens every 45 "
      "days; registration for the call is open to all members.",
-     {"entity": "ALPHA", "topic": "newsletter", "status": "VIGENTE"}),
+     {"entity": "ALPHA", "topic": "newsletter", "status": "current"}),
     ("beta-travel",
      "Program BETA travel policy. BETA reimbursement requests are filed "
      "within 15 business days of travel, using the expenses portal.",
-     {"entity": "BETA", "topic": "travel", "status": "VIGENTE"}),
+     {"entity": "BETA", "topic": "travel", "status": "current"}),
     ("gamma-fee-history",
      "Program GAMMA charges. Historical note: the GAMMA fee was reviewed in "
      "2019 and again in 2022 by the finance committee.",
-     {"entity": "GAMMA", "topic": "fee-history", "status": "VIGENTE"}),
+     {"entity": "GAMMA", "topic": "fee-history", "status": "current"}),
     ("delta-glossary",
      "Program DELTA glossary. 'Continuous participation' means participation "
      "without a gap longer than 60 days.",
-     {"entity": "DELTA", "topic": "glossary", "status": "VIGENTE"}),
+     {"entity": "DELTA", "topic": "glossary", "status": "current"}),
     ("cross-summary",
      "Programs overview. ALPHA, BETA, GAMMA and DELTA are administered by the "
      "same secretariat and share a single appeals calendar.",
-     {"entity": "ALL", "topic": "overview", "status": "VIGENTE"}),
+     {"entity": "ALL", "topic": "overview", "status": "current"}),
 ]
 
 TOPIC_WORDS = {
@@ -148,7 +148,7 @@ def _noise(count: int) -> list[dict]:
                      f"circular applies to all secretariat procedures and "
                      f"supersedes circular {max(0, i - 40)}."),
             "metadata": {"entity": "SECRETARIAT", "topic": subject,
-                         "status": "VIGENTE", "effective_date": "2024-01-01"},
+                         "status": "current", "effective_date": "2024-01-01"},
         })
     return out
 
@@ -346,7 +346,7 @@ class TestRevocationIsAbsolute:
         result = registry.retrieve_multi(
             "what did the BETA appeal rule use to say?",
             subqueries=["BETA appeal deadline"],
-            subquery_filters=[{"status": "REVOGADO"}, {"status": "REVOGADO"}],
+            subquery_filters=[{"status": "superseded"}, {"status": "superseded"}],
             resolve_versions=True, k=8,
         )
         assert "beta-appeal-v1" in result.documents

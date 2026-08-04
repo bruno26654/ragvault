@@ -102,8 +102,8 @@ answer = kb.ask_multi(
     "Qual o prazo para pedir reembolso e em quanto tempo o dinheiro volta?",
     llm=answer_llm,              # seu provedor (callable)
     decompose=query_decomposer,  # opcional; falha → cai para consulta única
-    filters={"status": "VIGENTE"},
-    resolve_versions=True,       # revogados nunca são citados
+    filters={"status": "current"},
+    resolve_versions=True,       # substituídos nunca são citados
     trace=True,
 )
 

@@ -56,7 +56,7 @@ answer = kb.ask_multi(
     max_subqueries=6,
     fusion="weighted_rrf",
     rerank=reranker,
-    filters={"status": "VIGENTE"},
+    filters={"status": "current"},
     resolve_versions=True,
     citations=True,
     explain=True,
@@ -88,26 +88,64 @@ resultados de cada subconsulta em um tier prioritário. Medido em
 | `filters={...}` | filtro **obrigatório**, aplicado como prefilter nativo antes da busca |
 | `boosts=[{"filter": {...}, "weight": 2.0}]` | boost multiplicativo **depois** da fusão |
 | `resolve_versions=True` | precedência por metadados dentro de `doc_group` |
-| `subquery_filters=[...]` | filtro **por consulta** (pergunta original primeiro); `None` mantém o global. Uma entrada **substitui** o filtro global daquela consulta — é o que permite "faceta decisória só em `VIGENTE`, faceta histórica só em `REVOGADO`", impossível com um filtro único |
+| `status_vocabulary="mlflow"` | qual vocabulário de status usar (`generic` padrão, `mlflow`, `legal-ptbr`) |
+| `current_statuses=[...]` / `superseded_statuses=[...]` | seu próprio vocabulário; substitui a classe inteira |
+| `subquery_filters=[...]` | filtro **por consulta** (pergunta original primeiro); `None` mantém o global. Uma entrada **substitui** o filtro global daquela consulta — é o que permite "faceta decisória só em `current`, faceta histórica só em `superseded`", impossível com um filtro único |
 | `rerank=fn` | rerank global; **nunca destrói recall** (descartados voltam) e falha tolerada |
 
 **Precedência de versões** (`resolve_versions=True`): dentro de cada
-`doc_group`, ordena por status (`VIGENTE`/`active` > desconhecido >
-`REVOGADO`/`revoked`), depois `effective_date` mais recente, depois `version`
+`doc_group`, ordena por status (classe `current` > não reconhecido >
+classe `superseded`), depois `effective_date` mais recente, depois `version`
 maior. Os perdedores **nunca** são silenciosos: aparecem em
 `result.conflicts`, em `plan["eliminated"]` (com `explain=True`) e no trace, e
 `ask_multi` os declara no prompt.
 
+### Vocabulário de status (`status_vocabulary=`)
+
+O vocabulário é **dado, não constante**. Um conjunto de palavras fixo só
+descreve quem o escreveu: um corpus rotulado ao estilo MLflow
+(`Production`/`Archived`) ou de CMS (`published`/`deprecated`) não casava com
+nenhuma das classes, então os dois lados empatavam e `resolve_versions=True`
+**não fazia nada, em silêncio** — o pior modo de falha possível, porque o
+chamador pediu precedência e não recebeu nenhuma, sem sinal.
+
+| Vocabulário | Classe `current` | Classe `superseded` |
+|---|---|---|
+| `generic` (padrão) | `current`, `active`, `published`, `live`, `valid`, `in_force`, `effective`, `latest` | `superseded`, `obsolete`, `deprecated`, `expired`, `archived`, `retired`, `inactive`, `withdrawn`, `revoked` |
+| `mlflow` | `production` | `archived` (`staging` fica sem classe de propósito) |
+| `legal-ptbr` | `vigente`, `em vigor` | `revogado`, `caduco` |
+
+```python
+kb.retrieve_multi(q, resolve_versions=True, status_vocabulary="mlflow")
+
+# ou o seu próprio, que substitui a classe inteira:
+kb.retrieve_multi(q, resolve_versions=True,
+                  current_statuses=["champion"],
+                  superseded_statuses=["challenger"])
+```
+
+O padrão `generic` é o vocabulário de *slowly changing dimension* / controle de
+documentos (`is_current`, superseded/obsolete) — o que ferramental de dados e
+ML converge a usar. `vigente`/`revogado` continuam reconhecidos como **alias**
+para não quebrar corpora escritos contra o padrão anterior, mas não fazem parte
+do `generic`: use `status_vocabulary="legal-ptbr"` para escolhê-los de propósito.
+
+**Status não reconhecido fica *entre* as duas classes**, nunca chutado para uma
+delas — o chamador rotulou o documento com algo que este vocabulário não
+descreve, e escolher um lado por ele seria inventar um fato sobre o corpus. E
+aparece em `result.unrecognized_statuses` e no trace: se você pediu precedência
+por status e ela não se aplicou a nenhum documento, isso é dito, não presumido.
+
 Três regras que só valem juntas:
 
-- **Revogação é absoluta.** Documento cujo `status` está na classe revogada
-  está fora de vigor por declaração própria — independentemente de o sucessor
-  ter sido recuperado ou não. Julgada só de forma *relativa*, uma regra
-  revogada que superasse o próprio sucessor entrava no contexto parecendo
-  vigente, sem nada reportado. **Exceção:** se o filtro do chamador menciona o
-  campo de status, ele está gerenciando status explicitamente e a regra
-  absoluta não se aplica — é o que mantém "faceta histórica em `REVOGADO`"
-  funcionando junto de `resolve_versions=True`.
+- **Status de substituído é absoluto.** Documento cujo `status` está na classe
+  `superseded` está fora por declaração própria — independentemente de o
+  sucessor ter sido recuperado ou não. Julgado só de forma *relativa*, um
+  documento substituído que superasse o próprio sucessor entrava no contexto
+  parecendo atual, sem nada reportado. **Exceção:** se o filtro do chamador
+  menciona o campo de status, ele está gerenciando status explicitamente e a
+  regra absoluta não se aplica — é o que mantém "faceta histórica em
+  `superseded`" funcionando junto de `resolve_versions=True`.
 - **Empate não é decisão.** Documentos que empatam no topo por (status, data,
   versão) são indistinguíveis *pelos metadados*: todos permanecem, e o
   conflito sai com `resolved: False` e `tied: [ids]`. Antes o desempate era
@@ -116,8 +154,8 @@ Três regras que só valem juntas:
   modelo: grupo não resolvido → relatar a divergência, não escolher um lado.
 - **Eliminar não encolhe o contexto.** Cada chunk removido libera uma vaga que
   o próximo candidato ocupa, e a **garantia de cobertura é reservada de novo**
-  sobre o que continua elegível. Sem isso, uma versão revogada que superasse a
-  vigente custava as duas: a vaga da faceta era gasta na revogada, e a vigente
+  sobre o que continua elegível. Sem isso, uma versão substituída que superasse
+  a atual custava as duas: a vaga da faceta era gasta na substituída, e a atual
   ficava logo fora da janela que havia sido cortada para a perdedora. Fusão e
   resolução rodam até ponto fixo.
 
@@ -284,7 +322,7 @@ usada (`"heuristic"` ou `"verifier"`).
 **Metadados na evidência**: cada `evidence` traz o `metadata` efetivo do
 documento citado (incluindo `status`, data de vigência e versão), também
 disponível em `Citation.metadata` — sem isso o verificador não consegue
-distinguir uma regra vigente de uma revogada. `Citation.text` traz o texto do
+distinguir um documento atual de um substituído. `Citation.text` traz o texto do
 bloco, exatamente como ele aparece sob `[n]` no contexto.
 
 ### Quatro eixos independentes

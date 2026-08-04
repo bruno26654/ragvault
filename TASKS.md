@@ -159,7 +159,7 @@ a citação que **existe mas não sustenta** a afirmação.
 | Vereditos `supported/unsupported/contradicted/uncited/question_fact/inference` | validated | `TestWrongButExistingCitation`, `TestQuestionFactVsDocumentEvidence` |
 | Distinção fato-da-pergunta × evidência documental × inferência | validated | `test_question_fact_is_distinguished_from_evidence`, `test_inference_is_its_own_verdict` |
 | Modos `report` / `annotate` / `repair` / `strict` | validated | um teste por modo; `repair` **remove** o que não se sustenta |
-| Conflito vigente × revogado detectado na resposta | validated | `TestVersionConflict` (afirmação com regra revogada é reparada) |
+| Conflito atual × substituído detectado na resposta | validated | `TestVersionConflict` (afirmação com documento substituído é reparada) |
 | Afirmação sem citação | validated | `TestUncitedClaims` (`strict` remove, `repair` mantém) |
 | Falha do verificador preserva a resposta válida | validated | `TestVerifierFailure` (exceção, `None`, contagem errada de vereditos → resposta intacta + erro registrado) |
 | Veredito/modo inválido são erro acionável (não "ok" silencioso) | validated | `test_unknown_verdict_is_an_actionable_error`, `test_unknown_mode_is_rejected` |
@@ -184,11 +184,12 @@ a citação que **existe mas não sustenta** a afirmação.
 | `quote` conferido contra a fonte citada; `require_quotes` | validated | `TestQuotedEvidence` (citação fabricada → `unsupported` + `structural_issues`; reformatação/caixa não reprovam; opcional por padrão porque suporte nem sempre é trecho contíguo) |
 | Marcador de citação depois do terminador fica com a claim que ele fonteia | validated | `TestTrailingCitationMarkers` — bug real: `"30 dias. [1]"` deixava a claim `uncited` (apagada por `strict`), creditava a próxima e criava uma "claim" que era só `[2]`; sem espaço não dividia |
 | `facets=` explícito em `ask()`/`ask_multi()` (obrigação ≠ subconsulta de busca) | validated | `TestExplicitFacets` — subconsulta de recuperação virava obrigação artificial; facetas declaradas valem para o checklist do prompt e para o julgamento |
-| Filtros por subconsulta (`subquery_filters`) | validated | `TestPerSubqueryFilters` (faceta decisória em `VIGENTE` + histórica em `REVOGADO` na mesma chamada) |
-| Cenário de alta exigência: base grande, ruidosa e versionada | validated | `test_scenario_versioned_registry.py` — ~900 docs de ruído + regras vigentes/revogadas/redundantes/incompletas/conflitantes em 4 entidades; achou os três bugs de resolução de versão abaixo |
-| Revogação é absoluta (não só relativa ao sucessor recuperado) | validated | `TestRevocationIsAbsolute` — bug real: com o sucessor fora do pool, a regra revogada entrava no contexto parecendo vigente. Filtro explícito de status do chamador tem precedência |
+| Vocabulário de status configurável (`status_vocabulary`, `current_statuses`, `superseded_statuses`) | validated | `TestStatusVocabulary`. Bug real: o vocabulário era fixo e continha termos jurídicos pt-BR, então um corpus MLflow (`Production`/`Archived`) ou CMS (`published`/`deprecated`) não casava com nenhuma classe e `resolve_versions=True` **não fazia nada, em silêncio**. Padrão agora é `generic` (SCD/controle de documentos); status não reconhecido é reportado em `result.unrecognized_statuses` |
+| Filtros por subconsulta (`subquery_filters`) | validated | `TestPerSubqueryFilters` (faceta decisória em `current` + histórica em `superseded` na mesma chamada) |
+| Cenário de alta exigência: base grande, ruidosa e versionada | validated | `test_scenario_versioned_registry.py` — ~900 docs de ruído + regras atuais/substituídas/redundantes/incompletas/conflitantes em 4 entidades; achou os três bugs de resolução de versão abaixo |
+| Status de substituído é absoluto (não só relativo ao sucessor recuperado) | validated | `TestRevocationIsAbsolute` — bug real: com o sucessor fora do pool, o documento substituído entrava no contexto parecendo atual. Filtro explícito de status do chamador tem precedência |
 | Empate de precedência não é decidido por ordem alfabética | validated | `TestUndecidableConflict` — bug real: `document_id` desempatava e a evidência do perdedor sumia; agora ambos ficam, `resolved=False`/`tied`, e o prompt manda relatar a divergência |
-| Eliminação não encolhe o contexto nem gasta a vaga de cobertura | validated | `TestRevocationIsAbsolute::test_the_replacement_takes_the_freed_slot` — bug real: a vaga da faceta era gasta na versão revogada e a vigente ficava fora da janela; fusão e resolução rodam até ponto fixo |
+| Eliminação não encolhe o contexto nem gasta a vaga de cobertura | validated | `TestRevocationIsAbsolute::test_the_replacement_takes_the_freed_slot` — bug real: a vaga da faceta era gasta na versão substituída e a atual ficava fora da janela; fusão e resolução rodam até ponto fixo |
 | Sem dependência obrigatória de provedor | validated | verificador é callable; exemplo roda offline, `--groq` opcional |
 
 ## Backlog v1.0 restante (apenas performance/formato — nenhum P0/P1 aberto)

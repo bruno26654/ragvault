@@ -19,28 +19,28 @@ def policy_kb(tmp_path):
         # multi-hop: the answer needs BOTH of these
         {"id": "refund_window", "text":
          "Refund requests must be filed within 30 days of the purchase date.",
-         "metadata": {"status": "VIGENTE", "doc_type": "policy"}},
+         "metadata": {"status": "current", "doc_type": "policy"}},
         {"id": "refund_method", "text":
          "Approved refunds are paid back to the original payment method.",
-         "metadata": {"status": "VIGENTE", "doc_type": "policy"}},
+         "metadata": {"status": "current", "doc_type": "policy"}},
         # current vs revoked versions of the same policy group
         {"id": "cancel_v2", "text":
          "Cancellation grants a full refund when requested before shipment.",
-         "metadata": {"status": "VIGENTE", "doc_group": "cancellation",
+         "metadata": {"status": "current", "doc_group": "cancellation",
                       "effective_date": "2024-06-01", "version": 2,
                       "doc_type": "policy"}},
         {"id": "cancel_v1", "text":
          "Cancellation grants a partial refund when requested before shipment.",
-         "metadata": {"status": "REVOGADO", "doc_group": "cancellation",
+         "metadata": {"status": "superseded", "doc_group": "cancellation",
                       "effective_date": "2019-01-01", "version": 1,
                       "doc_type": "policy"}},
         # semantically similar but irrelevant distractors
         {"id": "distractor_tax", "text":
          "Tax refunds from the government follow a separate federal schedule.",
-         "metadata": {"status": "VIGENTE", "doc_type": "faq"}},
+         "metadata": {"status": "current", "doc_type": "faq"}},
         {"id": "distractor_gift", "text":
          "Gift cards are non-refundable and cannot be cancelled after issue.",
-         "metadata": {"status": "VIGENTE", "doc_type": "faq"}},
+         "metadata": {"status": "current", "doc_type": "faq"}},
     ])
     yield kb
     kb.close()
@@ -141,7 +141,7 @@ class TestVersionPrecedence:
         conflict = result.conflicts[0]
         assert conflict["kept"]["document_id"] == "cancel_v2"
         assert conflict["dropped"][0]["document_id"] == "cancel_v1"
-        assert "REVOGADO" in conflict["dropped"][0]["reason"]
+        assert "superseded" in conflict["dropped"][0]["reason"]
 
     def test_without_resolve_versions_both_can_appear(self, policy_kb):
         result = policy_kb.retrieve_multi(
@@ -151,7 +151,7 @@ class TestVersionPrecedence:
 
     def test_mandatory_filter_excludes_revoked_before_search(self, policy_kb):
         result = policy_kb.retrieve_multi(
-            "cancellation refund", filters={"status": "VIGENTE"}, k=6
+            "cancellation refund", filters={"status": "current"}, k=6
         )
         assert "cancel_v1" not in result.documents
         assert result.plan["filtered"] is True
@@ -160,10 +160,10 @@ class TestVersionPrecedence:
         with ragvault.open(tmp_path / "kb") as kb:
             kb.add([
                 {"id": "new", "text": "Holiday policy allows ten extra days.",
-                 "metadata": {"status": "VIGENTE", "doc_group": "holiday",
+                 "metadata": {"status": "current", "doc_group": "holiday",
                               "effective_date": "2025-01-01", "version": 3}},
                 {"id": "old", "text": "Holiday policy allows five extra days.",
-                 "metadata": {"status": "VIGENTE", "doc_group": "holiday",
+                 "metadata": {"status": "current", "doc_group": "holiday",
                               "effective_date": "2021-01-01", "version": 1}},
             ])
             result = kb.retrieve_multi("holiday extra days", resolve_versions=True, k=5)
@@ -191,9 +191,9 @@ class TestPerSubqueryFilters:
             "what does cancellation say, and what did it used to say?",
             subqueries=["current cancellation rule", "previous cancellation rule"],
             subquery_filters=[
-                {"status": "VIGENTE"},   # pergunta original: só vigente
-                {"status": "VIGENTE"},   # faceta decisória
-                {"status": "REVOGADO"},  # faceta histórica
+                {"status": "current"},   # pergunta original: só vigente
+                {"status": "current"},   # faceta decisória
+                {"status": "superseded"},  # faceta histórica
             ],
             k=8,
         )
@@ -204,14 +204,14 @@ class TestPerSubqueryFilters:
     def test_global_filter_alone_cannot_reach_revoked(self, policy_kb):
         result = policy_kb.retrieve_multi(
             "cancellation rules", subqueries=["previous cancellation rule"],
-            filters={"status": "VIGENTE"}, k=8,
+            filters={"status": "current"}, k=8,
         )
         assert "cancel_v1" not in result.documents
 
     def test_none_entry_keeps_the_global_filter(self, policy_kb):
         result = policy_kb.retrieve_multi(
             "cancellation rules", subqueries=["previous cancellation rule"],
-            filters={"status": "VIGENTE"},
+            filters={"status": "current"},
             subquery_filters=[None, None], k=8,
         )
         assert "cancel_v1" not in result.documents
@@ -221,19 +221,19 @@ class TestPerSubqueryFilters:
         with pytest.raises(ragvault.ConfigurationError) as err:
             policy_kb.retrieve_multi(
                 "refund", subqueries=["a", "b"],
-                subquery_filters=[{"status": "VIGENTE"}], k=3,
+                subquery_filters=[{"status": "current"}], k=3,
             )
         assert "3 queries" in str(err.value)
 
     def test_per_query_filters_are_traced(self, policy_kb):
         result = policy_kb.retrieve_multi(
             "cancellation", subqueries=["previous rule"],
-            subquery_filters=[None, {"status": "REVOGADO"}],
+            subquery_filters=[None, {"status": "superseded"}],
             trace=True, k=6,
         )
         traced = result.trace["subquery_filters"]
         assert traced[1]["query"] == "previous rule"
-        assert traced[1]["filter"] == {"status": "REVOGADO"}
+        assert traced[1]["filter"] == {"status": "superseded"}
         assert result.plan["per_query_filters"] is True
 
     def test_invalid_filter_is_rejected(self, policy_kb):
@@ -572,3 +572,120 @@ class TestCpuPerformance:
 
         # 6 queries batched must cost well under 6x a single query
         assert multi < single * 6, f"single={single*1000:.2f}ms multi={multi*1000:.2f}ms"
+
+
+class TestStatusVocabulary:
+    """Version resolution used to know exactly one domain's words. A corpus
+    labelled any other way matched neither class, so both sides ranked equal
+    and `resolve_versions=True` silently did nothing."""
+
+    @pytest.fixture
+    def registry(self, tmp_path):
+        kb = ragvault.open(tmp_path / "kb")
+        kb.add([
+            {"id": "v2", "text": "The churn model uses 40 features nightly.",
+             "metadata": {"doc_group": "churn", "status": "champion",
+                          "version": 2}},
+            {"id": "v1", "text": "The churn model uses 12 features weekly.",
+             "metadata": {"doc_group": "churn", "status": "challenger",
+                          "version": 1}},
+        ])
+        yield kb
+        kb.close()
+
+    def test_unknown_vocabulary_is_reported_not_ignored(self, registry):
+        """The caller asked for status precedence and got none for these
+        documents. Silence would look like agreement."""
+        result = registry.retrieve_multi(
+            "churn model features", resolve_versions=True, k=4)
+        assert result.unrecognized_statuses == ["challenger", "champion"]
+
+    def test_a_custom_vocabulary_resolves(self, registry):
+        result = registry.retrieve_multi(
+            "churn model features", resolve_versions=True, k=4,
+            current_statuses=["champion"], superseded_statuses=["challenger"])
+        assert {c.document_id for c in result.chunks} == {"v2"}
+        assert result.unrecognized_statuses == []
+
+    def test_named_vocabularies_are_selectable(self, tmp_path):
+        kb = ragvault.open(tmp_path / "mlflow")
+        kb.add([
+            {"id": "prod", "text": "Ranker serves all traffic.",
+             "metadata": {"doc_group": "r", "status": "Production"}},
+            {"id": "old", "text": "Ranker previously served all traffic.",
+             "metadata": {"doc_group": "r", "status": "Archived"}},
+        ])
+        try:
+            result = kb.retrieve_multi("ranker traffic", resolve_versions=True,
+                                       k=4, status_vocabulary="mlflow")
+            assert {c.document_id for c in result.chunks} == {"prod"}
+            assert result.unrecognized_statuses == []
+        finally:
+            kb.close()
+
+    def test_the_default_vocabulary_is_domain_neutral(self, tmp_path):
+        kb = ragvault.open(tmp_path / "generic")
+        kb.add([
+            {"id": "now", "text": "Retention policy keeps records 90 days.",
+             "metadata": {"doc_group": "ret", "status": "current"}},
+            {"id": "was", "text": "Retention policy kept records 30 days.",
+             "metadata": {"doc_group": "ret", "status": "superseded"}},
+        ])
+        try:
+            result = kb.retrieve_multi("retention policy", resolve_versions=True,
+                                       k=4)
+            assert {c.document_id for c in result.chunks} == {"now"}
+            assert result.unrecognized_statuses == []
+        finally:
+            kb.close()
+
+    def test_legacy_domain_terms_still_resolve(self, tmp_path):
+        """The vocabulary that used to be hardcoded stays recognized: dropping
+        it would break every corpus written against the old default."""
+        kb = ragvault.open(tmp_path / "legacy")
+        kb.add([
+            {"id": "now", "text": "O prazo de recurso e de 15 dias.",
+             "metadata": {"doc_group": "p", "status": "current"}},
+            {"id": "was", "text": "O prazo de recurso e de 30 dias.",
+             "metadata": {"doc_group": "p", "status": "superseded"}},
+        ])
+        try:
+            result = kb.retrieve_multi("prazo de recurso", resolve_versions=True,
+                                       k=4)
+            assert {c.document_id for c in result.chunks} == {"now"}
+            assert result.unrecognized_statuses == []
+        finally:
+            kb.close()
+
+    def test_an_unknown_vocabulary_name_is_refused(self, registry):
+        from ragvault.errors import ConfigurationError
+
+        with pytest.raises(ConfigurationError, match="unknown status_vocabulary"):
+            registry.retrieve_multi("churn", resolve_versions=True,
+                                    status_vocabulary="nonsense", k=2)
+
+    def test_a_status_cannot_be_in_both_classes(self, registry):
+        from ragvault.errors import ConfigurationError
+
+        with pytest.raises(ConfigurationError, match="cannot be both"):
+            registry.retrieve_multi(
+                "churn", resolve_versions=True, k=2,
+                current_statuses=["live"], superseded_statuses=["LIVE"])
+
+    def test_an_unrecognized_status_ranks_between_the_two(self):
+        """Not guessed into either class: the caller labelled the document
+        something this vocabulary does not describe, and picking an end for
+        them would be inventing a fact about their corpus."""
+        from ragvault.multiquery import _status_rank, resolve_status_vocabulary
+
+        current, superseded = resolve_status_vocabulary()
+        assert _status_rank("current", current, superseded) == 0
+        assert _status_rank("champion", current, superseded) == 1
+        assert _status_rank("superseded", current, superseded) == 2
+
+    def test_the_vocabulary_in_use_is_traced(self, registry):
+        result = registry.retrieve_multi(
+            "churn model features", resolve_versions=True, k=4, trace=True)
+        assert result.trace["status_vocabulary"]["name"] == "generic"
+        assert result.trace["status_vocabulary"]["unrecognized"] == [
+            "challenger", "champion"]
