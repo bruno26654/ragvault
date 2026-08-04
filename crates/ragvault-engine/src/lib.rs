@@ -10,3 +10,8 @@ pub mod snapshot;
 pub mod wal;
 
 pub use engine::{EngineConfig, SearchHit, SearchRequest, VaultEngine};
+/// Re-exported so the Python layer shares the *same* tokenizer the BM25
+/// index uses. Two implementations of "what is a word" would drift, and a
+/// drift between how the index tokenizes and how dedup tokenizes is
+/// invisible until it misbehaves.
+pub use ragvault_retrieval::tokenize;

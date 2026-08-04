@@ -335,11 +335,25 @@ fn validate_filter(filter_json: String) -> PyResult<()> {
         .map_err(to_py_err)
 }
 
+/// Tokenize text exactly as the BM25 index does.
+///
+/// Exposed so the Python layer (MMR overlap, near-duplicate dedup) shares one
+/// definition of "what is a word" with the index instead of re-implementing it
+/// with `str.split()` — which treated an entire Chinese or Thai chunk as a
+/// single token, making near-duplicate detection score 0.0 overlap between two
+/// nearly identical chunks.
+#[pyfunction]
+#[pyo3(signature = (text, lowercase = true))]
+fn tokenize(text: String, lowercase: bool) -> Vec<String> {
+    ragvault_engine::tokenize(&text, lowercase)
+}
+
 #[pymodule]
 #[pyo3(name = "_native")]
 fn ragvault_native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyVault>()?;
     m.add_function(wrap_pyfunction!(validate_filter, m)?)?;
+    m.add_function(wrap_pyfunction!(tokenize, m)?)?;
     m.add("VaultError", py.get_type::<VaultError>())?;
     m.add("VaultLockedError", py.get_type::<VaultLockedError>())?;
     m.add("VaultCorruptError", py.get_type::<VaultCorruptError>())?;

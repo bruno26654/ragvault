@@ -522,6 +522,30 @@ impl VaultEngine {
                     }
                 }
             }
+            // A vault written before the tokenizer change holds postings for
+            // terms the current tokenizer can never produce — in unspaced
+            // scripts, one term per whole chunk. Those postings are not wrong
+            // so much as unaddressable, so the index is rebuilt from the text
+            // that is still on disk. Latin corpora tokenize identically before
+            // and after, so the rebuild is a no-op for them beyond its cost.
+            let bm25 = if manifest.format_version < snapshot::FORMAT_VERSION {
+                let mut rebuilt = Bm25Index::new(stored_config.bm25.clone());
+                for (row, slot) in chunks.iter().enumerate() {
+                    match slot {
+                        Some(sc) => rebuilt.add(row as u32, &sc.chunk.text),
+                        // Ids are append-only, so a hole still consumes one.
+                        None => rebuilt.add(row as u32, ""),
+                    }
+                }
+                for (row, slot) in chunks.iter().enumerate() {
+                    if slot.is_none() || arena.is_deleted(row as u32) {
+                        rebuilt.remove(row as u32);
+                    }
+                }
+                rebuilt
+            } else {
+                persisted.bm25
+            };
             let wal = Wal::open(path, stored_config.wal_sync)?;
             let sq8 = if stored_config.quantization == "sq8" {
                 let mut q = Sq8Arena::new(stored_config.dim, stored_config.metric)?;
@@ -548,7 +572,7 @@ impl VaultEngine {
                 sq8,
                 ivf: None,
                 hnsw: persisted.hnsw,
-                bm25: persisted.bm25,
+                bm25,
                 sparse: persisted.sparse,
                 seq: snapshot::base_seq(manifest),
                 wal,
@@ -2647,10 +2671,80 @@ mod tests {
             engine.flush().unwrap();
         }
         let manifest = snapshot::load_manifest(dir.path()).unwrap().unwrap();
-        assert_eq!(manifest.format_version, 2, "flush must write v2");
+        assert_eq!(
+            manifest.format_version,
+            snapshot::FORMAT_VERSION,
+            "flush must write the current format version"
+        );
         let gen_dir = dir.path().join(format!("gen-{}", manifest.generation));
         assert!(gen_dir.join("state.rvseg").exists(), "binary base segment");
         assert!(!gen_dir.join("state.json").exists(), "no legacy json");
+    }
+
+    /// A vault written before the tokenizer change holds BM25 postings whose
+    /// terms the current tokenizer can never produce. Reopening must rebuild
+    /// the index from stored text, including the fiddly parts: holes in the
+    /// row space still consume an id, and deleted rows must stay excluded from
+    /// both results and the length statistics.
+    #[test]
+    fn pre_tokenizer_vault_rebuilds_bm25_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+            engine
+                .upsert_document(
+                    doc("zh", json!({})),
+                    vec![chunk("zh", 0, "退款申请必须在购买后三十天内提交")],
+                    &unit_vec(4, 0),
+                    None,
+                )
+                .unwrap();
+            engine
+                .upsert_document(
+                    doc("gone", json!({})),
+                    vec![chunk("gone", 0, "退款申请将被删除")],
+                    &unit_vec(4, 1),
+                    None,
+                )
+                .unwrap();
+            engine.delete_document("gone").unwrap();
+            engine.flush().unwrap();
+        }
+
+        // Downgrade only the recorded format version: the stored state stays
+        // valid, but the vault now claims to predate the tokenizer change.
+        let path = dir.path().join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest["format_version"] = serde_json::json!(2);
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        let engine = VaultEngine::open(dir.path(), config(4)).unwrap();
+        let response = engine
+            .search(&SearchRequest {
+                vector: None,
+                text: Some("退款".into()),
+                sparse: None,
+                k: 5,
+                mode: "keyword".into(),
+                candidates: None,
+                filter: None,
+                ef_search: None,
+                nprobe: None,
+                weights: None,
+            })
+            .unwrap();
+        let ids: Vec<&str> = response
+            .hits
+            .iter()
+            .map(|h| h.document_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["zh"],
+            "rebuilt index must serve a substring query \
+             and must not resurrect the deleted document"
+        );
     }
 
     #[test]
@@ -2741,7 +2835,11 @@ mod tests {
             engine.compact().unwrap();
         }
         let migrated = snapshot::load_manifest(dir.path()).unwrap().unwrap();
-        assert_eq!(migrated.format_version, 2, "vault is v2");
+        assert_eq!(
+            migrated.format_version,
+            snapshot::FORMAT_VERSION,
+            "vault is migrated to the current format version"
+        );
         assert!(migrated.segments.is_empty(), "compaction collapses deltas");
         let gen_dir = dir.path().join(format!("gen-{}", migrated.generation));
         assert!(gen_dir.join("state.rvseg").exists(), "base migrated to v2");

@@ -25,6 +25,13 @@
 //! manifest whose `format_version` exceeds what this build supports still
 //! fails closed. ADR 0016 tracks the remaining v2 work (multi-segment
 //! deltas, read-safe online compaction).
+//!
+//! `format_version = 3` changes nothing on disk. It marks the BM25
+//! tokenizer change (ADR 0017): text in scripts without word spacing used to
+//! index as one enormous term per chunk, so postings written by an older
+//! build cannot be matched by queries tokenized the new way. Opening a vault
+//! below v3 rebuilds the BM25 index from the stored chunk text — the same
+//! rebuild compaction already performs — and the next flush records v3.
 
 use std::collections::HashMap;
 use std::fs;
@@ -40,7 +47,7 @@ use ragvault_vector::Hnsw;
 use crate::segment::{self, SegmentWriter};
 
 /// Highest manifest format this build writes and can read.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Base state file name for a v2 generation (binary segment).
 const STATE_SEGMENT: &str = "state.rvseg";

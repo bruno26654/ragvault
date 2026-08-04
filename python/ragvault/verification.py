@@ -53,6 +53,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
 
+from .chunking import CASELESS_TERMINATORS
 from .context import Citation
 from .errors import ConfigurationError
 
@@ -140,25 +141,11 @@ _CLAIM_START = r"[A-Z\[]|[-*•+]\s|\d+[.)]\s|(?![a-zà-öø-ÿ])[^\W\d_]"
 #: split off as a claim that is only a marker — the very failure this fixes.
 _TRAILING_CITES = r"(?=(?P<trail>(?:[ \t]*\[\d+\])*))(?P=trail)"
 
-#: Sentence terminators in scripts that have no letter case. Unicode calls
-#: these `Sentence_Terminal=Yes`; they are listed literally because `re` has no
-#: `\p{Sentence_Terminal}` and pulling in `regex` for one character class is
-#: not worth a dependency.
-#:
-#: Every character missing from this list silently disables per-claim
-#: verification for the languages that use it — the answer comes back as one
-#: claim and nothing is checked per statement. That was fixed once for CJK and
-#: was still open for the danda, which covers Hindi, Bengali, Marathi and
-#: Nepali. A terminator here costs nothing when it never appears.
-_CASELESS_TERMINATORS = (
-    "。．！？"   # CJK / full-width stop, exclamation, question
-    "｡"         # U+FF61 halfwidth ideographic full stop
-    "।॥"        # U+0964/U+0965 danda, double danda — Indic
-    "։"         # U+0589 Armenian full stop
-    "።"         # U+1362 Ethiopic full stop
-    "។"         # U+17D4 Khmer khan
-    "၊။"        # U+104A/U+104B Myanmar little section, section
-)
+#: Sentence terminators of scripts without letter case. Defined in `chunking`,
+#: which is the foundational module, so the claim splitter here and the chunk
+#: splitter there cannot disagree about what ends a sentence — they did, and
+#: the chunker was the one still missing the danda.
+_CASELESS_TERMINATORS = CASELESS_TERMINATORS
 
 #: Claim boundaries. Five alternatives, in order:
 #:  1. Latin terminator + any trailing citation markers + whitespace +
