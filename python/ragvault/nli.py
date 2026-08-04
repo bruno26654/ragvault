@@ -42,6 +42,34 @@ recovers most of the loss. That is the default here (``granularity="sentence"``)
 and it is why the sentence splitter's script coverage matters so much — a
 language the splitter cannot segment silently falls back to whole-block
 premises, which is the degraded mode.
+
+Measured, and it changes what this is for
+-----------------------------------------
+
+``benchmarks/RESULTS-VERIFICATION.md``, 36 labelled pairs, en/es/pt,
+mDeBERTa-v3-base-xnli on CPU. On a *bare* premise the adapter is good: 0.89
+accuracy, 4% false-contradicted. On a **padded premise — a realistic retrieved
+chunk — it is not**: accuracy 0.78 and the false-contradicted rate rises to
+**21%**, meaning roughly one correct claim in five would be deleted by
+``repair``. Whole-block granularity is worse on both counts (0.72 / 25%), so
+this is not a granularity that can be tuned around.
+
+The mechanism is visible in the table: ``unsupported`` keeps precision 1.00 but
+its recall collapses from 0.64 to 0.27. The model does not stop being right
+when it speaks — it stops saying "neutral" once the chunk contains competing
+content, and what should have been neutral is asserted as a contradiction.
+
+So the adapter **refuses ``repair`` and ``strict`` by default**
+(``allow_repair=True`` to override once you have measured your own corpus). It
+reports; it does not delete. A wrong verdict in ``report``/``annotate`` is a
+visible mislabel, and that is a trade worth making — a wrong verdict in
+``repair`` is a correct sentence that silently disappears, which is the failure
+this whole module exists to prevent.
+
+**It is also slow.** p50 is ~10 s per claim on CPU with a bare premise and
+~22 s with a realistic one, so a five-claim answer costs minutes. Block
+granularity halves it and costs accuracy. Batch across claims, use a GPU, or
+treat this as an offline audit pass rather than something in the request path.
 """
 
 from __future__ import annotations
@@ -142,7 +170,12 @@ class NLIVerifier:
         batch_size: int = 16,
         max_length: int = 512,
         device: Optional[str] = None,
+        allow_repair: bool = False,
     ) -> None:
+        #: Refuses `repair`/`strict` by default — see the module docstring for
+        #: the measurement. Opt in once you have run the benchmark on your own
+        #: corpus and the false-contradicted rate is acceptable to you.
+        self.destructive_modes_allowed = bool(allow_repair)
         if granularity not in ("sentence", "block"):
             raise ConfigurationError(
                 f"unknown granularity {granularity!r}; expected 'sentence' or 'block'"

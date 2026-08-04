@@ -289,7 +289,10 @@ class TestEndToEnd:
                 return CONTRADICT
             return ENTAIL if "30 days" in premise else NEUTRAL
 
-        verifier, _, _ = build(rule)
+        # `allow_repair=True` on purpose: this test is about what repair does
+        # with the verdicts, and the default refusal is covered separately in
+        # TestDestructiveModeGuard.
+        verifier, _, _ = build(rule, allow_repair=True)
         answer = kb.ask(
             "refund",
             llm=lambda p: "Refunds take 30 days [1]. Refunds take 90 days [1].",
@@ -397,3 +400,114 @@ class TestBenchmarkHarness:
         for lang in {r["lang"] for r in pairs}:
             labels = {r["label"] for r in pairs if r["lang"] == lang}
             assert labels == {"supported", "contradicted", "unsupported"}, lang
+
+
+class TestDestructiveModeGuard:
+    """Measured on realistic (padded) premises, the adapter's
+    false-contradicted rate is 21% — roughly one correct claim in five would be
+    deleted by `repair`. It refuses those modes rather than documenting the
+    risk and leaving the default dangerous."""
+
+    def test_repair_is_refused_by_default(self, tmp_path):
+        verifier, _, _ = build(lambda p, h: ENTAIL)
+        kb = ragvault.open(tmp_path / "kb")
+        kb.add([{"id": "refund", "text": "Refunds take 30 days."}])
+        try:
+            with pytest.raises(ConfigurationError, match="must not drive"):
+                kb.ask("refund", llm=lambda p: "Refunds take 30 days [1].",
+                       verify=verifier, verification_mode="repair", k=1)
+        finally:
+            kb.close()
+
+    @pytest.mark.parametrize("mode", ["report", "annotate"])
+    def test_reporting_modes_are_unaffected(self, tmp_path, mode):
+        verifier, _, _ = build(lambda p, h: ENTAIL)
+        kb = ragvault.open(tmp_path / "kb")
+        kb.add([{"id": "refund", "text": "Refunds take 30 days."}])
+        try:
+            answer = kb.ask("refund", llm=lambda p: "Refunds take 30 days [1].",
+                            verify=verifier, verification_mode=mode, k=1)
+            assert answer.verification.claims[0].verdict == "supported"
+        finally:
+            kb.close()
+
+    def test_opting_in_restores_repair(self, tmp_path):
+        verifier, _, _ = build(lambda p, h: ENTAIL, allow_repair=True)
+        assert verifier.destructive_modes_allowed
+        kb = ragvault.open(tmp_path / "kb")
+        kb.add([{"id": "refund", "text": "Refunds take 30 days."}])
+        try:
+            answer = kb.ask("refund", llm=lambda p: "Refunds take 30 days [1].",
+                            verify=verifier, verification_mode="repair", k=1)
+            assert "Refunds take 30 days" in answer.text
+        finally:
+            kb.close()
+
+    def test_the_guard_is_generic_not_nli_specific(self):
+        """Any verifier can decline destructive modes — the library does not
+        special-case this module."""
+        from ragvault.verification import verify_answer
+
+        def picky(payload):
+            return ["supported"] * len(payload["claims"])
+
+        picky.destructive_modes_allowed = False
+        with pytest.raises(ConfigurationError, match="must not drive"):
+            verify_answer(question="q", answer_text="A claim.", context="",
+                          citations=[], verify=picky, mode="strict")
+
+    def test_an_ordinary_verifier_is_unrestricted(self):
+        """Absence of the attribute means allowed: existing verifiers keep
+        working exactly as before."""
+        from ragvault.verification import verify_answer
+
+        report = verify_answer(
+            question="q", answer_text="A claim.", context="", citations=[],
+            verify=lambda payload: ["unsupported"], mode="repair",
+            require_evidence=False,
+        )
+        assert report.claims[0].action == "removed"
+
+
+class TestGateRendering:
+    @pytest.fixture
+    def bench(self):
+        import importlib.util
+        from pathlib import Path
+
+        path = (Path(__file__).resolve().parents[2]
+                / "benchmarks" / "bench_nli_verifier.py")
+        spec = importlib.util.spec_from_file_location("bench_nli_gate", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _render(self, bench, verdict_fn):
+        pairs = bench.load_pairs(None)
+        results = {
+            name: bench.run_config(verdict_fn, pairs, pad)
+            for name, pad in (("sentence / bare premise", False),
+                              ("sentence / padded premise", True))
+        }
+        return bench.render(results, pairs, "stub")
+
+    def test_a_verifier_that_cries_contradiction_fails_the_gate(self, bench):
+        text = self._render(
+            bench, lambda payload: {"claims": [{"verdict": "contradicted"}]})
+        assert "**FAIL**" in text
+        assert "refuses `repair`/`strict` by default" in text
+
+    def test_a_perfect_verifier_passes_the_gate(self, bench):
+        pairs = bench.load_pairs(None)
+
+        def oracle(payload):
+            claim = payload["claims"][0]
+            for row in pairs:
+                if (row["claim"] == claim["claim"]
+                        and claim["evidence"][0]["text"].startswith(row["premise"])):
+                    return {"claims": [{"verdict": row["label"]}]}
+            raise AssertionError("unmatched")
+
+        text = self._render(bench, oracle)
+        assert "**PASS**" in text
+        assert "allow_repair=True" in text
