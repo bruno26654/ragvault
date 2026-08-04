@@ -63,6 +63,27 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
   mislabel. Any verifier may set `destructive_modes_allowed = False` and
   `verify_answer` refuses those modes with an actionable error. Verifiers
   without the attribute are unrestricted, so existing code is unaffected.
+- **The status vocabulary for version resolution is now data, not a constant**
+  (`status_vocabulary=`, `current_statuses=`, `superseded_statuses=` on
+  `retrieve_multi`/`ask_multi`). Named vocabularies ship for `generic` (the
+  default), `mlflow` and `legal-ptbr`.
+
+### Changed
+- **`resolve_versions` no longer assumes one domain's words.** The status
+  vocabulary was hardcoded with Brazilian legal terms first
+  (`vigente`/`revogado`), which meant a corpus labelled the MLflow way
+  (`Production`/`Archived`) or the CMS way (`published`/`deprecated`) matched
+  neither class — both sides ranked equal and `resolve_versions=True` silently
+  did nothing. The default vocabulary is now domain-neutral: the
+  slowly-changing-dimension / document-control terms that data and ML tooling
+  converge on. `vigente`/`revogado` remain recognized as aliases so existing
+  corpora keep resolving, and are selectable on purpose via
+  `status_vocabulary="legal-ptbr"`. `ACTIVE_STATUSES`/`REVOKED_STATUSES` are
+  kept as names for `STATUS_VOCABULARIES["generic"]` plus those aliases.
+- A status the active vocabulary does not describe now ranks *between* the two
+  classes and is reported in `result.unrecognized_statuses` and the trace,
+  rather than being silently treated as ordinary. Asking for status precedence
+  and receiving none is a fact the caller needs.
 
 ### Fixed
 - **Per-claim verification was a silent no-op for roughly a billion speakers.**
