@@ -20,8 +20,8 @@ Presets: `quality, balanced, fast, offline, multilingual, code, long_documents, 
 | `retrieve(query, k=8, token_budget=None, filters=None, mode=None, candidates=None, ef_search=None, rerank=None, context_window=None, max_chunks_per_document=None, explain=False, trace=False)` | → `RetrievalResult` |
 | `retrieve_many(queries, **kw)` / `aretrieve` / `aretrieve_many` | lote e async |
 | `retrieve_multi(question, subqueries=None, decompose=None, max_subqueries=6, fusion="weighted_rrf", coverage_per_subquery=1, rerank=None, filters=None, subquery_filters=None, boosts=None, resolve_versions=False, **retrieve_kw)` | pipeline multi-query → `MultiRetrievalResult` |
-| `ask_multi(question, llm=..., citations=True, verify=None, verification_mode="report", **retrieve_multi_kw)` / `aretrieve_multi` / `aask_multi` | multi-query + LLM com integridade de citações |
-| `ask(question, llm=..., citations=True, system_prompt=None, verify=None, verification_mode="report", **retrieve_kw)` | → `Answer` (LLM é seu) |
+| `ask_multi(question, llm=..., citations=True, verify=None, verification_mode="report", segmenter=None, **retrieve_multi_kw)` / `aretrieve_multi` / `aask_multi` | multi-query + LLM com integridade de citações |
+| `ask(question, llm=..., citations=True, system_prompt=None, verify=None, verification_mode="report", segmenter=None, **retrieve_kw)` | → `Answer` (LLM é seu) |
 | `evaluate(dataset, k=10)` | → `EvaluationReport` |
 | `compare(dataset, presets=[...], k=10)` | avalia presets (parâmetros de retrieval) → `ComparisonReport` |
 | `tune(dataset, objective="ndcg@10", max_p95_ms=None, grid=None)` | grid-search com evidência → `TuningRecommendation` (nunca aplica sozinho) |
@@ -339,6 +339,97 @@ resposta declara isso em vez de ficar vazia. Nenhum provedor é obrigatório.
 **Trace** (`trace=True`) em `trace["verification"]`: `mode`, `ok`, `counts`,
 `elapsed_ms` e, por afirmação, `claim`, `citations`, `chunk_ids`, `verdict`,
 `rationale`, `replacement` e `action` (`kept`/`annotated`/`rewritten`/`removed`).
+
+### Verificador NLI offline (`ragvault.nli`)
+
+Todo o resto da verificação é **estrutural**: a citação é substring da fonte, o
+veredito nomeia um lastro, os spans são ordenados e não sobrepostos. A pergunta
+que nenhuma delas responde é se a evidência citada de fato **acarreta** a
+afirmação — e até aqui só um juiz LLM seu respondia, o que deixava a instalação
+offline padrão sem nenhuma checagem de fidelidade.
+
+```python
+from ragvault.nli import nli_verifier
+
+answer = kb.ask(question, llm=meu_llm, verify=nli_verifier())
+```
+
+Os três rótulos de NLI mapeiam nos vereditos existentes sem inventar nada:
+`entailment → supported`, `contradiction → contradicted`, `neutral →
+unsupported`. Instale com `pip install "ragvault[nli]"`.
+
+| Parâmetro | Padrão | O que faz |
+|---|---|---|
+| `granularity` | `"sentence"` | divide o bloco citado em frases e pontua cada uma contra a afirmação (SummaC-ZS). `"block"` usa o chunk inteiro: mais barato, pior em premissa longa |
+| `threshold` | `None` | `None` = `argmax` do próprio modelo. Um corte de probabilidade é prática consolidada, mas a constante não é transferível — derive a sua com `calibrate_threshold()` |
+| `batch_size` / `max_length` | `16` / `512` | vazão em CPU |
+
+**O que ele não faz**, dito abertamente porque um verificador que subnotifica
+em silêncio é pior que nenhum:
+
+- nunca devolve `question_fact` nem `inference` — ambos exigem ler a pergunta
+  como fonte, o que NLI não faz. Afirmações que são inferência voltam
+  `unsupported`;
+- não reporta cobertura de facetas, então com facetas declaradas `complete`
+  fica `False`. Passe `facets=[]`, ou combine com um juiz LLM para esse eixo;
+- **a acurácia não é uniforme entre idiomas.** Um checkpoint multilíngue herda
+  ~100 idiomas de pré-treino do XLM-R mas só os ~15 do fine-tuning em XNLI.
+  Fora deles o comportamento é não medido.
+
+**Agregação.** Uma frase-premissa que acarreta a afirmação já basta (`max`
+existencial, não um botão de ajuste). Acarretamento é checado **antes** de
+contradição: varrendo muitas frases, alguma não relacionada acaba pontuando
+como contradição, e deixá-la vencer apagaria texto correto em `repair`. Os dois
+erros não são simétricos — contradição perdida deixa uma frase errada visível,
+contradição falsa remove em silêncio uma frase certa.
+
+**Estado da medição:** ver `benchmarks/RESULTS-VERIFICATION.md`. Enquanto o
+benchmark não tiver rodado com um modelo real, use em `report`/`annotate`, onde
+um veredito errado é visível e não custa nada — **não** em `repair`/`strict`.
+
+### Segmentação conectável (`segmenter=`)
+
+O divisor embutido conhece terminadores de sentença — incluindo os que faltavam
+(danda `।`, ponto etíope `።`, ponto armênio `։`, khmer `។`), sem os quais a
+verificação por afirmação era um **no-op** em híndi, bengali, marathi, nepali,
+amárico e armênio. Ele também tolera pontuação do mundo real: espaço faltando
+depois do ponto (`"30 dias.Eles enviam"`), terminador ausente com quebra de
+parágrafo, pontuação repetida — e deixou de quebrar em iniciais de nome
+(`"John F. Kennedy"`).
+
+O que nenhuma regra de terminador alcança é prosa que **não tem terminador**:
+tailandês, laosiano, khmer e birmanês corridos. Para esses, passe o seu:
+
+```python
+import pysbd
+seg = pysbd.Segmenter(language="en", clean=False)
+answer = kb.ask(question, llm=meu_llm, verify=meu_verificador,
+                segmenter=seg.segment)
+```
+
+Sem dependência nova no núcleo: como `verify=` e `rerank=`, é um callable seu.
+As afirmações devolvidas passam pelo mesmo contrato estrutural do verificador —
+substrings verbatim da resposta, em ordem, sem sobreposição — que é o que
+mantém o `repair` cirúrgico. Um segmentador que quebra preserva a resposta e
+registra o erro. `answer.verification.segmentation` diz qual rota foi usada:
+`"heuristic"`, `"segmenter"` ou `"verifier"`.
+
+**Não** dividimos em minúscula depois de ponto (`"30 dias. eles enviam"`): as
+abreviaturas minúsculas são um conjunto aberto entre idiomas (`aprox.`, `pág.`,
+`ca.`, `ex.`) e uma divisão falsa vira um fragmento que o `repair` apaga de um
+texto que estava correto — pior que a divisão perdida.
+
+### Quão específica precisa ser a `quote`
+
+Estar **na** fonte não é o mesmo que apontar **para** algo nela: uma citação de
+uma palavra ("o") é substring de quase qualquer documento.
+`max_quote_occurrences` (8 por padrão) rejeita um span que casa tantas vezes no
+bloco citado que não localiza nada. Conta ocorrências em vez de medir tamanho
+de propósito: uma contagem significa a mesma coisa em qualquer script, enquanto
+"pelo menos 4 caracteres" é uma oração em chinês e uma sílaba em finlandês.
+Chunks duplicados não punem uma boa citação — as ocorrências são contadas por
+fonte e minimizadas. `min_quote_coverage` (razão entre tamanho da citação e da
+afirmação) é opcional e vem desligada.
 
 **Trace** (`trace=True`): `subqueries`, `candidates_per_subquery`, `fusion`
 (método, k0, contribuição de cada ranking por chunk, `fused_score` e

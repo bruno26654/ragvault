@@ -723,6 +723,9 @@ def ask_multi(
     require_quotes: bool = False,
     require_evidence: Optional[bool] = None,
     facets: Optional[Sequence[str]] = None,
+    segmenter: Optional[Callable] = None,
+    max_quote_occurrences: int = 8,
+    min_quote_coverage: float = 0.0,
     **retrieve_kwargs: Any,
 ) -> "Answer":
     """Multi-query ask: retrieve_multi + user-provided LLM + citation
@@ -838,6 +841,9 @@ def ask_multi(
             allow_replacements=allow_replacements,
             require_quotes=require_quotes,
             facets=answer_facets,
+            segmenter=segmenter,
+            max_quote_occurrences=max_quote_occurrences,
+            min_quote_coverage=min_quote_coverage,
             require_evidence=citations if require_evidence is None
             else require_evidence,
         )

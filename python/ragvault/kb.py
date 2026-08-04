@@ -881,6 +881,9 @@ class KnowledgeBase:
         require_quotes: bool = False,
         require_evidence: Optional[bool] = None,
         facets: Optional[Sequence[str]] = None,
+        segmenter: Optional[Callable] = None,
+        max_quote_occurrences: int = 8,
+        min_quote_coverage: float = 0.0,
         **retrieve_kwargs: Any,
     ) -> Answer:
         """Retrieve context and call a user-provided LLM. The LLM is a plain
@@ -895,6 +898,12 @@ class KnowledgeBase:
         text into the answer instead. ``facets=`` declares what the answer owed
         (see :meth:`ask_multi`), which is what makes ``verification.complete``
         meaningful for a single-query ask.
+
+        ``segmenter=`` replaces the built-in claim splitter, which needs a
+        sentence terminator to exist and so cannot reach Thai, Lao, Khmer or
+        Burmese prose. ``max_quote_occurrences`` / ``min_quote_coverage``
+        control how specific a verifier's ``quote`` must be; see
+        :func:`ragvault.verification.verify_answer`.
         """
         trace = bool(retrieve_kwargs.get("trace"))
         result = self.retrieve(question, **retrieve_kwargs)
@@ -924,6 +933,9 @@ class KnowledgeBase:
                 citations=result.citations, verify=verify, mode=verification_mode,
                 allow_replacements=allow_replacements,
                 require_quotes=require_quotes, facets=facets,
+                segmenter=segmenter,
+                max_quote_occurrences=max_quote_occurrences,
+                min_quote_coverage=min_quote_coverage,
                 # An answer that was never asked to cite cannot be held to
                 # citations; the caller already said which mode this is.
                 require_evidence=citations if require_evidence is None

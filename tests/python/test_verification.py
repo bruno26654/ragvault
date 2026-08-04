@@ -597,20 +597,70 @@ class TestClaimBoundaries:
         ("返金には30日かかります[1]。配送には5日かかります[2]。", 2),   # japonês
         ("يستغرق الاسترداد 30 يومًا [1]. يستغرق الشحن 5 أيام [2].", 2),  # árabe
         ("ההחזר אורך 30 יום [1]. המשלוח אורך 5 ימים [2].", 2),      # hebraico
+        # Scripts whose terminator the rule did not know: per-claim
+        # verification was a silent no-op for all of them.
+        ("यह पहला वाक्य है। यह दूसरा वाक्य है।", 2),                   # híndi
+        ("এটি প্রথম বাক্য। এটি দ্বিতীয় বাক্য।", 2),                        # bengali
+        ("ይህ የመጀመሪያው ነው። ይህ ሁለተኛው ነው።", 2),                       # amárico
+        ("Սա առաջինն է։ Սա երկրորդն է։", 2),                        # armênio
+        ("នេះជាប្រយោគទីមួយ។ នេះជាប្រយោគទីពីរ។", 2),                      # khmer
     ])
     def test_boundaries(self, text, expected):
         assert len(self._split(text)[0]) == expected
+
+    @pytest.mark.parametrize("text,expected", [
+        # Real answers are not well-typed. Splitting has to survive that
+        # without inventing boundaries that are not there.
+        ("Refunds take 30 days.They ship fast.", 2),      # space simply missing
+        ("Refunds take 30 days.[1]They ship in 5.", 2),   # …with a marker between
+        ("Refunds take 30 days\n\nThey ship fast", 2),    # no terminator at all
+        ("Refunds take 30 days.. They ship fast.", 2),    # doubled terminator
+        ("Refunds take 30 days!!! They ship fast?!", 2),  # excited punctuation
+        ("It applies in the U.S. Then it stops.", 2),     # initialism ends it
+        ("O prazo e 30. Depois disso nao vale.", 2),      # sentence ends in digit
+    ])
+    def test_malformed_punctuation_still_splits(self, text, expected):
+        assert len(self._split(text)[0]) == expected
+
+    @pytest.mark.parametrize("text", [
+        "Written by John F. Kennedy in 1961.",   # a middle initial, not a stop
+        "O peso total e 1.5Kg no maximo.",       # decimal glued to a capital
+        "O valor e R$ 1.234,56 por mes.",        # thousands separator
+        "See www.gov.br/docs for details.",      # a URL
+        "Use a filter, i.e. The author field.",  # i.e. before a capital
+        "Refunds take 30 days. they ship fast.",  # lowercase: see _SENTENCE_RE
+        "Refunds take 30\ndays in total",        # a wrapped line, not a break
+    ])
+    def test_does_not_invent_boundaries(self, text):
+        """A false split is worse than a missed one: `repair` deletes the
+        fragment it produces, corrupting text that was correct."""
+        assert len(self._split(text)[0]) == 1
 
     @pytest.mark.parametrize("text", [
         "Um [1]. Dois [2].",
         "- A [1].\n- B [2].",
         "退款需要30天[1]。运输需要5天[2]。",
         "O Art. 5º vale [1]. Fim [2].",
+        "यह पहला वाक्य है। यह दूसरा वाक्य है।",
+        "Refunds take 30 days.They ship fast.",
+        "Refunds take 30 days\n\nThey ship fast",
     ])
     def test_split_is_lossless(self, text):
         claims, seps = self._split(text)
         rebuilt = claims[0] + "".join(s + c for s, c in zip(seps, claims[1:]))
         assert rebuilt == text.strip()
+
+    def test_indic_answer_can_be_repaired_per_claim(self, kb):
+        """Without the danda, a Hindi answer was one claim and `repair` could
+        only keep or delete the whole thing."""
+        answer = kb.ask(
+            "refund",
+            llm=lambda p: "वापसी में 30 दिन लगते हैं[1]। शिपिंग में 5 दिन लगते हैं[1]।",
+            verify=verdicts("supported", "contradicted"),
+            verification_mode="repair", k=3,
+        )
+        assert "वापसी में 30 दिन लगते हैं" in answer.text
+        assert "शिपिंग में 5 दिन लगते हैं" not in answer.text
 
     def test_cjk_answer_can_be_repaired_per_claim(self, kb):
         """Before, a CJK answer was one claim: verification was a no-op."""
@@ -1484,3 +1534,135 @@ class TestClaimSplitting:
         from ragvault.verification import citations_in
 
         assert citations_in("A [2] and again [2] and [3].") == [2, 3]
+
+
+class TestSuppliedSegmenter:
+    """`segmenter=` exists for prose with no sentence terminator at all —
+    Thai, Lao, Khmer and Burmese running text, which no terminator rule
+    reaches. A supplied segmentation is held to the same structural contract
+    as the verifier's own."""
+
+    def test_segmenter_claims_are_used(self, kb):
+        answer = kb.ask(
+            "refund",
+            llm=lambda p: "Refunds take 30 days [1] shipping takes five [1]",
+            verify=verdicts("supported", "contradicted"),
+            verification_mode="repair",
+            segmenter=lambda text: [
+                "Refunds take 30 days [1]", "shipping takes five [1]",
+            ],
+            k=3,
+        )
+        assert answer.verification.segmentation == "segmenter"
+        assert "Refunds take 30 days" in answer.text
+        assert "shipping takes five" not in answer.text
+
+    def test_non_verbatim_claims_are_rejected(self, kb):
+        """Repair removes spans of the original; a paraphrased claim cannot be
+        located in it, so accepting one would rewrite the answer from the
+        segmenter's copy of it."""
+        answer = kb.ask(
+            "refund", llm=lambda p: "Refunds take 30 days [1].",
+            verify=verdicts("supported"),
+            segmenter=lambda text: ["Refunds are processed in 30 days"], k=3,
+        )
+        assert not answer.verification.valid
+        assert "not verbatim" in answer.verification.error
+
+    def test_overlapping_claims_are_rejected(self, kb):
+        answer = kb.ask(
+            "refund", llm=lambda p: "Refunds take 30 days [1].",
+            verify=verdicts("supported"),
+            segmenter=lambda text: ["Refunds take 30", "take 30 days [1]."], k=3,
+        )
+        assert not answer.verification.valid
+        assert "overlaps" in answer.verification.error
+
+    def test_a_broken_segmenter_preserves_the_answer(self, kb):
+        def boom(text):
+            raise RuntimeError("no locale data")
+
+        answer = kb.ask("refund", llm=lambda p: "Refunds take 30 days [1].",
+                        verify=verdicts("supported"), segmenter=boom, k=3)
+        assert answer.text == "Refunds take 30 days [1]."
+        assert answer.verification.ok is False
+        assert "no locale data" in answer.verification.error
+
+    def test_uncovered_text_is_reported(self, kb):
+        """A segmenter that drops a sentence leaves it unjudged, and silence
+        about unverified text is what the structural issues exist to break."""
+        answer = kb.ask(
+            "refund", llm=lambda p: "Refunds take 30 days [1]. Ships in five [1].",
+            verify=verdicts("supported"),
+            segmenter=lambda text: ["Refunds take 30 days [1]."], k=3,
+        )
+        assert not answer.verification.ok
+        assert any("unverified" in i for i in answer.verification.structural_issues)
+
+
+class TestQuoteSpecificity:
+    """Being *in* the source is not the same as pointing *at* something in it:
+    a one-word quote is a substring of almost any document."""
+
+    def _judge(self, quote, text="Refund requests must be filed within 30 days.",
+               **kwargs):
+        from ragvault.context import Citation
+        from ragvault.verification import verify_answer
+
+        citation = Citation(
+            index=1, document_id="refund", document_version=1,
+            chunk_ids=["c1"], title="refund", text=text, metadata={},
+        )
+        return verify_answer(
+            question="how long?", answer_text="Refunds take 30 days [1].",
+            context=text, citations=[citation],
+            verify=lambda payload: [{"verdict": "supported", "quote": quote}],
+            **kwargs,
+        )
+
+    def test_ubiquitous_quote_is_rejected(self):
+        report = self._judge(
+            "the",
+            text="The rule applies to the refund, the shipping, the invoice, "
+                 "the receipt, the order, the account, the customer and the fee.",
+        )
+        assert report.claims[0].verdict == "unsupported"
+        assert "does not identify where" in report.claims[0].rationale
+
+    def test_a_real_span_is_accepted(self):
+        report = self._judge("filed within 30 days")
+        assert report.claims[0].verdict == "supported"
+
+    def test_duplicate_chunks_do_not_punish_a_good_quote(self):
+        """The same span in two copies of a retrieved chunk is one location,
+        not two — occurrences are counted per source, then minimised."""
+        from ragvault.context import Citation
+        from ragvault.verification import verify_answer
+
+        text = "Refund requests must be filed within 30 days."
+        citations = [
+            Citation(index=i, document_id=f"d{i}", document_version=1,
+                     chunk_ids=[f"c{i}"], title="t", text=text, metadata={})
+            for i in (1, 2)
+        ]
+        report = verify_answer(
+            question="q", answer_text="Refunds take 30 days [1][2].",
+            context=text, citations=citations,
+            verify=lambda payload: [
+                {"verdict": "supported", "quote": "filed within 30 days"}
+            ],
+            max_quote_occurrences=1,
+        )
+        assert report.claims[0].verdict == "supported"
+
+    def test_occurrence_limit_is_script_independent(self):
+        """A length threshold would call four Chinese characters too short
+        while they carry a whole clause; an occurrence count does not."""
+        report = self._judge("30天内", text="退款必须在30天内提出。运输需要5天。")
+        assert report.claims[0].verdict == "supported"
+
+    def test_coverage_ratio_is_opt_in(self):
+        assert self._judge("30 days").claims[0].verdict == "supported"
+        strict = self._judge("30 days", min_quote_coverage=0.9)
+        assert strict.claims[0].verdict == "unsupported"
+        assert "covers" in strict.claims[0].rationale
