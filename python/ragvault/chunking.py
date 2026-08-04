@@ -16,12 +16,59 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 
+#: Character ranges of scripts written without spaces between words.
+#:
+#: Kept in sync with `is_unspaced_script` in
+#: `crates/ragvault-retrieval/src/bm25.rs`; `tests/python/test_components.py`
+#: asserts the two agree, because a silent divergence between how text is
+#: counted here and how it is tokenized there is exactly the class of bug this
+#: constant exists to fix.
+_UNSPACED_RANGES = (
+    (0x3040, 0x309F),  # Hiragana
+    (0x30A0, 0x30FF),  # Katakana
+    (0x3400, 0x4DBF),  # CJK Unified Ideographs Extension A
+    (0x4E00, 0x9FFF),  # CJK Unified Ideographs
+    (0xF900, 0xFAFF),  # CJK Compatibility Ideographs
+    (0xAC00, 0xD7AF),  # Hangul Syllables
+    (0x0E00, 0x0E7F),  # Thai
+    (0x0E80, 0x0EFF),  # Lao
+    (0x1000, 0x109F),  # Myanmar
+    (0x1780, 0x17FF),  # Khmer
+)
+
+#: Tokens per character for those scripts. Common BPE and SentencePiece
+#: vocabularies emit roughly 0.6–1.0 tokens per Han character (more for rare
+#: ones); this sits in the middle. It is an estimate and is documented as one —
+#: `ChunkingConfig.tokenizer` takes a real tokenizer when the exact count
+#: matters.
+_UNSPACED_TOKENS_PER_CHAR = 0.7
+
+
+def _is_unspaced_char(ch: str) -> bool:
+    code = ord(ch)
+    return any(lo <= code <= hi for lo, hi in _UNSPACED_RANGES)
+
+
 def estimate_tokens(text: str) -> int:
-    """Cheap token estimate (~chars/4 blended with word count)."""
+    """Cheap token estimate (~chars/4 blended with word count).
+
+    The word term only means anything in scripts that separate words with
+    spaces. Counting a Chinese paragraph as "one word" made the estimate 5–9×
+    low — 35 characters scored 4 tokens — so `target_tokens` and `token_budget`
+    were both wrong by that factor and chunks silently overran whatever the
+    caller budgeted. Characters in unspaced scripts are therefore counted on
+    their own terms, and the original blend applies to the rest.
+    """
     if not text:
         return 0
-    words = len(text.split())
-    return max(1, int(0.6 * words + 0.4 * (len(text) / 4)))
+    unspaced = sum(1 for ch in text if _is_unspaced_char(ch))
+    if not unspaced:
+        words = len(text.split())
+        return max(1, int(0.6 * words + 0.4 * (len(text) / 4)))
+    spaced_text = "".join(ch for ch in text if not _is_unspaced_char(ch))
+    words = len(spaced_text.split())
+    spaced = 0.6 * words + 0.4 * (len(spaced_text) / 4)
+    return max(1, int(unspaced * _UNSPACED_TOKENS_PER_CHAR + spaced))
 
 
 @dataclass
@@ -56,7 +103,32 @@ class RawChunk:
     page_number: Optional[int] = None
 
 
-_SENTENCE_RE = re.compile(r"(?<=[.!?…])\s+")
+#: Sentence terminators of scripts without letter case, as Unicode
+#: `Sentence_Terminal=Yes`. Lives here rather than in `verification` because
+#: this module is the foundational one — it imports nothing internal — and both
+#: splitters must agree on what ends a sentence.
+CASELESS_TERMINATORS = (
+    "。．！？"   # CJK / full-width stop, exclamation, question
+    "｡"         # U+FF61 halfwidth ideographic full stop
+    "।॥"        # U+0964/U+0965 danda, double danda — Indic
+    "։"         # U+0589 Armenian full stop
+    "።"         # U+1362 Ethiopic full stop
+    "។"         # U+17D4 Khmer khan
+    "၊။"        # U+104A/U+104B Myanmar little section, section
+)
+
+#: Sentence boundaries for chunking. Latin terminators need trailing
+#: whitespace; caseless ones do not, because the scripts that use them do not
+#: put spaces around punctuation.
+#:
+#: Only `[.!?…]` was recognized before, so a Chinese, Hindi or Arabic paragraph
+#: was one sentence. That mattered because `_pack_units` falls back to sentence
+#: splitting for an oversized paragraph — with no boundaries to find it went
+#: straight to hard-wrapping, cutting mid-sentence in every language whose
+#: terminator was missing.
+_SENTENCE_RE = re.compile(
+    rf"(?<=[.!?…])\s+|(?<=[{CASELESS_TERMINATORS}])\s*|(?<=[؟۔])\s+"
+)
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 
 

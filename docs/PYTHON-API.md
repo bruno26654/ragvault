@@ -89,6 +89,7 @@ resultados de cada subconsulta em um tier prioritário. Medido em
 | `boosts=[{"filter": {...}, "weight": 2.0}]` | boost multiplicativo **depois** da fusão |
 | `resolve_versions=True` | precedência por metadados dentro de `doc_group` |
 | `status_vocabulary="mlflow"` | qual vocabulário de status usar (`generic` padrão, `mlflow`, `legal-ptbr`) |
+| `date_format="%m/%d/%Y"` | formato de `effective_date` quando o corpus não usa ISO-8601 |
 | `current_statuses=[...]` / `superseded_statuses=[...]` | seu próprio vocabulário; substitui a classe inteira |
 | `subquery_filters=[...]` | filtro **por consulta** (pergunta original primeiro); `None` mantém o global. Uma entrada **substitui** o filtro global daquela consulta — é o que permite "faceta decisória só em `current`, faceta histórica só em `superseded`", impossível com um filtro único |
 | `rerank=fn` | rerank global; **nunca destrói recall** (descartados voltam) e falha tolerada |
@@ -129,6 +130,32 @@ documentos (`is_current`, superseded/obsolete) — o que ferramental de dados e
 ML converge a usar. `vigente`/`revogado` continuam reconhecidos como **alias**
 para não quebrar corpora escritos contra o padrão anterior, mas não fazem parte
 do `generic`: use `status_vocabulary="legal-ptbr"` para escolhê-los de propósito.
+
+### Datas que não dá para ordenar
+
+`effective_date` era convertida removendo tudo que não fosse dígito. Isso ordena
+ISO corretamente e **inverte silenciosamente todo o resto**:
+
+```
+ISO      2023-12-31 -> 20231231000000
+         2024-01-15 -> 20240115000000   correto
+US m/d/Y 12/31/2023 -> 12312023000000
+         01/15/2024 ->  1152024000000   INVERTIDO
+```
+
+Data invertida é pior que data ilegível: o documento substituído vence por
+recência e entra no contexto parecendo atual, sem nada reportado — o que anula a
+regra de supersessão absoluta sempre que as datas não são ISO.
+
+Agora uma string que não se prova ordenável **não é convertida** num número que
+só parece ordenável: ela ordena como desconhecida e é reportada em
+`result.unparseable_dates` e no trace. `12/31/2023` e `31/12/2023` têm a mesma
+forma e significados opostos, então adivinhar seria inventar um fato sobre o
+corpus. Quem tem corpus consistentemente não-ISO passa `date_format=` (padrão
+`strptime`) e recupera a ordenação exata.
+
+Reconhecidos sem declaração: `2024-01-15`, `2024-01-15T18:00:00Z`, `20240115`,
+`2024-01`, `2024`.
 
 **Status não reconhecido fica *entre* as duas classes**, nunca chutado para uma
 delas — o chamador rotulou o documento com algo que este vocabulário não

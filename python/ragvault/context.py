@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from . import _native
 from .chunking import estimate_tokens
 
 
@@ -107,7 +108,23 @@ class RetrievalResult:
 
 
 def _token_set(text: str) -> set[str]:
-    return {t for t in text.lower().split() if len(t) > 2}
+    """Terms of a chunk, tokenized exactly as the BM25 index tokenizes.
+
+    This used to be ``text.lower().split()``, which is only a model of a word
+    in scripts that put spaces between them. In Chinese, Japanese or Thai the
+    whole chunk came back as one token, so ``_overlap`` between two nearly
+    identical chunks was 0.0 — MMR read that as "maximally diverse" and spent
+    context budget admitting both, the exact outcome it exists to prevent.
+
+    Sharing the native tokenizer rather than re-deriving one here is
+    deliberate: a drift between how the index tokenizes and how dedup
+    tokenizes is invisible until it misbehaves.
+
+    The ``len(t) > 2`` floor is gone with it. It was a cheap stopword proxy for
+    English, and it discarded every bigram this tokenizer emits for unspaced
+    scripts — which is all of them.
+    """
+    return set(_native.tokenize(text, True))
 
 
 def _overlap(a: set[str], b: set[str]) -> float:

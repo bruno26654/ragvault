@@ -69,6 +69,44 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
   default), `mlflow` and `legal-ptbr`.
 
 ### Changed
+- **BM25 tokenizes scripts without word spacing as overlapping character
+  bigrams** (ADR 0017). `is_alphanumeric` runs made an entire Chinese, Japanese,
+  Korean or Thai chunk into one token, so every substring query returned nothing
+  and only a verbatim whole-string match worked — and since `hybrid` is the
+  default mode in every preset, including `multilingual`, it degraded to
+  dense-only in silence. Now the Lucene `CJKBigramFilter` behaviour. Spaced
+  scripts (Latin, Cyrillic, Greek, Arabic) tokenize byte-identically to before,
+  asserted by test, so no existing corpus re-ranks. Index size grows for the
+  affected scripts, and a single-character query against bigrammed text does not
+  match — the documented Lucene trade-off.
+  **Migration:** `format_version = 3` marks vaults whose persisted postings
+  predate the change; opening one rebuilds the BM25 index from stored chunk
+  text, reusing the rebuild compaction already performs. Nothing else on disk
+  changes.
+- **`_token_set` shares the native tokenizer** instead of `str.split()`. MMR
+  overlap between two near-identical Chinese chunks was 0.00, which MMR reads as
+  "maximally diverse" — so it admitted both and spent context budget on a
+  duplicate. English discrimination improved as well (near/far margin
+  0.62 → 0.72), since the `len(t) > 2` floor that went with it also discarded
+  every bigram.
+- **Token estimation counts unspaced scripts per character.** 35 Chinese
+  characters estimated at 4 tokens, so `target_tokens` and `token_budget` were
+  wrong by 5–9× and chunks silently overran the budget.
+- **Chunking recognizes the same sentence terminators the verifier does.**
+  `(?<=[.!?…])\s+` meant a Chinese, Hindi, Arabic or Amharic paragraph was one
+  sentence, so an oversized paragraph skipped sentence splitting and went
+  straight to hard-wrapping, cutting mid-sentence. The terminator set now lives
+  in `chunking` (the foundational module) and `verification` imports it, so the
+  two splitters cannot disagree again.
+- **`effective_date` values that cannot be ordered are no longer coerced into
+  numbers that look ordered.** Stripping non-digits ordered ISO correctly and
+  silently *inverted* everything else: `12/31/2023` outranked `01/15/2024`, so
+  the superseded document won on recency and entered the context looking current
+  — defeating absolute supersession whenever dates were not ISO. Unparseable
+  values now sort as unknown and are reported in `result.unparseable_dates` and
+  the trace; `date_format=` (a `strptime` pattern) restores exact ordering for
+  consistently non-ISO corpora. `12/31/2023` and `31/12/2023` are the same shape
+  with opposite meanings, so guessing is not on the table.
 - **`resolve_versions` no longer assumes one domain's words.** The status
   vocabulary was hardcoded with Brazilian legal terms first
   (`vigente`/`revogado`), which meant a corpus labelled the MLflow way

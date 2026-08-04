@@ -689,3 +689,80 @@ class TestStatusVocabulary:
         assert result.trace["status_vocabulary"]["name"] == "generic"
         assert result.trace["status_vocabulary"]["unrecognized"] == [
             "challenger", "champion"]
+
+
+class TestEffectiveDateParsing:
+    """A non-ISO date used to be coerced into a number that looked orderable
+    and was not: `12/31/2023` outranked `01/15/2024`. An inverted date is worse
+    than an unreadable one — the superseded document wins on recency and enters
+    the context looking current, with nothing reported."""
+
+    @pytest.fixture
+    def kb(self, tmp_path):
+        base = ragvault.open(tmp_path / "kb")
+        base.add([
+            {"id": "old", "text": "The retention policy keeps records 30 days.",
+             "metadata": {"doc_group": "ret", "effective_date": "12/31/2023"}},
+            {"id": "new", "text": "The retention policy keeps records 90 days.",
+             "metadata": {"doc_group": "ret", "effective_date": "01/15/2024"}},
+        ])
+        yield base
+        base.close()
+
+    @pytest.mark.parametrize("value,orderable", [
+        ("2024-01-15", True),
+        ("2024-01-15T18:00:00Z", True),
+        ("20240115", True),
+        ("2024-01", True),
+        ("2024", True),
+        ("12/31/2023", False),   # m/d/Y and d/m/Y are the same shape
+        ("31/12/2023", False),
+        ("15 de janeiro de 2024", False),
+        ("", False),
+    ])
+    def test_only_provably_orderable_dates_get_a_key(self, value, orderable):
+        from ragvault.multiquery import parse_effective_date
+
+        assert (parse_effective_date(value) is not None) is orderable
+
+    def test_iso_dates_order_correctly(self):
+        from ragvault.multiquery import parse_effective_date as parse
+
+        assert parse("2024-01-15") > parse("2023-12-31")
+        assert parse("2024-01-15T18:00:00Z") > parse("2024-01-15T10:00:00Z")
+
+    def test_an_ambiguous_date_never_wins_by_being_misread(self, kb):
+        """Neither document may be eliminated on a date nobody can order."""
+        result = kb.retrieve_multi("retention policy", resolve_versions=True, k=4)
+        assert {c.document_id for c in result.chunks} == {"old", "new"}
+
+    def test_unorderable_dates_are_reported(self, kb):
+        result = kb.retrieve_multi("retention policy", resolve_versions=True, k=4)
+        assert result.unparseable_dates == ["01/15/2024", "12/31/2023"]
+
+    def test_a_declared_format_resolves_them(self, kb):
+        result = kb.retrieve_multi(
+            "retention policy", resolve_versions=True, k=4,
+            date_format="%m/%d/%Y")
+        assert {c.document_id for c in result.chunks} == {"new"}
+        assert result.unparseable_dates == []
+
+    def test_iso_corpora_report_nothing(self, tmp_path):
+        base = ragvault.open(tmp_path / "iso")
+        base.add([
+            {"id": "old", "text": "Retention keeps records 30 days.",
+             "metadata": {"doc_group": "r", "effective_date": "2023-12-31"}},
+            {"id": "new", "text": "Retention keeps records 90 days.",
+             "metadata": {"doc_group": "r", "effective_date": "2024-01-15"}},
+        ])
+        try:
+            result = base.retrieve_multi("retention", resolve_versions=True, k=4)
+            assert {c.document_id for c in result.chunks} == {"new"}
+            assert result.unparseable_dates == []
+        finally:
+            base.close()
+
+    def test_the_report_reaches_the_trace(self, kb):
+        result = kb.retrieve_multi("retention policy", resolve_versions=True,
+                                   k=4, trace=True)
+        assert result.trace["unparseable_dates"] == ["01/15/2024", "12/31/2023"]

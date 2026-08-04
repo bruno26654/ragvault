@@ -44,6 +44,7 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 import numpy as np
@@ -125,6 +126,11 @@ class MultiRetrievalResult(RetrievalResult):
     #: nothing to precedence for those documents — the caller asked for
     #: precedence and, for them, got none. Reported instead of assumed away.
     unrecognized_statuses: list[str] = field(default_factory=list)
+    #: `effective_date` values that carry data but cannot be ordered — a
+    #: non-ISO format with no ``date_format`` declared. They sort as unknown
+    #: rather than as a number that merely looks orderable, and appear here so
+    #: the caller learns precedence did not apply.
+    unparseable_dates: list[str] = field(default_factory=list)
 
 
 def _normalize(text: str) -> str:
@@ -258,6 +264,7 @@ def retrieve_multi(
     status_vocabulary: Optional[str] = None,
     current_statuses: Optional[Sequence[str]] = None,
     superseded_statuses: Optional[Sequence[str]] = None,
+    date_format: Optional[str] = None,
     token_budget: Optional[int] = None,
     candidates: Optional[int] = None,
     mode: Optional[str] = None,
@@ -441,6 +448,7 @@ def retrieve_multi(
     # -- 5. version resolution by metadata precedence -----------------------
     conflicts: list[dict] = []
     unrecognized_statuses: list[str] = []
+    unparseable_dates: list[str] = []
     if resolve_versions:
         t0 = time.monotonic()
         # Elimination must not shrink the context, and must not cost a facet
@@ -467,20 +475,24 @@ def retrieve_multi(
         # status seen only in round 1 would vanish from the report if the
         # last round's view were the one kept.
         seen_unrecognized: set = set()
+        seen_unparseable: set = set()
         for _ in range(_MAX_RESOLUTION_ROUNDS):
-            chunks, conflicts, dropped_chunks, unrecognized = _resolve_versions(
+            (chunks, conflicts, dropped_chunks, unrecognized,
+             unparseable) = _resolve_versions(
                 chunks, status_field=status_field,
                 effective_date_field=effective_date_field,
                 version_field=version_field,
                 version_group_field=version_group_field,
                 current_statuses=_current_set,
                 superseded_statuses=_superseded_set,
+                date_format=date_format,
                 absolute_status=absolute_status,
             )
             # Conflicts are recomputed from the surviving set each round, so
             # they are merged: without this, a version eliminated in round 1
             # vanishes from the report the moment round 2 recomputes.
             seen_unrecognized |= set(unrecognized)
+            seen_unparseable |= set(unparseable)
             for conflict in conflicts:
                 _merge_conflict(by_group, conflict)
             eliminated.extend(dropped_chunks)
@@ -494,6 +506,7 @@ def retrieve_multi(
             chunks = refilled
         conflicts = list(by_group.values())
         unrecognized_statuses = sorted(seen_unrecognized)
+        unparseable_dates = sorted(seen_unparseable)
 
         stage_ms["resolve_versions"] = (time.monotonic() - t0) * 1000
         if trace_data is not None:
@@ -502,6 +515,7 @@ def retrieve_multi(
                 "name": status_vocabulary or DEFAULT_STATUS_VOCABULARY,
                 "unrecognized": unrecognized_statuses,
             }
+            trace_data["unparseable_dates"] = unparseable_dates
 
     if trace_data is not None:
         trace_data["fusion"] = {
@@ -642,17 +656,79 @@ def retrieve_multi(
         subqueries=queries,
         conflicts=conflicts,
         unrecognized_statuses=unrecognized_statuses,
+        unparseable_dates=unparseable_dates,
     )
 
 
-def _iso_key(date: Optional[str]) -> float:
-    """Sortable key for ISO-like date strings; unknown dates sort lowest."""
-    if not date:
-        return float("-inf")
-    digits = re.sub(r"[^0-9]", "", str(date))[:14]
-    if not digits:
-        return float("-inf")
-    return float(digits.ljust(14, "0"))
+_EPOCH = datetime(1970, 1, 1)
+_YMD_RE = re.compile(r"(\d{4})(?:-?(\d{2}))?(?:-?(\d{2}))?$")
+
+
+def parse_effective_date(
+    date: Optional[str], date_format: Optional[str] = None
+) -> Optional[float]:
+    """Sortable key for a date, or ``None`` when it cannot be ordered.
+
+    This used to strip every non-digit and pad the result, which orders ISO
+    correctly and **silently inverts everything else**::
+
+        ISO      2023-12-31 -> 20231231000000
+                 2024-01-15 -> 20240115000000   correct
+        US m/d/Y 12/31/2023 -> 12312023000000
+                 01/15/2024 ->  1152024000000   INVERTED
+
+    An inverted date is worse than an unreadable one: the superseded document
+    wins on recency and enters the context looking current, with nothing
+    reported — which defeats the absolute-supersession rule whenever dates are
+    not ISO. So a string that cannot be *shown* to be orderable is not coerced
+    into a number that merely looks like one. It returns ``None``, sorts as
+    unknown, and is reported to the caller.
+
+    ``12/31/2023`` and ``31/12/2023`` are the same string shape with opposite
+    meanings, so guessing would be inventing a fact about the corpus — the same
+    reason an unrecognized status ranks between the classes rather than being
+    assigned to one. Callers whose corpus is consistently non-ISO pass
+    ``date_format`` (a ``strptime`` pattern) and get exact ordering.
+    """
+    if date is None:
+        return None
+    text = str(date).strip()
+    if not text:
+        return None
+
+    parsed: Optional[datetime] = None
+    if date_format:
+        try:
+            parsed = datetime.strptime(text, date_format)
+        except ValueError:
+            return None
+    else:
+        try:
+            parsed = datetime.fromisoformat(
+                f"{text[:-1]}+00:00" if text.endswith("Z") else text
+            )
+        except ValueError:
+            match = _YMD_RE.fullmatch(text)
+            if not match:
+                return None
+            try:
+                parsed = datetime(
+                    int(match.group(1)),
+                    int(match.group(2) or 1),
+                    int(match.group(3) or 1),
+                )
+            except ValueError:
+                return None
+
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return (parsed - _EPOCH).total_seconds()
+
+
+def _iso_key(date: Optional[str], date_format: Optional[str] = None) -> float:
+    """Ordering key; unknown and unparseable dates both sort lowest."""
+    parsed = parse_effective_date(date, date_format)
+    return float("-inf") if parsed is None else parsed
 
 
 #: Safety bound on the resolve/refill fixed point. Each round eliminates at
@@ -703,7 +779,8 @@ def _resolve_versions(
     absolute_status: bool = True,
     current_statuses: frozenset[str] = frozenset(),
     superseded_statuses: frozenset[str] = frozenset(),
-) -> tuple[list[RetrievedChunk], list[dict], list[dict], list[str]]:
+    date_format: Optional[str] = None,
+) -> tuple[list[RetrievedChunk], list[dict], list[dict], list[str], list[str]]:
     """Keep the documents in force. Pure: same chunk set, same outcome.
 
     Returns (surviving chunks, conflicts, eliminations). Two rules, both
@@ -733,6 +810,17 @@ def _resolve_versions(
         for chunk in chunks
         if chunk.metadata.get(status_field) is not None
         and rank(chunk.metadata.get(status_field)) == 1
+    })
+
+    # Dates that carry a value but cannot be ordered. Reported for the same
+    # reason unrecognized statuses are: precedence was requested and, for these
+    # documents, silently did not apply.
+    unparseable_dates = sorted({
+        str(chunk.metadata.get(effective_date_field))
+        for chunk in chunks
+        if chunk.metadata.get(effective_date_field) is not None
+        and parse_effective_date(
+            chunk.metadata.get(effective_date_field), date_format) is None
     })
 
     losers: dict[str, str] = {}
@@ -777,7 +865,7 @@ def _resolve_versions(
                 version_num = float("-inf")
             return (
                 rank(e["status"]),                 # current first
-                -(_iso_key(e["effective_date"])),   # latest date first
+                -(_iso_key(e["effective_date"], date_format)),  # latest first
                 -version_num,                       # highest version first
             )
 
@@ -788,7 +876,8 @@ def _resolve_versions(
         winner = ranked[0]
         dropped = []
         for e in ranked[len(tied):]:
-            reason = _precedence_reason(winner, e, status_field, rank)
+            reason = _precedence_reason(
+                winner, e, status_field, rank, date_format)
             losers[e["document_id"]] = reason
             dropped.append({"document_id": e["document_id"],
                             "status": e["status"], "reason": reason})
@@ -806,7 +895,7 @@ def _resolve_versions(
         })
 
     if not losers:
-        return list(chunks), conflicts, [], unrecognized
+        return list(chunks), conflicts, [], unrecognized, unparseable_dates
     surviving, eliminated = [], []
     for chunk in chunks:
         reason = losers.get(chunk.document_id)
@@ -818,15 +907,17 @@ def _resolve_versions(
                 "document_id": chunk.document_id,
                 "reason": f"version resolution: {reason}",
             })
-    return surviving, conflicts, eliminated, unrecognized
+    return surviving, conflicts, eliminated, unrecognized, unparseable_dates
 
 
 def _precedence_reason(winner: dict, loser: dict, status_field: str,
-                       rank: Callable[[Optional[str]], int]) -> str:
+                       rank: Callable[[Optional[str]], int],
+                       date_format: Optional[str] = None) -> str:
     if rank(loser["status"]) > rank(winner["status"]):
         return (f"{status_field}={loser['status']!r} superseded by "
                 f"{status_field}={winner['status']!r} ({winner['document_id']})")
-    if _iso_key(loser["effective_date"]) < _iso_key(winner["effective_date"]):
+    if (_iso_key(loser["effective_date"], date_format)
+            < _iso_key(winner["effective_date"], date_format)):
         return (f"effective_date {loser['effective_date']!r} older than "
                 f"{winner['effective_date']!r} ({winner['document_id']})")
     return f"lower precedence than {winner['document_id']}"

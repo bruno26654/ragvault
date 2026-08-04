@@ -7,7 +7,13 @@
 ## Sinais
 
 - **Dense**: Flat exato abaixo de `flat_threshold` (default 1000 vetores) ou HNSW (M=16, ef_construction=200). `ef_search` configurável por query.
-- **BM25**: k1=1.2, b=0.75, tokenizer Unicode lowercase, estatísticas sobre docs vivos.
+- **BM25**: k1=1.2, b=0.75, estatísticas sobre docs vivos. Tokenizer Unicode:
+  runs alfanuméricos em minúscula para escritas com espaço entre palavras;
+  **bigramas de caractere sobrepostos** para as que não têm (chinês, japonês,
+  coreano, tailandês, lao, birmanês, khmer). Sem isso um run alfanumérico *é*
+  a frase inteira nessas línguas, o índice guardava um único termo enorme por
+  chunk e só uma consulta literalmente idêntica casava — `hybrid` degradava
+  para dense-only em silêncio. Ver ADR 0017.
 - **Sparse**: vetores esparsos fornecidos por você (SPLADE, BGE-M3...); o core nunca gera sparse embeddings.
 
 ### IVF (`index="ivf_flat"` / `index="ivf_pq"`)

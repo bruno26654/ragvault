@@ -1,8 +1,14 @@
 //! Incremental BM25 inverted index.
 //!
-//! - Unicode-aware tokenizer: lowercased alphanumeric runs (configurable
-//!   lowercasing). Works for Latin scripts and CJK-adjacent text degrades to
-//!   character runs rather than breaking.
+//! - Unicode-aware tokenizer: lowercased alphanumeric runs for spaced scripts,
+//!   overlapping character bigrams for scripts written without word spacing.
+//!   The bigrams are not an optimization — without them an alphanumeric run
+//!   *is* the whole sentence in Chinese, Japanese, Korean and Thai, so the
+//!   index held one enormous term per chunk and only a verbatim whole-string
+//!   query could match. Every substring query returned nothing, and because
+//!   `hybrid` is the default mode everywhere it degraded to dense-only in
+//!   silence. (This comment previously claimed such text "degrades to
+//!   character runs"; it did not.)
 //! - Postings are append-only per term; deletions are handled at query time
 //!   through the caller's tombstone predicate, and statistics are kept
 //!   consistent by tracking removed document lengths.
@@ -167,26 +173,92 @@ impl Bm25Index {
     }
 }
 
-/// Unicode tokenizer: alphanumeric runs, optional lowercasing.
-pub fn tokenize(text: &str, lowercase: bool) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    for ch in text.chars() {
-        if ch.is_alphanumeric() {
-            if lowercase {
-                for lc in ch.to_lowercase() {
-                    current.push(lc);
-                }
-            } else {
-                current.push(ch);
-            }
-        } else if !current.is_empty() {
-            tokens.push(std::mem::take(&mut current));
+/// Scripts written without spaces between words, where an alphanumeric run is
+/// a sentence rather than a word.
+///
+/// Hangul is included even though Korean *is* spaced: Korean is agglutinative,
+/// so particles attach to the stem ("한국어를" / "한국어는") and bigrams inside
+/// each spaced word are what let those forms match each other. Word boundaries
+/// still cut the run, so this only ever bigrams within one word.
+fn is_unspaced_script(ch: char) -> bool {
+    matches!(ch as u32,
+        0x3040..=0x309F   // Hiragana
+        | 0x30A0..=0x30FF // Katakana
+        | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
+        | 0x4E00..=0x9FFF // CJK Unified Ideographs
+        | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+        | 0xAC00..=0xD7AF // Hangul Syllables
+        | 0x0E00..=0x0E7F // Thai
+        | 0x0E80..=0x0EFF // Lao
+        | 0x1000..=0x109F // Myanmar
+        | 0x1780..=0x17FF // Khmer
+    )
+}
+
+fn flush_spaced(buf: &mut String, out: &mut Vec<String>) {
+    if !buf.is_empty() {
+        out.push(std::mem::take(buf));
+    }
+}
+
+/// Overlapping character bigrams, the Lucene `CJKBigramFilter` behaviour.
+///
+/// A dictionary would segment these scripts better, but it would put
+/// per-language data in a core that has to stay small — the same trade-off the
+/// verification layer resolves with a caller-supplied `segmenter`. Bigrams need
+/// nothing and take these languages from "one token per chunk" to usable.
+///
+/// A run of one character emits that character, so a single-glyph term is not
+/// lost. Runs of two or more emit bigrams only: a one-character *query* against
+/// bigrammed text therefore does not match, which is the documented Lucene
+/// trade-off and the price of not inflating every posting list with unigrams.
+fn flush_unspaced(buf: &mut Vec<char>, out: &mut Vec<String>) {
+    if buf.is_empty() {
+        return;
+    }
+    if buf.len() == 1 {
+        out.push(buf[0].to_string());
+    } else {
+        for pair in buf.windows(2) {
+            out.push(pair.iter().collect());
         }
     }
-    if !current.is_empty() {
-        tokens.push(current);
+    buf.clear();
+}
+
+/// Unicode tokenizer: alphanumeric runs for spaced scripts, overlapping
+/// character bigrams for unspaced ones, optional lowercasing.
+///
+/// Used by both indexing and querying, which is what makes the two consistent
+/// by construction — a tokenizer change can never desynchronize them.
+pub fn tokenize(text: &str, lowercase: bool) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut spaced = String::new();
+    let mut unspaced: Vec<char> = Vec::new();
+
+    for ch in text.chars() {
+        if is_unspaced_script(ch) {
+            // Checked before `is_alphanumeric`, which is true for these too.
+            flush_spaced(&mut spaced, &mut tokens);
+            // No cased characters exist in these ranges, so lowercasing is a
+            // no-op and the char is kept as-is.
+            unspaced.push(ch);
+        } else if ch.is_alphanumeric() {
+            flush_unspaced(&mut unspaced, &mut tokens);
+            if lowercase {
+                for lc in ch.to_lowercase() {
+                    spaced.push(lc);
+                }
+            } else {
+                spaced.push(ch);
+            }
+        } else {
+            flush_spaced(&mut spaced, &mut tokens);
+            flush_unspaced(&mut unspaced, &mut tokens);
+        }
     }
+    flush_spaced(&mut spaced, &mut tokens);
+    flush_unspaced(&mut unspaced, &mut tokens);
     tokens
 }
 
@@ -272,5 +344,76 @@ mod tests {
             idx.search("beta gamma", 5, &|_| true),
             restored.search("beta gamma", 5, &|_| true)
         );
+    }
+}
+
+#[cfg(test)]
+mod tokenizer_tests {
+    use super::tokenize;
+
+    /// The property that makes this change safe to ship: spaced scripts must
+    /// tokenize exactly as before, so no existing corpus shifts ranking.
+    #[test]
+    fn spaced_scripts_are_unchanged() {
+        assert_eq!(
+            tokenize("Refund requests, filed!", true),
+            vec!["refund", "requests", "filed"]
+        );
+        assert_eq!(
+            tokenize("Возврат средств", true),
+            vec!["возврат", "средств"]
+        );
+        assert_eq!(tokenize("استرداد الأموال", true), vec!["استرداد", "الأموال"]);
+        assert_eq!(tokenize("R$ 1.234,56", true), vec!["r", "1", "234", "56"]);
+    }
+
+    #[test]
+    fn cjk_becomes_overlapping_bigrams() {
+        // Was one token: the whole run, matchable only by a verbatim query.
+        assert_eq!(tokenize("退款申请", true), vec!["退款", "款申", "申请"]);
+    }
+
+    #[test]
+    fn a_substring_query_shares_a_term_with_the_document() {
+        let doc = tokenize("退款申请必须提交", true);
+        let query = tokenize("退款", true);
+        assert!(
+            query.iter().any(|t| doc.contains(t)),
+            "no shared term: doc={doc:?} query={query:?}"
+        );
+    }
+
+    #[test]
+    fn scripts_split_at_the_boundary() {
+        assert_eq!(
+            tokenize("退款refund申请", true),
+            vec!["退款", "refund", "申请"]
+        );
+        assert_eq!(tokenize("30天", true), vec!["30", "天"]);
+    }
+
+    #[test]
+    fn a_single_character_run_survives() {
+        assert_eq!(tokenize("退 款", true), vec!["退", "款"]);
+    }
+
+    #[test]
+    fn japanese_korean_and_thai_are_covered() {
+        assert_eq!(
+            tokenize("返金の申請", true),
+            vec!["返金", "金の", "の申", "申請"]
+        );
+        // Korean is spaced, so bigrams stay inside each word.
+        assert_eq!(
+            tokenize("한국어를 배우다", true),
+            vec!["한국", "국어", "어를", "배우", "우다"]
+        );
+        assert!(tokenize("คืนเงิน", true).len() > 1);
+    }
+
+    #[test]
+    fn lowercasing_still_applies_to_cased_scripts_only() {
+        assert_eq!(tokenize("Refund 退款", false), vec!["Refund", "退款"]);
+        assert_eq!(tokenize("Refund 退款", true), vec!["refund", "退款"]);
     }
 }
