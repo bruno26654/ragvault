@@ -68,6 +68,13 @@ PADDING = (
 
 LABELS = ("supported", "contradicted", "unsupported")
 
+#: The line above which `repair`/`strict` are not defensible. `repair` exists
+#: to make an answer more trustworthy; deleting more than one correct claim in
+#: twenty trades a visible error for an invisible one at a rate no user expects.
+#: The judgement is in this constant, so it is arguable — which beats a verdict
+#: written by hand into the results file after seeing them.
+GATE_MAX_FALSE_CONTRADICTED = 0.05
+
 
 def load_pairs(limit: int | None) -> list[dict]:
     rows = [json.loads(line) for line in DATA.read_text().splitlines() if line.strip()]
@@ -225,6 +232,37 @@ def render(results: dict, pairs: list[dict], model: str) -> str:
             f"**{long_sentence['accuracy'] - short['accuracy']:+.2f}** even at "
             "sentence granularity: retrieval noise is not free."
         )
+
+    # The gate, computed rather than concluded: a padded premise is what a real
+    # retrieved chunk looks like, so that is the row `repair` has to survive.
+    realistic = {n: r for n, r in results.items() if "padded" in n}
+    if realistic:
+        worst = max(r["false_contradicted"] for r in realistic.values())
+        best = min(r["false_contradicted"] for r in realistic.values())
+        passed = best <= GATE_MAX_FALSE_CONTRADICTED
+        lines += [
+            "",
+            "## Gate: may this drive `repair`/`strict`?",
+            "",
+            f"Threshold: false-contradicted ≤ {GATE_MAX_FALSE_CONTRADICTED:.0%} "
+            "on a padded premise, which is the shape a real retrieved chunk has.",
+            "",
+        ]
+        if passed:
+            lines.append(
+                f"**PASS** — best realistic configuration is {best:.0%}. The "
+                "adapter may be opted into destructive modes with "
+                "`nli_verifier(..., allow_repair=True)`."
+            )
+        else:
+            lines.append(
+                f"**FAIL** — every realistic configuration is above the line "
+                f"({best:.0%}–{worst:.0%}). Roughly one correct claim in "
+                f"{round(1 / best) if best else 0} would be deleted by "
+                "`repair`. The adapter refuses `repair`/`strict` by default; "
+                "`report` and `annotate` are unaffected, since a wrong verdict "
+                "there is a visible mislabel rather than a lost sentence."
+            )
     return "\n".join(lines) + "\n"
 
 

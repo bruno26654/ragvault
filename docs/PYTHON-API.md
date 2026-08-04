@@ -383,9 +383,32 @@ como contradição, e deixá-la vencer apagaria texto correto em `repair`. Os do
 erros não são simétricos — contradição perdida deixa uma frase errada visível,
 contradição falsa remove em silêncio uma frase certa.
 
-**Estado da medição:** ver `benchmarks/RESULTS-VERIFICATION.md`. Enquanto o
-benchmark não tiver rodado com um modelo real, use em `report`/`annotate`, onde
-um veredito errado é visível e não custa nada — **não** em `repair`/`strict`.
+**Medido — e o resultado muda para que serve isto**
+(`benchmarks/RESULTS-VERIFICATION.md`, 36 pares, en/es/pt, mDeBERTa-v3-base-xnli
+em CPU):
+
+| configuração | acurácia | falso-`contradicted` | p50 |
+|---|---|---|---|
+| sentence / premissa nua | 0.89 | 4% | 10 s |
+| **sentence / premissa realista** | **0.78** | **21%** | 22 s |
+| block / premissa realista | 0.72 | 25% | 10 s |
+
+Com uma premissa realista — um chunk recuperado de verdade — **21% das
+afirmações corretas seriam apagadas pelo `repair`**: uma em cada cinco. Não é
+questão de trocar de granularidade: `block` é pior nos dois eixos.
+
+O mecanismo está na tabela completa: `unsupported` mantém precisão 1.00 mas o
+recall cai de 0.64 para 0.27. O modelo não passa a errar quando fala — ele para
+de dizer "neutro" quando o chunk tem conteúdo competindo, e o que era neutro
+sai afirmado como contradição.
+
+Por isso o adaptador **recusa `repair` e `strict` por padrão**
+(`ConfigurationError` acionável; `allow_repair=True` libera depois que você
+mediu no seu próprio corpus). Ele relata, não apaga.
+
+**E é lento:** p50 de ~10 s por afirmação com premissa nua, ~22 s com premissa
+realista, em CPU. Uma resposta de cinco afirmações custa minutos — trate como
+auditoria offline, não como algo no caminho da requisição.
 
 ### Segmentação conectável (`segmenter=`)
 

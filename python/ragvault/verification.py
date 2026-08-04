@@ -74,6 +74,11 @@ _PROBLEM_VERDICTS = frozenset({UNSUPPORTED, CONTRADICTED})
 
 VERIFICATION_MODES = ("report", "annotate", "repair", "strict")
 
+#: Modes that remove text rather than describe it. The distinction matters
+#: because it decides what a *wrong* verdict costs: in `report`/`annotate` it
+#: is a visible mislabel, in these it is a deleted sentence.
+_DESTRUCTIVE_MODES = frozenset({"repair", "strict"})
+
 _CITATION_RE = re.compile(r"\[(\d+)\]")
 
 #: Abbreviations whose trailing period must not end a claim. Legal and
@@ -710,6 +715,21 @@ def verify_answer(
         )
     if not callable(verify):
         raise ConfigurationError("verify must be a callable")
+    # A verifier may declare that it is not accurate enough to *delete* text.
+    # `report` and `annotate` only describe; `repair` and `strict` remove
+    # claims, so a wrong verdict there destroys correct output instead of
+    # flagging it. Any callable can opt out by setting this attribute — the
+    # measurement that justifies it belongs to whoever wrote the verifier.
+    if mode in _DESTRUCTIVE_MODES and not getattr(
+        verify, "destructive_modes_allowed", True
+    ):
+        raise ConfigurationError(
+            f"this verifier declares it must not drive {mode!r}, because a "
+            "wrong verdict there deletes a correct claim rather than "
+            f"reporting one. Use one of {sorted(set(VERIFICATION_MODES) - _DESTRUCTIVE_MODES)}, "
+            "or set `destructive_modes_allowed = True` on the verifier once "
+            "you have measured its false-contradicted rate on your own corpus"
+        )
 
     report = VerificationReport(mode=mode, repaired_text=answer_text)
     # Recorded before anything can fail: what the answer was *supposed* to

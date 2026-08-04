@@ -28,10 +28,19 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
   `argmax` — a tuned probability threshold is consolidated practice but the
   constant is not transferable, so `calibrate_threshold()` derives one from
   your labelled data instead of shipping someone else's.
-  **Not yet measured**: `benchmarks/bench_nli_verifier.py` and its committed
-  dataset are reproducible, but this environment cannot reach the model, so
-  `benchmarks/RESULTS-VERIFICATION.md` publishes no numbers. Until it has run,
-  the adapter belongs in `report`/`annotate`, not `repair`/`strict`.
+  **Measured, and the measurement restricts it** (`RESULTS-VERIFICATION.md`,
+  36 pairs, en/es/pt, mDeBERTa-v3-base-xnli on CPU): on a bare premise it is
+  good — 0.89 accuracy, 4% false-contradicted. On a *padded* premise, the shape
+  a real retrieved chunk has, accuracy falls to 0.78 and false-contradicted
+  rises to **21%** — roughly one correct claim in five would be deleted by
+  `repair`. Block granularity is worse on both counts, so this is not
+  tunable around. `unsupported` keeps precision 1.00 while its recall collapses
+  from 0.64 to 0.27: the model stops saying "neutral" once the chunk has
+  competing content, and what should have been neutral is asserted as a
+  contradiction. The adapter therefore **refuses `repair`/`strict` by default**
+  (`allow_repair=True` after measuring your own corpus). It is also slow —
+  p50 ~10 s per claim bare, ~22 s padded, on CPU — so it is an offline audit
+  pass, not something in the request path.
 - **Pluggable sentence segmentation** (`segmenter=` on `ask`, `ask_multi` and
   `verify_answer`). Thai, Lao, Khmer and Burmese prose has no sentence
   terminator, so no terminator rule reaches it. Rather than carry ICU and its
@@ -48,6 +57,12 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
   "at least four characters" is a clause in Chinese and a syllable in Finnish.
   Counted per source and minimised, so a chunk retrieved twice does not punish
   a legitimate quote.
+- **A verifier can decline to drive destructive modes.** `repair` and `strict`
+  remove claims, so a wrong verdict there deletes correct output instead of
+  flagging it, while in `report`/`annotate` the same mistake is a visible
+  mislabel. Any verifier may set `destructive_modes_allowed = False` and
+  `verify_answer` refuses those modes with an actionable error. Verifiers
+  without the attribute are unrestricted, so existing code is unaffected.
 
 ### Fixed
 - **Per-claim verification was a silent no-op for roughly a billion speakers.**
