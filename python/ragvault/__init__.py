@@ -36,6 +36,7 @@ from .database import Database, connect
 from .evaluate import EvaluationReport
 from .kb import Answer, KnowledgeBase, SyncReport, open_kb as open  # noqa: A001
 from .multiquery import MultiRetrievalResult
+from .nli import calibrate_threshold, nli_verifier
 from .rerankers import maxsim_reranker, maxsim_score
 from .verification import ClaimVerification, VerificationReport
 from .parsers import ParsedDocument, parse_file, register_parser
@@ -60,6 +61,8 @@ __all__ = [
     "KnowledgeBase",
     "maxsim_reranker",
     "maxsim_score",
+    "nli_verifier",
+    "calibrate_threshold",
     "RetrievalResult",
     "MultiRetrievalResult",
     "VerificationReport",

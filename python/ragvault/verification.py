@@ -10,11 +10,14 @@ the source it cites.
 This module adds an optional verification pass over the generated answer:
 
 1. **Split** the answer into claims. The built-in segmentation is heuristic
-   (sentence terminators, list markers, CJK/Arabic/Hebrew punctuation, an
-   abbreviation guard). It cannot see two claims inside one sentence — for
+   (sentence terminators, list markers, CJK/Indic/Arabic/Hebrew punctuation,
+   an abbreviation guard). It cannot see two claims inside one sentence — for
    that a verifier may return its **own** segmentation, which costs no extra
-   call since it is already an LLM reading the whole answer. Its claims must
-   be verbatim substrings of the answer, so repair stays surgical.
+   call since it is already an LLM reading the whole answer. Nor can it reach
+   Thai, Lao, Khmer or Burmese prose, which has no sentence terminator to
+   find; pass ``segmenter=`` for a UAX #29 splitter of your own. All three
+   routes produce claims that are verbatim substrings of the answer, in order
+   and non-overlapping, so repair stays surgical.
 2. **Attach** the `[n]` markers found in each claim to the citations they
    refer to, resolved back to the real chunks that produced them.
 3. **Judge** each claim with a caller-supplied verifier — typically an LLM, but
@@ -76,13 +79,41 @@ _CITATION_RE = re.compile(r"\[(\d+)\]")
 #: Abbreviations whose trailing period must not end a claim. Legal and
 #: Portuguese text is dense with these ("Art. 5º", "Inc. II"), and splitting
 #: there hands the verifier fragments instead of claims.
+#:
+#: This is a *precision* device for Latin script only: scripts that do not use
+#: `.` as a terminator never reach this guard, where it is a harmless no-op.
+#: Entries have to earn their place globally, because the guard is global —
+#: the French honorific "M." is a genuine abbreviation but it also blocks the
+#: split after an English sentence ending in "P.M.", so it is deliberately
+#: absent. Only abbreviations that no sentence plausibly ends with are listed.
 _ABBREVIATIONS = (
     "Art", "Arts", "Inc", "Ltda", "Ltd", "Cia", "Cf", "Ref", "Fig", "Eq",
     "Sr", "Sra", "Srta", "Dr", "Dra", "Prof", "Profa", "Mr", "Mrs", "Ms",
     "No", "Nº", "n", "p", "pp", "vs", "etc", "ed", "al", "par",
+    "Nr", "bzw", "Abb",  # German: "Nr. 5", "bzw. auch", "Abb. 3"
+    # "e.g." / "i.e.": the split point falls after the *last* period, so the
+    # letter to guard is the final one. `\b` keeps these from matching a word
+    # that merely ends in them — "log." has no boundary before its "g".
+    "e", "g", "i",
 )
 #: The split point sits *after* the period, so each guard must include it.
 _ABBREV_GUARD = "".join(f"(?<!\\b{a}\\.)" for a in _ABBREVIATIONS)
+
+#: A single capital preceded by a space is a personal initial, not the end of
+#: a sentence: "Written by John F. Kennedy" was being split after "F.", which
+#: is well-formed text mis-segmented into a fragment and a headless claim.
+#:
+#: The whitespace in the lookbehind is what keeps this from swallowing the
+#: legitimate case: in "applies in the U.S. Then", the final "S" is preceded
+#: by "." rather than a space, so an initialism ending a sentence still
+#: splits. An abbreviation list cannot cover this — initials are arbitrary.
+_INITIAL_GUARD = r"(?<!\s[A-Z]\.)"
+
+#: Digits before the terminator, for the no-space rule only: "1.5Kg" must not
+#: become "1." + "5Kg". A sentence *can* legitimately end in a digit ("the
+#: term is 30. After that…"), so this guard is deliberately not applied to the
+#: ordinary spaced rule, where that sentence lives.
+_DECIMAL_GUARD = r"(?<![0-9]\.)"
 
 #: What may start a new claim: a capital, a citation marker, a list bullet, or
 #: any letter that has no lowercase form (Arabic, Hebrew, Devanagari, CJK…).
@@ -104,19 +135,67 @@ _CLAIM_START = r"[A-Z\[]|[-*•+]\s|\d+[.)]\s|(?![a-zà-öø-ÿ])[^\W\d_]"
 #: split off as a claim that is only a marker — the very failure this fixes.
 _TRAILING_CITES = r"(?=(?P<trail>(?:[ \t]*\[\d+\])*))(?P=trail)"
 
-#: Claim boundaries. Three alternatives, in order:
+#: Sentence terminators in scripts that have no letter case. Unicode calls
+#: these `Sentence_Terminal=Yes`; they are listed literally because `re` has no
+#: `\p{Sentence_Terminal}` and pulling in `regex` for one character class is
+#: not worth a dependency.
+#:
+#: Every character missing from this list silently disables per-claim
+#: verification for the languages that use it — the answer comes back as one
+#: claim and nothing is checked per statement. That was fixed once for CJK and
+#: was still open for the danda, which covers Hindi, Bengali, Marathi and
+#: Nepali. A terminator here costs nothing when it never appears.
+_CASELESS_TERMINATORS = (
+    "。．！？"   # CJK / full-width stop, exclamation, question
+    "｡"         # U+FF61 halfwidth ideographic full stop
+    "।॥"        # U+0964/U+0965 danda, double danda — Indic
+    "։"         # U+0589 Armenian full stop
+    "።"         # U+1362 Ethiopic full stop
+    "។"         # U+17D4 Khmer khan
+    "၊။"        # U+104A/U+104B Myanmar little section, section
+)
+
+#: Claim boundaries. Five alternatives, in order:
 #:  1. Latin terminator + any trailing citation markers + whitespace +
 #:     something that starts a new unit (capital, citation marker, or a list
 #:     bullet — without bullets a whole list would be one claim, so one bad
 #:     item condemned all of them);
-#:  2. CJK/full-width terminators, where the space is optional and there is
-#:     no case to look for — Chinese, Japanese and Korean answers were never
-#:     split at all before, making per-claim verification a no-op for them;
-#:  3. Arabic full stop / question mark, same reason.
+#:  2. the same, with the space simply missing — "30 days.They ship" is
+#:     ordinary typing, and answers arriving from OCR'd PDFs are full of it.
+#:     Requires a capital *followed by a lowercase letter*, so an initialism
+#:     ("U.S.A") is not mistaken for a new sentence;
+#:  3. terminators of caseless scripts, where the space is optional and there
+#:     is no capital to look for — see `_CASELESS_TERMINATORS`;
+#:  4. Arabic full stop / question mark, same reason;
+#:  5. a blank line, terminator or not. Real answers drop the final period on
+#:     headings and list-ish lines, and a paragraph break is an unambiguous
+#:     boundary — unlike a single newline, which is just as often a wrapped
+#:     line in the middle of one sentence.
+#:
+#: What is deliberately *not* here: splitting on a lowercase word after a
+#: terminator ("30 days. they ship"). It looks like the same class of typo,
+#: but the two errors are not symmetric. Failing to split merges two claims
+#: and degrades one verdict; splitting wrongly turns an abbreviation into a
+#: fragment claim, which `repair` then deletes from otherwise correct text.
+#: Lowercase abbreviations are an open set across languages ("aprox.", "pág.",
+#: "ca.", "ex."), so the rule cannot be made safe by enumeration — and the
+#: convention it would abandon, that a sentence opens with a capital, is one
+#: of the most reliable in every cased script.
+#:
+#: Scripts whose prose has *no* sentence terminator at all — Thai, Lao, Khmer
+#: and Burmese running text — are out of reach of any terminator rule. They
+#: need dictionary-based breaking (UAX #29), which is what the `segmenter`
+#: hook on `verify_answer` is for.
 _SENTENCE_RE = re.compile(
-    rf"(?<=[.!?]){_ABBREV_GUARD}{_TRAILING_CITES}\s+(?={_CLAIM_START})"
-    rf"|(?<=[。．！？]){_TRAILING_CITES.replace('trail', 'trail_cjk')}\s*"
+    rf"(?<=[.!?]){_ABBREV_GUARD}{_INITIAL_GUARD}{_TRAILING_CITES}"
+    rf"\s+(?={_CLAIM_START})"
+    rf"|(?<=[.!?]){_ABBREV_GUARD}{_INITIAL_GUARD}{_DECIMAL_GUARD}"
+    rf"{_TRAILING_CITES.replace('trail', 'trail_tight')}"
+    rf"(?=[A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ])"
+    rf"|(?<=[{_CASELESS_TERMINATORS}])"
+    rf"{_TRAILING_CITES.replace('trail', 'trail_cjk')}\s*"
     rf"|(?<=[؟۔]){_TRAILING_CITES.replace('trail', 'trail_rtl')}\s+"
+    rf"|\n[ \t]*\n\s*"
 )
 
 
@@ -173,8 +252,9 @@ class VerificationReport:
     #: Set when the second pass over replacements raised. The repaired answer
     #: stands, but its replacements went unchecked — surfaced, not hidden.
     recheck_error: Optional[str] = None
-    #: Which segmentation produced the claims: the built-in heuristic, or the
-    #: verifier's own (which can split two claims inside one sentence).
+    #: Which segmentation produced the claims: the built-in `"heuristic"`, a
+    #: caller-supplied `"segmenter"`, or the `"verifier"`'s own (which can
+    #: split two claims inside one sentence).
     segmentation: str = "heuristic"
     #: Facets the answer was expected to cover (empty when the question was
     #: not decomposed). Kept so a *partial* coverage report can be detected:
@@ -297,8 +377,8 @@ def _split_with_separators(text: str) -> tuple[list[str], list[str]]:
     for match in _SENTENCE_RE.finditer(stripped):
         # Citation markers trailing the terminator stay with the claim they
         # source; only what follows them is layout between claims.
-        trail = (match.group("trail") or match.group("trail_cjk")
-                 or match.group("trail_rtl") or "")
+        trail = (match.group("trail") or match.group("trail_tight")
+                 or match.group("trail_cjk") or match.group("trail_rtl") or "")
         claims.append(stripped[pos:match.start()] + trail)
         seps.append(stripped[match.start() + len(trail):match.end()])
         pos = match.end()
@@ -313,6 +393,48 @@ def _split_with_separators(text: str) -> tuple[list[str], list[str]]:
             out_seps.append(seps[i - 1] if i - 1 < len(seps) else " ")
         out_claims.append(claim.strip())
     return out_claims, out_seps
+
+
+def _segment(
+    answer_text: str, segmenter: Optional[Callable],
+) -> tuple[list[str], list[str], list[str], str]:
+    """Split the answer into claims, honouring a caller-supplied segmenter.
+
+    Returns (claims, separators, structural issues, segmentation label).
+
+    The built-in splitter is a terminator rule, which no amount of fixing can
+    extend to scripts whose prose has no terminator — Thai, Lao, Khmer and
+    Burmese running text need dictionary-based breaking (UAX #29). Rather than
+    carry ICU and its locale data in the core, segmentation is pluggable the
+    way everything else here is: RagVault never calls a provider itself, so
+    ``segmenter`` is a plain callable and PySBD, PyICU or spaCy are two-line
+    adapters the caller installs.
+
+    A supplied segmentation is held to the same structural contract as the
+    verifier's own (see ``_locate_spans``): claims must be verbatim substrings
+    of the answer, in order, non-overlapping. That is what keeps ``repair``
+    surgical — it removes spans of the original rather than reassembling the
+    answer out of somebody's copy of it.
+    """
+    if segmenter is None:
+        claims, seps = _split_with_separators(answer_text)
+        return claims, seps, [], "heuristic"
+    if not answer_text.strip():
+        return [], [], [], "segmenter"
+
+    supplied = [
+        text for text in (str(c).strip() for c in segmenter(answer_text)) if text
+    ]
+    if not supplied:
+        raise ValueError("segmenter returned no claims for a non-empty answer")
+    missing = [t for t in supplied if t not in answer_text]
+    if missing:
+        raise ValueError(
+            f"segmenter returned {len(missing)} claim(s) that are not verbatim "
+            f"substrings of the answer, e.g. {missing[0][:60]!r}"
+        )
+    claims, seps, issues = _locate_spans(supplied, answer_text)
+    return claims, seps, issues, "segmenter"
 
 
 def citations_in(claim: str) -> list[int]:
@@ -379,30 +501,42 @@ _GROUNDS = {
 }
 
 
-def _quote_is_grounded(quote: str, evidence: Sequence[dict]) -> bool:
-    """True when the quoted span really appears in one of the cited sources.
+def _quote_grounding(quote: str, texts: Sequence[str]) -> tuple[bool, int]:
+    """Locate a quoted span in candidate sources.
 
-    Purely structural: substring, not meaning. A verifier that answers
-    "supported, the source says X" where no cited source says X has attributed
-    words to a document it did not contain them, and that is checkable without
-    judging anything.
+    Returns ``(found, occurrences)``. Purely structural: substring, not
+    meaning. A verifier that answers "supported, the source says X" where no
+    cited source says X has attributed to a document words it does not
+    contain, and that is checkable without judging anything.
+
+    ``occurrences`` is the count in the source that localizes the quote
+    *best* — the fewest matches in any single text containing it, not the sum.
+    Summing would punish the ordinary case of a chunk retrieved twice, where
+    the same span legitimately appears once in each copy; the minimum asks the
+    question that matters, "does at least one cited source pin this down?"
     """
     needle = _normalize_span(quote)
     if not needle:
-        return False
-    return any(needle in _normalize_span(ev.get("text") or "") for ev in evidence)
+        return False, 0
+    counts = [
+        n for n in (_normalize_span(t or "").count(needle) for t in texts) if n
+    ]
+    if not counts:
+        return False, 0
+    return True, min(counts)
 
 
 def _check_ground(
     verdict: str, rationale: str, quote: Optional[str], claim: str,
     evidence: Sequence[dict], question: str, *,
     require_evidence: bool, require_quotes: bool,
+    max_quote_occurrences: int = 8, min_quote_coverage: float = 0.0,
 ) -> tuple[str, str, Optional[str]]:
     """Hold a verdict to the ground it implicitly claims.
 
     Returns (verdict, rationale, structural issue or None). Every test here is
-    structural — a substring, or the presence of a resolved citation — never a
-    judgement about meaning.
+    structural — a substring, an occurrence count, or the presence of a
+    resolved citation — never a judgement about meaning.
     """
     grounds = _GROUNDS.get(verdict, ())
     if not grounds:
@@ -417,17 +551,45 @@ def _check_ground(
         # The quote names where the support lives, so it is checked against
         # exactly that: a `question_fact` quoting the question was being
         # compared to the cited documents and rejected for not being in them.
-        found = (
-            ("sources" in grounds and _quote_is_grounded(quote, evidence))
-            or ("question" in grounds
-                and _normalize_span(quote) in _normalize_span(question))
-        )
+        found, occurrences = False, 0
+        if "sources" in grounds:
+            found, occurrences = _quote_grounding(
+                quote, [ev.get("text") or "" for ev in evidence]
+            )
+        if not found and "question" in grounds:
+            found, occurrences = _quote_grounding(quote, [question])
+        where = " or ".join(grounds)
         if not found:
-            where = " or ".join(grounds)
             return rejected(
                 f"quoted span {quote.strip()[:60]!r} is not in the {where}",
                 UNSUPPORTED,
             )
+        # Being *in* the source is not the same as pointing *at* something in
+        # it. A quote of "the" is a substring of almost any source, so the
+        # substring test alone let a one-word span stand in for evidence.
+        # Occurrence count is the script-independent way to ask this: it needs
+        # no tokenizer and no length unit, so it behaves the same for Chinese,
+        # Finnish and English — unlike a minimum quote *length*, where four
+        # characters is a clause in one script and a syllable in another.
+        if max_quote_occurrences and occurrences > max_quote_occurrences:
+            return rejected(
+                f"quoted span {quote.strip()[:60]!r} occurs {occurrences} times "
+                f"in the {where} and so does not identify where the support is",
+                UNSUPPORTED,
+            )
+        if min_quote_coverage:
+            # Ratio, not absolute size: both sides are in the same script, so
+            # the unit cancels. Off by default — support is not always
+            # proportional to the claim (a date backs a long sentence).
+            bare = _normalize_span(_CITATION_RE.sub("", claim))
+            coverage = len(_normalize_span(quote)) / max(len(bare), 1)
+            if coverage < min_quote_coverage:
+                return rejected(
+                    f"quoted span {quote.strip()[:60]!r} covers "
+                    f"{coverage:.0%} of the claim, below the required "
+                    f"{min_quote_coverage:.0%}",
+                    UNSUPPORTED,
+                )
         return verdict, rationale, None
 
     if require_quotes:
@@ -492,6 +654,9 @@ def verify_answer(
     allow_replacements: bool = False,
     require_quotes: bool = False,
     require_evidence: bool = True,
+    segmenter: Optional[Callable[[str], Sequence[str]]] = None,
+    max_quote_occurrences: int = 8,
+    min_quote_coverage: float = 0.0,
 ) -> VerificationReport:
     """Run the verification pass. See the module docstring for the contract.
 
@@ -523,6 +688,21 @@ def verify_answer(
     because support is not always a contiguous span (a rule spread over two
     sentences, a table), and demanding one would reject claims that really are
     supported.
+
+    A quote that *is* in the sources still has to point at something in them.
+    ``max_quote_occurrences`` (8 by default) rejects a span that matches so
+    often in the cited block that it localizes nothing — the failure a
+    one-word quote of "the" exploits. It counts occurrences rather than
+    measuring length on purpose: an occurrence count means the same thing in
+    every script, while "at least four characters" is a clause in Chinese and
+    a syllable in Finnish. The default is deliberately loose, because the cost
+    of a false rejection here is a deleted claim in ``repair`` mode; tighten it
+    against your own corpus. ``min_quote_coverage`` is the complementary ratio
+    of quote length to claim length, off by default.
+
+    ``segmenter`` replaces the built-in claim splitter with a callable of your
+    own — see ``_segment``. The built-in rule needs a sentence terminator to
+    exist, which in Thai, Lao, Khmer and Burmese prose it does not.
     """
     if mode not in VERIFICATION_MODES:
         raise ConfigurationError(
@@ -538,7 +718,16 @@ def verify_answer(
     report.expected_facets = list(facets or [])
     started = time.monotonic()
 
-    claims, separators = _split_with_separators(answer_text)
+    try:
+        claims, separators, seg_issues, seg_label = _segment(answer_text, segmenter)
+    except Exception as exc:
+        # A broken segmenter must not destroy the answer any more than a broken
+        # verifier does: preserve the text, record the failure, fail closed.
+        report.error = f"{type(exc).__name__}: {exc}"
+        report.elapsed_ms = (time.monotonic() - started) * 1000
+        return report
+    report.segmentation = seg_label
+    report.structural_issues.extend(seg_issues)
     if not claims:
         report.elapsed_ms = (time.monotonic() - started) * 1000
         return report
@@ -620,6 +809,8 @@ def verify_answer(
                 verdict, rationale, quote, claim, evidence, question,
                 require_evidence=require_evidence,
                 require_quotes=require_quotes,
+                max_quote_occurrences=max_quote_occurrences,
+                min_quote_coverage=min_quote_coverage,
             )
             if issue:
                 report.structural_issues.append(issue)

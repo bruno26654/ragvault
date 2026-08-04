@@ -8,6 +8,8 @@
 | DSPy | `kb.as_dspy_retriever(k=8)` | implemented, untested (erro acionável sem a lib) | `pip install dspy` |
 | Faiss (interop) | `ragvault.compat.faiss` | **validated** (round-trip testado com faiss-cpu real) | `pip install "ragvault[faiss]"` |
 | GPU cuVS/CAGRA | `ragvault.gpu.CagraDenseSearcher` | experimental — ver docs/GPU.md | `pip install "ragvault[gpu-cu12]"` |
+| NLI (verificação offline) | `ragvault.nli.nli_verifier()` | implemented, **não medido** — ver `benchmarks/RESULTS-VERIFICATION.md` | `pip install "ragvault[nli]"` |
+| Segmentador de sentença | `kb.ask(..., segmenter=...)` | callable seu (PySBD/PyICU/spaCy) — sem dependência no núcleo | opcional |
 | NumPy | nativo em toda a API | validated | — |
 
 Todos os retrievers carregam proveniência completa (document_id, versão,

@@ -12,7 +12,66 @@ compatibility guarantees (see [docs/STORAGE.md](docs/STORAGE.md)).
 
 ## [Unreleased]
 
+### Added
+- **Offline fidelity checking with NLI** (`ragvault.nli.nli_verifier()`, extra
+  `nli`). Every other check in the library is structural — a quote is a
+  substring of its source, a verdict names an admissible ground, spans are
+  ordered and non-overlapping. None of them can answer whether the cited
+  evidence actually *entails* the claim, which until now only a caller-supplied
+  LLM judge could, leaving the default offline install with no fidelity check
+  at all. The three NLI labels map onto the existing verdicts without inventing
+  anything. Premises are split into sentences and scored individually
+  (SummaC-ZS, Laban et al. TACL 2022) because NLI degrades on long premises and
+  RAG chunks are long; labels are read from `config.id2label` by *name*, since
+  checkpoints disagree about label order and reading it by position inverts
+  every verdict on half the models. The decision rule is the model's own
+  `argmax` — a tuned probability threshold is consolidated practice but the
+  constant is not transferable, so `calibrate_threshold()` derives one from
+  your labelled data instead of shipping someone else's.
+  **Not yet measured**: `benchmarks/bench_nli_verifier.py` and its committed
+  dataset are reproducible, but this environment cannot reach the model, so
+  `benchmarks/RESULTS-VERIFICATION.md` publishes no numbers. Until it has run,
+  the adapter belongs in `report`/`annotate`, not `repair`/`strict`.
+- **Pluggable sentence segmentation** (`segmenter=` on `ask`, `ask_multi` and
+  `verify_answer`). Thai, Lao, Khmer and Burmese prose has no sentence
+  terminator, so no terminator rule reaches it. Rather than carry ICU and its
+  locale data in the core, segmentation joins `verify=` and `rerank=` as a
+  plain callable — PySBD, PyICU and spaCy become two-line adapters. Supplied
+  claims are held to the same structural contract as the verifier's own
+  (verbatim substrings, ordered, non-overlapping), which is what keeps `repair`
+  surgical; a segmenter that raises preserves the answer and records the error.
+- **Quote specificity** (`max_quote_occurrences`, default 8;
+  `min_quote_coverage`, off). Being *in* the source is not the same as pointing
+  *at* something in it: a one-word quote of "the" is a substring of almost any
+  document and passed the existing check. Occurrences are counted rather than
+  length measured, because a count means the same thing in every script while
+  "at least four characters" is a clause in Chinese and a syllable in Finnish.
+  Counted per source and minimised, so a chunk retrieved twice does not punish
+  a legitimate quote.
+
 ### Fixed
+- **Per-claim verification was a silent no-op for roughly a billion speakers.**
+  The sentence splitter knew `.!?`, the CJK terminators and the Arabic ones,
+  but not the danda `।`/`॥` (Hindi, Bengali, Marathi, Nepali), the Ethiopic
+  `።`, the Armenian `։`, the Khmer `។`, the Myanmar `၊`/`။` or the halfwidth
+  `｡`. Answers in those scripts came back as one claim, so `repair` could only
+  keep or delete the whole thing — the same failure fixed earlier for CJK.
+- **A middle initial split a sentence in two.** "Written by John F. Kennedy"
+  broke after "F.", handing the verifier a fragment and a headless claim. An
+  abbreviation list cannot cover this, since initials are arbitrary; a single
+  capital *preceded by a space* is now guarded. An initialism ending a sentence
+  ("applies in the U.S. Then…") still splits, because there the letter is
+  preceded by a period rather than a space.
+- **Real answers are not well-typed, and splitting now survives that.** A
+  missing space after the terminator ("30 days.They ship" — ordinary typing,
+  and pervasive in OCR'd PDFs) and a missing terminator across a paragraph
+  break both left two claims fused into one. Guarded so that "1.5Kg" and
+  "R$ 1.234,56" are not split. Splitting on a *lowercase* word after a
+  terminator is deliberately still not done: lowercase abbreviations are an
+  open set across languages, and a false split becomes a fragment that `repair`
+  deletes from otherwise correct text — the costlier of the two errors.
+- **Stripping `[1]` from a claim left a stranded space before the period.** The
+  NLI hypothesis differed from its premise for a reason unrelated to meaning.
 - **Three verdicts were unfalsifiable.** `supported`, `inference` and
   `question_fact` passed with `ok=True` while citing nothing and quoting
   nothing — so the cheapest way to get a fabricated sentence through
